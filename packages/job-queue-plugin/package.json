@@ -1,30 +1,48 @@
 {
-  "name": "@vendure/job-queue-plugin",
-  "version": "1.0.0-beta.10",
-  "license": "MIT",
-  "main": "lib/index.js",
-  "types": "lib/index.d.ts",
-  "files": [
-    "lib/**/*"
-  ],
-  "private": true,
-  "scripts": {
-    "watch": "tsc -p ./tsconfig.build.json --watch",
-    "build": "rimraf lib && tsc -p ./tsconfig.build.json && yarn ts-node build.ts",
-    "lint": "tslint --fix --project ./",
-    "test": "jest --config ./jest.config.js",
-    "ci": "yarn build"
-  },
-  "publishConfig": {
-    "access": "restricted"
-  },
-  "devDependencies": {
-    "@google-cloud/pubsub": "^2.8.0",
-    "@types/redis": "^2.8.28",
-    "@vendure/common": "^1.0.0-beta.8",
-    "@vendure/core": "^1.0.0-beta.10",
-    "redis": "^3.0.2",
-    "rimraf": "^3.0.2",
-    "typescript": "4.1.5"
-  }
+    "name": "@vendure/job-queue-plugin",
+    "version": "3.8.2",
+    "license": "GPL-3.0-or-later",
+    "main": "package/index.js",
+    "types": "package/index.d.ts",
+    "files": [
+        "package/**/*"
+    ],
+    "repository": {
+        "type": "git",
+        "url": "git+https://github.com/vendurehq/vendure.git",
+        "directory": "packages/job-queue-plugin"
+    },
+    "private": false,
+    "scripts": {
+        "watch": "tsc -p ./tsconfig.build.json --watch",
+        "build": "rimraf package && tsc -p ./tsconfig.build.json",
+        "lint": "eslint --fix .",
+        "e2e": "node e2e/check-connection.js || cross-env PACKAGE=job-queue-plugin vitest --config ../../e2e-common/vitest.config.mts --run",
+        "ci": "npm run build"
+    },
+    "homepage": "https://www.vendure.io/",
+    "funding": "https://github.com/sponsors/michaelbromley",
+    "publishConfig": {
+        "access": "public"
+    },
+    "devDependencies": {
+        "@vendure/common": "3.8.2",
+        "@vendure/core": "3.8.2",
+        "bullmq": "^5.67.1",
+        "ioredis": "5.9.3",
+        "rimraf": "^5.0.5",
+        "typescript": "5.8.2"
+    },
+    "peerDependencies": {
+        "bullmq": "^5.4.2",
+        "ioredis": "^5.3.2"
+    },
+    "peerDependenciesMeta": {
+        "bullmq": {
+            "optional": true
+        },
+        "ioredis": {
+            "optional": true
+        }
+    }
 }

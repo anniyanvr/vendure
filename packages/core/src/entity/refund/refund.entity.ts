@@ -1,28 +1,57 @@
 import { DeepPartial, ID } from '@vendure/common/lib/shared-types';
-import { Column, Entity, JoinColumn, JoinTable, ManyToOne, OneToMany } from 'typeorm';
+import { Column, Entity, Index, JoinColumn, JoinTable, ManyToOne, OneToMany } from 'typeorm';
 
 import { PaymentMetadata } from '../../common/types/common-types';
+import { HasCustomFields } from '../../config/custom-field/custom-field-types';
 import { RefundState } from '../../service/helpers/refund-state-machine/refund-state';
 import { VendureEntity } from '../base/base.entity';
+import { CustomRefundFields } from '../custom-entity-fields';
 import { EntityId } from '../entity-id.decorator';
-import { OrderItem } from '../order-item/order-item.entity';
+import { Money } from '../money.decorator';
+import { RefundLine } from '../order-line-reference/refund-line.entity';
 import { Payment } from '../payment/payment.entity';
 
+/**
+ * @description A refund the belongs to an order
+ *
+ * @docsCategory entities
+ */
 @Entity()
-export class Refund extends VendureEntity {
+export class Refund extends VendureEntity implements HasCustomFields {
     constructor(input?: DeepPartial<Refund>) {
         super(input);
     }
 
-    @Column() items: number;
+    /**
+     * @deprecated Since v2.2, the `items` field will not be used by default. Instead, the `total` field
+     * alone will be used to determine the refund amount.
+     */
+    @Money() items: number;
 
-    @Column() shipping: number;
+    /**
+     * @deprecated Since v2.2, the `shipping` field will not be used by default. Instead, the `total` field
+     * alone will be used to determine the refund amount.
+     */
+    @Money() shipping: number;
 
-    @Column() adjustment: number;
+    /**
+     * @deprecated Since v2.2, the `adjustment` field will not be used by default. Instead, the `total` field
+     * alone will be used to determine the refund amount.
+     */
+    @Money() adjustment: number;
 
-    @Column() total: number;
+    @Money() total: number;
 
     @Column() method: string;
+
+    /**
+     * @description
+     * The refund destination code, if a non-default destination was used.
+     * When null, the refund was directed to the original payment method.
+     *
+     * @since 3.8.0
+     */
+    @Column({ nullable: true, type: 'varchar' }) destination: string | null;
 
     @Column({ nullable: true }) reason: string;
 
@@ -30,11 +59,12 @@ export class Refund extends VendureEntity {
 
     @Column({ nullable: true }) transactionId: string;
 
-    @OneToMany(type => OrderItem, orderItem => orderItem.refund)
+    @OneToMany(type => RefundLine, line => line.refund)
     @JoinTable()
-    orderItems: OrderItem[];
+    lines: RefundLine[];
 
-    @ManyToOne(type => Payment)
+    @Index()
+    @ManyToOne(type => Payment, payment => payment.refunds)
     @JoinColumn()
     payment: Payment;
 
@@ -42,4 +72,7 @@ export class Refund extends VendureEntity {
     paymentId: ID;
 
     @Column('simple-json') metadata: PaymentMetadata;
+
+    @Column(type => CustomRefundFields)
+    customFields: CustomRefundFields;
 }

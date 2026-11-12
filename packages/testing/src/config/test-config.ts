@@ -2,6 +2,7 @@ import { ADMIN_API_PATH, SHOP_API_PATH } from '@vendure/common/lib/shared-consta
 import {
     DefaultAssetNamingStrategy,
     defaultConfig,
+    DefaultLogger,
     mergeConfig,
     NoopLogger,
     VendureConfig,
@@ -12,6 +13,8 @@ import { TestingAssetStorageStrategy } from './testing-asset-storage-strategy';
 import { TestingEntityIdStrategy } from './testing-entity-id-strategy';
 
 export const E2E_DEFAULT_CHANNEL_TOKEN = 'e2e-default-channel';
+
+const logger = process.env.LOG ? new DefaultLogger() : new NoopLogger();
 
 /**
  * @description
@@ -24,6 +27,16 @@ export const E2E_DEFAULT_CHANNEL_TOKEN = 'e2e-default-channel';
  * * `assetStorageStrategy: new TestingAssetStorageStrategy()` This strategy does not actually persist any binary data to disk.
  * * `assetPreviewStrategy: new TestingAssetPreviewStrategy()` This strategy is a no-op.
  *
+ * ## Logging
+ * By default, the testConfig does not output any log messages. This is most desirable to keep a clean CI output.
+ * However, for debugging purposes, it can make it hard to figure out why tests fail.
+ *
+ * You can enable default logging behaviour with the environment variable `LOG`:
+ *
+ * ```
+ * LOG=true yarn e2e
+ * ```
+ *
  * @docsCategory testing
  */
 export const testConfig: Required<VendureConfig> = mergeConfig(defaultConfig, {
@@ -35,9 +48,11 @@ export const testConfig: Required<VendureConfig> = mergeConfig(defaultConfig, {
     },
     defaultChannelToken: E2E_DEFAULT_CHANNEL_TOKEN,
     authOptions: {
-        sessionSecret: 'some-secret',
         tokenMethod: 'bearer',
         requireVerification: true,
+        cookieOptions: {
+            secret: 'some-secret',
+        },
     },
     dbConnectionOptions: {
         type: 'sqljs',
@@ -48,11 +63,11 @@ export const testConfig: Required<VendureConfig> = mergeConfig(defaultConfig, {
     },
     promotionOptions: {},
     customFields: {},
-    entityIdStrategy: new TestingEntityIdStrategy(),
+    entityOptions: { entityIdStrategy: new TestingEntityIdStrategy() },
     paymentOptions: {
         paymentMethodHandlers: [],
     },
-    logger: new NoopLogger(),
+    logger,
     importExportOptions: {},
     assetOptions: {
         assetNamingStrategy: new DefaultAssetNamingStrategy(),

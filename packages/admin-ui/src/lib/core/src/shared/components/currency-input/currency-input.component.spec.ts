@@ -2,6 +2,7 @@ import { Component, Injectable } from '@angular/core';
 import { ComponentFixture, fakeAsync, TestBed, tick, waitForAsync } from '@angular/core/testing';
 import { FormsModule } from '@angular/forms';
 import { By } from '@angular/platform-browser';
+import { ServerConfigService } from '@vendure/admin-ui/core';
 import { Type } from '@vendure/common/lib/shared-types';
 import { of } from 'rxjs';
 
@@ -12,22 +13,29 @@ import { AffixedInputComponent } from '../affixed-input/affixed-input.component'
 
 import { CurrencyInputComponent } from './currency-input.component';
 
+class MockServerConfigService {
+    serverConfig = {
+        moneyStrategyPrecision: 2,
+    };
+}
+
 describe('CurrencyInputComponent', () => {
-    beforeEach(
-        waitForAsync(() => {
-            TestBed.configureTestingModule({
-                imports: [FormsModule],
-                providers: [{ provide: DataService, useClass: MockDataService }],
-                declarations: [
-                    TestControlValueAccessorComponent,
-                    TestSimpleComponent,
-                    CurrencyInputComponent,
-                    AffixedInputComponent,
-                    LocaleCurrencyNamePipe,
-                ],
-            }).compileComponents();
-        }),
-    );
+    beforeEach(waitForAsync(() => {
+        TestBed.configureTestingModule({
+            imports: [FormsModule],
+            providers: [
+                { provide: DataService, useClass: MockDataService },
+                { provide: ServerConfigService, useClass: MockServerConfigService },
+            ],
+            declarations: [
+                TestControlValueAccessorComponent,
+                TestSimpleComponent,
+                CurrencyInputComponent,
+                AffixedInputComponent,
+                LocaleCurrencyNamePipe,
+            ],
+        }).compileComponents();
+    }));
 
     it('should display the price as decimal with a simple binding', fakeAsync(() => {
         const fixture = createAndRunChangeDetection(TestSimpleComponent);
@@ -72,6 +80,24 @@ describe('CurrencyInputComponent', () => {
         expect(fixture.componentInstance.price).toBe(157);
     }));
 
+    describe('currencies without minor units', () => {
+        it('displays JPY without decimal places', fakeAsync(() => {
+            MockDataService.language = LanguageCode.en;
+            const fixture = createAndRunChangeDetection(TestSimpleComponent, 429900, 'JPY');
+            const nativeInput = getNativeInput(fixture);
+            expect(nativeInput.value).toBe('4299');
+        }));
+
+        it('increments JPY with a step of 1', fakeAsync(() => {
+            MockDataService.language = LanguageCode.en;
+            const fixture = createAndRunChangeDetection(TestSimpleComponent, 429900, 'JPY');
+            const nativeInputDebugEl = fixture.debugElement.query(By.css('input[type="number"]'));
+
+            const nativeInput = getNativeInput(fixture);
+            expect(nativeInput.step).toBe('1');
+        }));
+    });
+
     describe('currencyCode display', () => {
         it('displays currency code in correct position (prefix)', fakeAsync(() => {
             MockDataService.language = LanguageCode.en;
@@ -95,7 +121,7 @@ describe('CurrencyInputComponent', () => {
     function createAndRunChangeDetection<T extends TestControlValueAccessorComponent | TestSimpleComponent>(
         component: Type<T>,
         priceValue = 123,
-        currencyCode: string = '',
+        currencyCode = '',
     ): ComponentFixture<T> {
         const fixture = TestBed.createComponent(component);
         if (fixture.componentInstance instanceof TestSimpleComponent && currencyCode) {
@@ -118,6 +144,7 @@ describe('CurrencyInputComponent', () => {
     template: `
         <vdr-currency-input [(ngModel)]="price"></vdr-currency-input>
     `,
+    standalone: false,
 })
 class TestControlValueAccessorComponent {
     price = 123;
@@ -128,6 +155,7 @@ class TestControlValueAccessorComponent {
     template: `
         <vdr-currency-input [value]="price" [currencyCode]="currencyCode"></vdr-currency-input>
     `,
+    standalone: false,
 })
 class TestSimpleComponent {
     currencyCode = '';

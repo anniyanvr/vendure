@@ -1,44 +1,46 @@
-/* tslint:disable:no-non-null-assertion */
-import { CustomFulfillmentProcess, manualFulfillmentHandler, mergeConfig } from '@vendure/core';
+/* eslint-disable @typescript-eslint/no-non-null-assertion */
+import { ErrorCode } from '@vendure/common/lib/generated-types';
+import {
+    CustomFulfillmentProcess,
+    defaultFulfillmentProcess,
+    manualFulfillmentHandler,
+    mergeConfig,
+    TransactionalConnection,
+} from '@vendure/core';
 import { createErrorResultGuard, createTestEnvironment, ErrorResultGuard } from '@vendure/testing';
 import path from 'path';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 
 import { initialData } from '../../../e2e-common/e2e-initial-data';
-import { testConfig, TEST_SETUP_TIMEOUT_MS } from '../../../e2e-common/test-config';
+import { TEST_SETUP_TIMEOUT_MS, testConfig } from '../../../e2e-common/test-config';
 
 import { testSuccessfulPaymentMethod } from './fixtures/test-payment-methods';
+import { fulfillmentFragment } from './graphql/fragments-admin';
+import { FragmentOf } from './graphql/graphql-admin';
 import {
-    CreateFulfillment,
-    ErrorCode,
-    FulfillmentFragment,
-    GetCustomerList,
-    GetOrderFulfillments,
-    TransitFulfillment,
-} from './graphql/generated-e2e-admin-types';
-import { AddItemToOrder } from './graphql/generated-e2e-shop-types';
-import {
-    CREATE_FULFILLMENT,
-    GET_CUSTOMER_LIST,
-    GET_ORDER_FULFILLMENTS,
-    TRANSIT_FULFILLMENT,
+    createFulfillmentDocument,
+    getCustomerListDocument,
+    getOrderFulfillmentsDocument,
+    transitFulfillmentDocument,
 } from './graphql/shared-definitions';
-import { ADD_ITEM_TO_ORDER } from './graphql/shop-definitions';
+import { addItemToOrderDocument } from './graphql/shop-definitions';
 import { addPaymentToOrder, proceedToArrangingPayment } from './utils/test-order-utils';
 
-const initSpy = jest.fn();
-const transitionStartSpy = jest.fn();
-const transitionEndSpy = jest.fn();
-const transitionEndSpy2 = jest.fn();
-const transitionErrorSpy = jest.fn();
+const initSpy = vi.fn();
+const transitionStartSpy = vi.fn();
+const transitionEndSpy = vi.fn();
+const transitionEndSpy2 = vi.fn();
+const transitionErrorSpy = vi.fn();
 
 describe('Fulfillment process', () => {
+    type FulfillmentFragment = FragmentOf<typeof fulfillmentFragment>;
     const fulfillmentGuard: ErrorResultGuard<FulfillmentFragment> = createErrorResultGuard(
         input => !!input.id,
     );
     const VALIDATION_ERROR_MESSAGE = 'Fulfillment must have a tracking code';
     const customOrderProcess: CustomFulfillmentProcess<'AwaitingPickup'> = {
         init(injector) {
-            initSpy(injector.getConnection().name);
+            initSpy(injector.get(TransactionalConnection).rawConnection.isInitialized);
         },
         transitions: {
             Pending: {
@@ -77,10 +79,10 @@ describe('Fulfillment process', () => {
     };
 
     const { server, adminClient, shopClient } = createTestEnvironment(
-        mergeConfig(testConfig, {
+        mergeConfig(testConfig(), {
             shippingOptions: {
-                ...testConfig.shippingOptions,
-                customFulfillmentProcess: [customOrderProcess as any, customOrderProcess2 as any],
+                ...testConfig().shippingOptions,
+                process: [defaultFulfillmentProcess, customOrderProcess as any, customOrderProcess2 as any],
             },
             paymentOptions: {
                 paymentMethodHandlers: [testSuccessfulPaymentMethod],
@@ -105,14 +107,11 @@ describe('Fulfillment process', () => {
         await adminClient.asSuperAdmin();
 
         // Create a couple of orders to be queried
-        const result = await adminClient.query<GetCustomerList.Query, GetCustomerList.Variables>(
-            GET_CUSTOMER_LIST,
-            {
-                options: {
-                    take: 3,
-                },
+        const result = await adminClient.query(getCustomerListDocument, {
+            options: {
+                take: 3,
             },
-        );
+        });
         const customers = result.customers.items;
 
         /**
@@ -120,11 +119,11 @@ describe('Fulfillment process', () => {
          */
         await shopClient.asUserWithCredentials(customers[0].emailAddress, 'test');
         // Add Items
-        await shopClient.query<AddItemToOrder.Mutation, AddItemToOrder.Variables>(ADD_ITEM_TO_ORDER, {
+        await shopClient.query(addItemToOrderDocument, {
             productVariantId: 'T_1',
             quantity: 1,
         });
-        await shopClient.query<AddItemToOrder.Mutation, AddItemToOrder.Variables>(ADD_ITEM_TO_ORDER, {
+        await shopClient.query(addItemToOrderDocument, {
             productVariantId: 'T_2',
             quantity: 1,
         });
@@ -133,7 +132,7 @@ describe('Fulfillment process', () => {
         await addPaymentToOrder(shopClient, testSuccessfulPaymentMethod);
 
         // Add a fulfillment without tracking code
-        await adminClient.query<CreateFulfillment.Mutation, CreateFulfillment.Variables>(CREATE_FULFILLMENT, {
+        await adminClient.query(createFulfillmentDocument, {
             input: {
                 lines: [{ orderLineId: 'T_1', quantity: 1 }],
                 handler: {
@@ -144,7 +143,7 @@ describe('Fulfillment process', () => {
         });
 
         // Add a fulfillment with tracking code
-        await adminClient.query<CreateFulfillment.Mutation, CreateFulfillment.Variables>(CREATE_FULFILLMENT, {
+        await adminClient.query(createFulfillmentDocument, {
             input: {
                 lines: [{ orderLineId: 'T_2', quantity: 1 }],
                 handler: {
@@ -165,14 +164,11 @@ describe('Fulfillment process', () => {
     describe('CustomFulfillmentProcess', () => {
         it('is injectable', () => {
             expect(initSpy).toHaveBeenCalled();
-            expect(initSpy.mock.calls[0][0]).toBe('default');
+            expect(initSpy.mock.calls[0][0]).toBe(true);
         });
 
         it('replaced transition target', async () => {
-            const { order } = await adminClient.query<
-                GetOrderFulfillments.Query,
-                GetOrderFulfillments.Variables
-            >(GET_ORDER_FULFILLMENTS, {
+            const { order } = await adminClient.query(getOrderFulfillmentsDocument, {
                 id: 'T_1',
             });
             const [fulfillment] = order?.fulfillments || [];
@@ -181,22 +177,16 @@ describe('Fulfillment process', () => {
 
         it('custom onTransitionStart handler returning error message', async () => {
             // First transit to AwaitingPickup
-            await adminClient.query<TransitFulfillment.Mutation, TransitFulfillment.Variables>(
-                TRANSIT_FULFILLMENT,
-                {
-                    id: 'T_1',
-                    state: 'AwaitingPickup',
-                },
-            );
+            await adminClient.query(transitFulfillmentDocument, {
+                id: 'T_1',
+                state: 'AwaitingPickup',
+            });
 
             transitionStartSpy.mockClear();
             transitionErrorSpy.mockClear();
             transitionEndSpy.mockClear();
 
-            const { transitionFulfillmentToState } = await adminClient.query<
-                TransitFulfillment.Mutation,
-                TransitFulfillment.Variables
-            >(TRANSIT_FULFILLMENT, {
+            const { transitionFulfillmentToState } = await adminClient.query(transitFulfillmentDocument, {
                 id: 'T_1',
                 state: 'Shipped',
             });
@@ -219,20 +209,14 @@ describe('Fulfillment process', () => {
             transitionEndSpy.mockClear();
 
             // First transit to AwaitingPickup
-            await adminClient.query<TransitFulfillment.Mutation, TransitFulfillment.Variables>(
-                TRANSIT_FULFILLMENT,
-                {
-                    id: 'T_2',
-                    state: 'AwaitingPickup',
-                },
-            );
+            await adminClient.query(transitFulfillmentDocument, {
+                id: 'T_2',
+                state: 'AwaitingPickup',
+            });
 
             transitionEndSpy.mockClear();
 
-            const { transitionFulfillmentToState } = await adminClient.query<
-                TransitFulfillment.Mutation,
-                TransitFulfillment.Variables
-            >(TRANSIT_FULFILLMENT, {
+            const { transitionFulfillmentToState } = await adminClient.query(transitFulfillmentDocument, {
                 id: 'T_2',
                 state: 'Shipped',
             });
@@ -244,10 +228,7 @@ describe('Fulfillment process', () => {
         });
 
         it('composes multiple CustomFulfillmentProcesses', async () => {
-            const { order } = await adminClient.query<
-                GetOrderFulfillments.Query,
-                GetOrderFulfillments.Variables
-            >(GET_ORDER_FULFILLMENTS, {
+            const { order } = await adminClient.query(getOrderFulfillmentsDocument, {
                 id: 'T_1',
             });
             const [fulfillment] = order?.fulfillments || [];

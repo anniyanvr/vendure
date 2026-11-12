@@ -1,15 +1,24 @@
 import { mergeConfig } from '@vendure/core';
 import {
+    testConfig as defaultTestConfig,
     MysqlInitializer,
     PostgresInitializer,
     registerInitializer,
     SqljsInitializer,
-    testConfig as defaultTestConfig,
 } from '@vendure/testing';
+import fs from 'fs-extra';
 import path from 'path';
-import { ConnectionOptions } from 'typeorm';
+import { DataSourceOptions } from 'typeorm';
 
 import { getPackageDir } from './get-package-dir';
+
+declare global {
+    namespace NodeJS {
+        interface Global {
+            e2eServerPortsUsed: number[];
+        }
+    }
+}
 
 /**
  * We use a relatively long timeout on the initial beforeAll() function of the
@@ -25,34 +34,77 @@ registerInitializer('postgres', new PostgresInitializer());
 registerInitializer('mysql', new MysqlInitializer());
 registerInitializer('mariadb', new MysqlInitializer());
 
+export const testConfig = () => {
+    const index = getIndexOfTestFileInParentDir();
+    return mergeConfig(defaultTestConfig, {
+        apiOptions: {
+            port: getBasePort() + index,
+        },
+        importExportOptions: {
+            importAssetsDir: path.join(packageDir, 'fixtures/assets'),
+        },
+        dbConnectionOptions: getDbConfig(),
+    });
+};
+
 /**
- * For local debugging of the e2e tests, we set a very long timeout value otherwise tests will
- * automatically fail for going over the 5 second default timeout.
+ * Returns a base port unique to the current package, so that e2e tests
+ * from different packages (which Lerna may run in parallel) never collide.
+ * Core gets 3010–3199, other packages get 3200+.
  */
-if (process.env.E2E_DEBUG) {
-    // tslint:disable-next-line:no-console
-    console.log('E2E_DEBUG', process.env.E2E_DEBUG, ' - setting long timeout');
-    jest.setTimeout(1800 * 1000);
-}
-/**
- * Increase default timeout in CI to 10 seconds because occasionally valid tests fail due to
- * timeouts.
- */
-if (process.env.CI) {
-    jest.setTimeout(10 * 1000);
+function getBasePort(): number {
+    const packageName = process.env.PACKAGE || 'core';
+    const offsets: Record<string, number> = {
+        core: 3010,
+        'asset-server-plugin': 3220,
+        'graphiql-plugin': 3230,
+        cli: 3240,
+        'harden-plugin': 3260,
+        'mcp-plugin': 3270,
+    };
+    return offsets[packageName] ?? 3250;
 }
 
-export const testConfig = mergeConfig(defaultTestConfig, {
-    importExportOptions: {
-        importAssetsDir: path.join(packageDir, 'fixtures/assets'),
-    },
-    jobQueueOptions: {
-        pollInterval: 100,
-    },
-    dbConnectionOptions: getDbConfig(),
-});
+/**
+ * Returns the index of the test file in the parent directory.
+ * This is used to ensure each test file has a unique
+ * port number.
+ */
+function getIndexOfTestFileInParentDir() {
+    const testFilePath = getCallerFilename(2);
+    const parentDir = path.dirname(testFilePath);
+    const files = fs.readdirSync(parentDir);
+    const index = files.indexOf(path.basename(testFilePath));
+    return index;
+}
 
-function getDbConfig(): ConnectionOptions {
+/**
+ * Returns the full path to the file which called the function.
+ * @param depth
+ */
+function getCallerFilename(depth: number): string {
+    let stack: any;
+    let file: any;
+    let frame: any;
+
+    const pst = Error.prepareStackTrace;
+    Error.prepareStackTrace = (_, _stack) => {
+        Error.prepareStackTrace = pst;
+        return _stack;
+    };
+
+    stack = new Error().stack;
+    stack = stack.slice(depth + 1);
+
+    do {
+        frame = stack.shift();
+        file = frame && frame.getFileName();
+    } while (stack.length && file === 'module.js');
+
+    return file;
+}
+
+export function getDbConfig(): DataSourceOptions {
     const dbType = process.env.DB || 'sqljs';
     switch (dbType) {
         case 'postgres':
@@ -61,8 +113,8 @@ function getDbConfig(): ConnectionOptions {
                 type: 'postgres',
                 host: '127.0.0.1',
                 port: process.env.CI ? +(process.env.E2E_POSTGRES_PORT || 5432) : 5432,
-                username: 'admin',
-                password: 'secret',
+                username: 'vendure',
+                password: 'password',
             };
         case 'mariadb':
             return {
@@ -71,7 +123,7 @@ function getDbConfig(): ConnectionOptions {
                 host: '127.0.0.1',
                 port: process.env.CI ? +(process.env.E2E_MARIADB_PORT || 3306) : 3306,
                 username: 'root',
-                password: '',
+                password: 'password',
             };
         case 'mysql':
             return {
@@ -80,7 +132,7 @@ function getDbConfig(): ConnectionOptions {
                 host: '127.0.0.1',
                 port: process.env.CI ? +(process.env.E2E_MYSQL_PORT || 3306) : 3306,
                 username: 'root',
-                password: '',
+                password: 'password',
             };
         case 'sqljs':
         default:

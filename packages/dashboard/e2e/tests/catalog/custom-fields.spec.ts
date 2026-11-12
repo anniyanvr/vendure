@@ -1,0 +1,676 @@
+import { type Locator, type Page, expect, test } from '@playwright/test';
+
+import { BaseDetailPage } from '../../page-objects/detail-page.base.js';
+import { BaseListPage } from '../../page-objects/list-page.base.js';
+
+// Custom fields are configured in global-setup.ts on the Product entity.
+// This suite verifies rendering of all custom field types: scalar, list, struct,
+// list-of-struct, and list-inside-struct. Tests cover tabs, display/edit modes,
+// and persistence after save.
+//
+// IMPORTANT: All tests share a single "Laptop" product, so the outer describe
+// must be serial to prevent concurrent mutations.
+
+const listPage = (page: Page) =>
+    new BaseListPage(page, {
+        path: '/products',
+        title: 'Products',
+        newButtonLabel: 'New Product',
+    });
+
+const detailPage = (page: Page) =>
+    new BaseDetailPage(page, {
+        newPath: '/products/new',
+        pathPrefix: '/products/',
+        newTitle: 'New product',
+    });
+
+/** Navigate to the first seeded product's detail page and wait for the form to load. */
+async function goToFirstProduct(page: Page) {
+    const lp = listPage(page);
+    await lp.goto();
+    await lp.expectLoaded();
+    await lp.search('Laptop');
+    await lp.clickEntity('Laptop');
+    await expect(page).toHaveURL(/\/products\/[^/]+$/);
+    // Wait for entity data AND custom fields to fully load before interacting.
+    // Custom fields load via separate async queries after the main product data.
+    const dp = detailPage(page);
+    await expect(dp.formItem('Product name').getByRole('textbox')).toHaveValue('Laptop', { timeout: 10_000 });
+    // Wait for all network requests to settle AND the Update button to be disabled
+    // (disabled = form is clean with server data loaded, no pending changes).
+    await page.waitForLoadState('networkidle');
+    await expect(page.getByRole('button', { name: 'Update', exact: true })).toBeDisabled({ timeout: 10_000 });
+}
+
+/**
+ * Locate a form-item by label within a scoped container (e.g. inside a struct).
+ * Same logic as BaseDetailPage.formItem but scoped to a parent locator.
+ */
+function scopedFormItem(container: Locator, page: Page, label: string): Locator {
+    return container.locator('[data-slot="field"]').filter({
+        has: page.locator('[data-slot="field-label"]').getByText(label, { exact: true }),
+    });
+}
+
+test.describe('Custom Fields', () => {
+    test.describe.configure({ mode: 'serial' });
+
+    // ─── Scalar field types ──────────────────────────────────────────────
+
+    test('should render all custom field types on a product detail page', async ({ page }) => {
+        await goToFirstProduct(page);
+        const dp = detailPage(page);
+
+        // string → textbox
+        await expect(dp.formItem('Info URL').getByRole('textbox')).toBeVisible();
+        // float → spinbutton
+        await expect(dp.formItem('Weight').getByRole('spinbutton')).toBeVisible();
+        // int → spinbutton
+        await expect(dp.formItem('Review Rating').getByRole('spinbutton')).toBeVisible();
+        // boolean → switch
+        await expect(dp.formItem('Downloadable').getByRole('switch')).toBeVisible();
+        // datetime → button (calendar picker trigger)
+        await expect(dp.formItem('Release Date').getByRole('button').first()).toBeVisible();
+        // text → textbox
+        await expect(dp.formItem('Additional Info').getByRole('textbox')).toBeVisible();
+        // string with options → combobox
+        await expect(dp.formItem('Priority').getByRole('combobox')).toBeVisible();
+        await expect(dp.formItem('Feature Type').getByRole('combobox')).toBeVisible();
+    });
+
+    // ─── Nullable option select ──────────────────────────────────────────
+
+    // #4801 — allow selecting and clearing nullable select items
+    test('should allow selecting and clearing a nullable option select', async ({ page }) => {
+        await goToFirstProduct(page);
+        const dp = detailPage(page);
+        const featureTypeCombobox = dp.formItem('Feature Type').getByRole('combobox');
+
+        // Base UI Select shows placeholder state via data-placeholder on the trigger,
+        // not as visible text in the combobox accessible name.
+        await expect(featureTypeCombobox).toHaveAttribute('data-placeholder', '');
+
+        await dp.selectOption('Feature Type', 'premium');
+        await expect(featureTypeCombobox).toContainText('premium');
+
+        await featureTypeCombobox.click();
+        await page.getByRole('listbox').getByRole('option').first().click();
+        await expect(featureTypeCombobox).toHaveAttribute('data-placeholder', '');
+        await expect(featureTypeCombobox).not.toContainText('premium');
+    });
+
+    // #4801 — create product without setting a nullable option select
+    test('should create a product without setting a nullable option select', async ({ page }) => {
+        const dp = detailPage(page);
+        await dp.gotoNew();
+        await dp.expectNewPageLoaded();
+
+        await dp.fillInput('Product name', 'Nullable Feature Type Product');
+        await expect(dp.formItem('Slug').getByRole('textbox')).not.toHaveValue('', { timeout: 5_000 });
+        await expect(dp.formItem('Feature Type').getByRole('combobox')).toHaveAttribute(
+            'data-placeholder',
+            '',
+        );
+        await expect(dp.createButton).toBeEnabled({ timeout: 10_000 });
+
+        await dp.clickCreate();
+        await dp.expectSuccessToast(/Successfully created product/);
+        await dp.expectNavigatedToExisting();
+    });
+
+    // ─── Non-nullable field with a default ───────────────────────────────
+
+    // #5241 — an untouched non-nullable custom field must not block the create form
+    test('should create a product without touching a non-nullable custom field', async ({ page }) => {
+        const dp = detailPage(page);
+        await dp.gotoNew();
+        await dp.expectNewPageLoaded();
+
+        await dp.fillInput('Product name', 'Default Warranty Product');
+        await expect(dp.formItem('Slug').getByRole('textbox')).not.toHaveValue('', { timeout: 5_000 });
+        await expect(dp.formItem('Warranty Months').getByRole('spinbutton')).toHaveValue('');
+        await expect(dp.createButton).toBeEnabled({ timeout: 10_000 });
+
+        await dp.clickCreate();
+        await dp.expectSuccessToast(/Successfully created product/);
+        await dp.expectNavigatedToExisting();
+
+        // The empty field is omitted from the payload, so the column's SQL DEFAULT is what lands.
+        await page.reload();
+        await expect(dp.formItem('Warranty Months').getByRole('spinbutton')).toHaveValue('12', {
+            timeout: 10_000,
+        });
+    });
+
+    // #5241 — the update form still requires a value for a non-nullable custom field
+    test('should keep the Update button disabled after clearing a non-nullable custom field', async ({
+        page,
+    }) => {
+        await goToFirstProduct(page);
+        const dp = detailPage(page);
+        const warrantyInput = dp.formItem('Warranty Months').getByRole('spinbutton');
+
+        // A valid edit enables the button, so the assertion below is about validity, not dirtiness.
+        await warrantyInput.fill('24');
+        await expect(dp.updateButton).toBeEnabled({ timeout: 10_000 });
+
+        await warrantyInput.fill('');
+        await expect(dp.updateButton).toBeDisabled({ timeout: 10_000 });
+    });
+
+    // ─── Tab grouping ────────────────────────────────────────────────────
+
+    test('should display custom field tabs', async ({ page }) => {
+        await goToFirstProduct(page);
+
+        const tabList = page.locator('[data-slot="tabs-list"]');
+        await expect(tabList).toBeVisible();
+
+        // Verify all tab triggers are present
+        for (const tabName of ['General', 'SEO', 'Details', 'Lists', 'Struct']) {
+            await expect(page.locator('[data-slot="tabs-trigger"]', { hasText: tabName })).toBeVisible();
+        }
+
+        // "General" should be the active tab by default
+        // Base UI uses `data-active` (boolean) instead of Radix's `data-state="active"`
+        await expect(page.locator('[data-slot="tabs-trigger"]', { hasText: 'General' })).toHaveAttribute(
+            'data-active',
+            '',
+        );
+    });
+
+    test('should switch between custom field tabs', async ({ page }) => {
+        await goToFirstProduct(page);
+        const dp = detailPage(page);
+
+        // Click "SEO" tab → SEO fields should be visible
+        await page.locator('[data-slot="tabs-trigger"]', { hasText: 'SEO' }).click();
+        await expect(dp.formItem('SEO Title')).toBeVisible();
+        await expect(dp.formItem('SEO Description')).toBeVisible();
+
+        // Click "Details" tab → Detail Notes should be visible
+        await page.locator('[data-slot="tabs-trigger"]', { hasText: 'Details' }).click();
+        await expect(dp.formItem('Detail Notes')).toBeVisible();
+
+        // Click "General" tab → original fields visible again
+        await page.locator('[data-slot="tabs-trigger"]', { hasText: 'General' }).click();
+        await expect(dp.formItem('Info URL').getByRole('textbox')).toBeVisible();
+        await expect(dp.formItem('Weight').getByRole('spinbutton')).toBeVisible();
+    });
+
+    // #5246 — a localized custom field with no label falls back to the field's own
+    // name, not the internal form path (which also changes with the content language).
+    test('should label an unlabelled locale custom field with its field name', async ({ page }) => {
+        await goToFirstProduct(page);
+
+        await page.locator('[data-slot="tabs-trigger"]', { hasText: 'SEO' }).click();
+
+        const labels = page.locator('[data-slot="field-label"]');
+        await expect(labels.getByText('seoKeywords', { exact: true })).toBeVisible();
+        await expect(labels.filter({ hasText: 'customFields.seoKeywords' })).toHaveCount(0);
+    });
+
+    test('should render locale fields with language selector', async ({ page }) => {
+        await goToFirstProduct(page);
+
+        // Switch to SEO tab
+        await page.locator('[data-slot="tabs-trigger"]', { hasText: 'SEO' }).click();
+
+        const seoTitleItem = page.locator('[data-slot="field"]').filter({
+            has: page.locator('[data-slot="field-label"]').getByText('SEO Title', { exact: true }),
+        });
+        await expect(seoTitleItem).toBeVisible();
+        await expect(seoTitleItem.getByRole('textbox')).toBeVisible();
+    });
+
+    // ─── Scalar save & persist ───────────────────────────────────────────
+
+    test('should save custom field values on a product', async ({ page }) => {
+        await goToFirstProduct(page);
+        const dp = detailPage(page);
+
+        // Fill in custom field values on the General tab
+        await dp.fillInput('Info URL', 'https://example.com');
+        await dp.fillNumber('Weight', '2.5');
+        await dp.fillNumber('Review Rating', '4');
+        await dp.toggleSwitch('Downloadable', true);
+        await dp.selectOption('Priority', 'high');
+
+        // Save
+        await dp.clickUpdate();
+        await dp.expectSuccessToast(/Successfully updated product/);
+
+        // Reload and verify persistence
+        await page.reload();
+        await expect(dp.formItem('Info URL').getByRole('textbox')).toHaveValue('https://example.com');
+        await expect(dp.formItem('Weight').getByRole('spinbutton')).toHaveValue('2.5');
+        await expect(dp.formItem('Review Rating').getByRole('spinbutton')).toHaveValue('4');
+        await expect(dp.formItem('Downloadable').getByRole('switch')).toBeChecked();
+        await expect(dp.formItem('Priority').getByRole('combobox')).toContainText('high');
+    });
+
+    // ─── String list (tag-style input) ───────────────────────────────────
+
+    test('should render a string list field with tag input', async ({ page }) => {
+        await goToFirstProduct(page);
+        await page.locator('[data-slot="tabs-trigger"]', { hasText: 'Lists' }).click();
+
+        const tagsField = detailPage(page).formItem('Tags');
+        await expect(tagsField).toBeVisible();
+
+        // StringListInput renders a text input with "Type and press Enter" placeholder
+        await expect(tagsField.getByRole('textbox')).toBeVisible();
+    });
+
+    test('should add and remove tags via Enter key', async ({ page }) => {
+        await goToFirstProduct(page);
+        await page.locator('[data-slot="tabs-trigger"]', { hasText: 'Lists' }).click();
+
+        const tagsField = detailPage(page).formItem('Tags');
+        const tagInput = tagsField.getByRole('textbox');
+
+        // Add two tags by typing + Enter
+        await tagInput.fill('electronics');
+        await tagInput.press('Enter');
+        await tagInput.fill('sale');
+        await tagInput.press('Enter');
+
+        // Tags should appear as badge elements
+        await expect(tagsField.getByText('electronics')).toBeVisible();
+        await expect(tagsField.getByText('sale')).toBeVisible();
+
+        // Remove "electronics" via its remove button (aria-label "Remove electronics")
+        await tagsField.getByLabel('Remove electronics').click();
+        await expect(tagsField.getByText('electronics')).not.toBeVisible();
+        await expect(tagsField.getByText('sale')).toBeVisible();
+    });
+
+    test('should save and persist tag list values', async ({ page }) => {
+        await goToFirstProduct(page);
+        const dp = detailPage(page);
+        await page.locator('[data-slot="tabs-trigger"]', { hasText: 'Lists' }).click();
+
+        const tagsField = dp.formItem('Tags');
+        const tagInput = tagsField.getByRole('textbox');
+
+        // Add three tags
+        await tagInput.fill('premium');
+        await tagInput.press('Enter');
+        await tagInput.fill('featured');
+        await tagInput.press('Enter');
+        await tagInput.fill('new-arrival');
+        await tagInput.press('Enter');
+
+        // Save
+        await dp.clickUpdate();
+        await dp.expectSuccessToast(/Successfully updated product/);
+
+        // Reload and verify
+        await page.reload();
+        await page.locator('[data-slot="tabs-trigger"]', { hasText: 'Lists' }).click();
+        const reloadedTags = dp.formItem('Tags');
+        await expect(reloadedTags.getByText('premium')).toBeVisible();
+        await expect(reloadedTags.getByText('featured')).toBeVisible();
+        await expect(reloadedTags.getByText('new-arrival')).toBeVisible();
+    });
+
+    // ─── Struct (single) ─────────────────────────────────────────────────
+
+    test('should render a struct field in display mode', async ({ page }) => {
+        await goToFirstProduct(page);
+        await page.locator('[data-slot="tabs-trigger"]', { hasText: 'Struct' }).click();
+
+        const specField = detailPage(page).formItem('Specifications');
+        await expect(specField).toBeVisible();
+
+        // Display mode shows a definition list with dt/dd pairs for each struct field
+        await expect(specField.locator('dt').getByText('Material')).toBeVisible();
+        await expect(specField.locator('dt').getByText('Height')).toBeVisible();
+        await expect(specField.locator('dt').getByText('Recyclable')).toBeVisible();
+        await expect(specField.locator('dt').getByText('Certifications')).toBeVisible();
+
+        // Edit button (pencil icon with sr-only "Edit" text) should be visible
+        await expect(specField.getByRole('button', { name: 'Edit' })).toBeVisible();
+    });
+
+    test('should switch to edit mode and show form inputs', async ({ page }) => {
+        await goToFirstProduct(page);
+        await page.locator('[data-slot="tabs-trigger"]', { hasText: 'Struct' }).click();
+
+        const specField = detailPage(page).formItem('Specifications');
+        await specField.getByRole('button', { name: 'Edit' }).click();
+
+        // Edit mode should show form inputs for each struct sub-field
+        const materialField = scopedFormItem(specField, page, 'Material');
+        await expect(materialField.getByRole('textbox')).toBeVisible();
+
+        const heightField = scopedFormItem(specField, page, 'Height');
+        await expect(heightField.locator('input[type="number"]')).toBeVisible();
+
+        const recyclableField = scopedFormItem(specField, page, 'Recyclable');
+        await expect(recyclableField.getByRole('switch')).toBeVisible();
+
+        // "Certifications" is list: true inside the struct → shows "Add item"
+        const certsField = scopedFormItem(specField, page, 'Certifications');
+        await expect(certsField.getByRole('button', { name: /Add item/i })).toBeVisible();
+
+        // Done button should be visible
+        await expect(specField.getByRole('button', { name: 'Done' })).toBeVisible();
+    });
+
+    test('should fill struct values and switch back to display mode', async ({ page }) => {
+        await goToFirstProduct(page);
+        await page.locator('[data-slot="tabs-trigger"]', { hasText: 'Struct' }).click();
+
+        const specField = detailPage(page).formItem('Specifications');
+        await specField.getByRole('button', { name: 'Edit' }).click();
+
+        // Fill in struct fields
+        await scopedFormItem(specField, page, 'Material').getByRole('textbox').fill('Aluminium');
+        await scopedFormItem(specField, page, 'Height').locator('input[type="number"]').fill('15.5');
+        await scopedFormItem(specField, page, 'Recyclable').getByRole('switch').click();
+
+        // Click Done to return to display mode
+        await specField.getByRole('button', { name: 'Done' }).click();
+
+        // Display mode should now show the entered values
+        const ddElements = specField.locator('dd');
+        await expect(ddElements.filter({ hasText: 'Aluminium' })).toBeVisible();
+        await expect(ddElements.filter({ hasText: '15.5' })).toBeVisible();
+    });
+
+    test('should save struct values and persist after reload', async ({ page }) => {
+        await goToFirstProduct(page);
+        const dp = detailPage(page);
+        await page.locator('[data-slot="tabs-trigger"]', { hasText: 'Struct' }).click();
+
+        const specField = dp.formItem('Specifications');
+        await specField.getByRole('button', { name: 'Edit' }).click();
+
+        await scopedFormItem(specField, page, 'Material').getByRole('textbox').fill('Steel');
+        await scopedFormItem(specField, page, 'Height').locator('input[type="number"]').fill('20');
+        await scopedFormItem(specField, page, 'Recyclable').getByRole('switch').click();
+
+        await specField.getByRole('button', { name: 'Done' }).click();
+
+        // Save
+        await dp.clickUpdate();
+        await dp.expectSuccessToast(/Successfully updated product/);
+
+        // Reload and verify
+        await page.reload();
+        await page.locator('[data-slot="tabs-trigger"]', { hasText: 'Struct' }).click();
+
+        const reloadedSpec = dp.formItem('Specifications');
+        const ddElements = reloadedSpec.locator('dd');
+        await expect(ddElements.filter({ hasText: 'Steel' })).toBeVisible();
+        await expect(ddElements.filter({ hasText: '20' })).toBeVisible();
+    });
+
+    // ─── List inside struct ──────────────────────────────────────────────
+
+    test('should add items to a list field inside a struct', async ({ page }) => {
+        await goToFirstProduct(page);
+        const dp = detailPage(page);
+        await page.locator('[data-slot="tabs-trigger"]', { hasText: 'Struct' }).click();
+
+        const specField = dp.formItem('Specifications');
+        await specField.getByRole('button', { name: 'Edit' }).click();
+
+        // "Certifications" is list: true inside the struct
+        const certsField = scopedFormItem(specField, page, 'Certifications');
+        const addBtn = certsField.getByRole('button', { name: /Add item/i });
+
+        // Add two certification items
+        await addBtn.click();
+        await addBtn.click();
+
+        const inputs = certsField.getByRole('textbox');
+        await expect(inputs).toHaveCount(2);
+
+        await inputs.nth(0).fill('ISO-9001');
+        await inputs.nth(1).fill('CE');
+
+        // Switch to display mode — certifications should show as comma-joined string
+        await specField.getByRole('button', { name: 'Done' }).click();
+        await expect(specField.locator('dd').filter({ hasText: 'ISO-9001, CE' })).toBeVisible();
+
+        // Save and verify persistence
+        await dp.clickUpdate();
+        await dp.expectSuccessToast(/Successfully updated product/);
+
+        await page.reload();
+        await page.locator('[data-slot="tabs-trigger"]', { hasText: 'Struct' }).click();
+
+        const reloadedSpec = dp.formItem('Specifications');
+        await expect(reloadedSpec.locator('dd').filter({ hasText: 'ISO-9001, CE' })).toBeVisible();
+    });
+
+    // ─── List of structs ─────────────────────────────────────────────────
+
+    test('should render a struct list field with an "Add item" button', async ({ page }) => {
+        await goToFirstProduct(page);
+        await page.locator('[data-slot="tabs-trigger"]', { hasText: 'Struct' }).click();
+
+        const dimField = detailPage(page).formItem('Dimensions');
+        await expect(dimField).toBeVisible();
+        await expect(dimField.getByRole('button', { name: /Add item/i })).toBeVisible();
+    });
+
+    test('should add a struct item to the list and edit it', async ({ page }) => {
+        await goToFirstProduct(page);
+        await page.locator('[data-slot="tabs-trigger"]', { hasText: 'Struct' }).click();
+
+        const dimField = detailPage(page).formItem('Dimensions');
+
+        // Add a new struct item
+        await dimField.getByRole('button', { name: /Add item/i }).click();
+
+        // A new struct appears in display mode with dashes. Click Edit.
+        await dimField.getByRole('button', { name: 'Edit' }).first().click();
+
+        // Fill in the struct fields (only one struct is in edit mode → .first())
+        await scopedFormItem(dimField, page, 'Dimension Name').getByRole('textbox').first().fill('Width');
+        await scopedFormItem(dimField, page, 'Dimension Value')
+            .locator('input[type="number"]')
+            .first()
+            .fill('30');
+        await scopedFormItem(dimField, page, 'Dimension Unit').getByRole('textbox').first().fill('cm');
+
+        // Done editing
+        await dimField.getByRole('button', { name: 'Done' }).first().click();
+
+        // Display mode should show the values
+        await expect(dimField.locator('dd').filter({ hasText: 'Width' })).toBeVisible();
+        await expect(dimField.locator('dd').filter({ hasText: '30' })).toBeVisible();
+        await expect(dimField.locator('dd').filter({ hasText: 'cm' })).toBeVisible();
+    });
+
+    test('should save struct list and persist after reload', async ({ page }) => {
+        await goToFirstProduct(page);
+        const dp = detailPage(page);
+        await page.locator('[data-slot="tabs-trigger"]', { hasText: 'Struct' }).click();
+
+        const dimField = dp.formItem('Dimensions');
+
+        // Add first dimension
+        await dimField.getByRole('button', { name: /Add item/i }).click();
+        await dimField.getByRole('button', { name: 'Edit' }).first().click();
+        await scopedFormItem(dimField, page, 'Dimension Name').getByRole('textbox').first().fill('Length');
+        await scopedFormItem(dimField, page, 'Dimension Value')
+            .locator('input[type="number"]')
+            .first()
+            .fill('50');
+        await scopedFormItem(dimField, page, 'Dimension Unit').getByRole('textbox').first().fill('mm');
+        await dimField.getByRole('button', { name: 'Done' }).first().click();
+
+        // Add second dimension — first item is now in display mode
+        await dimField.getByRole('button', { name: /Add item/i }).click();
+        // The newly added struct's Edit button. The first Edit belongs to the
+        // first item (display mode), the second to the new item.
+        const editButtons = dimField.getByRole('button', { name: 'Edit' });
+        await editButtons.nth(1).click();
+
+        // Only the second struct is in edit mode, so form inputs appear once
+        await scopedFormItem(dimField, page, 'Dimension Name').getByRole('textbox').first().fill('Depth');
+        await scopedFormItem(dimField, page, 'Dimension Value')
+            .locator('input[type="number"]')
+            .first()
+            .fill('10');
+        await scopedFormItem(dimField, page, 'Dimension Unit').getByRole('textbox').first().fill('mm');
+        await dimField.getByRole('button', { name: 'Done' }).first().click();
+
+        // Save
+        await dp.clickUpdate();
+        await dp.expectSuccessToast(/Successfully updated product/);
+
+        // Reload and verify both structs persisted
+        await page.reload();
+        await page.locator('[data-slot="tabs-trigger"]', { hasText: 'Struct' }).click();
+
+        const reloadedDim = dp.formItem('Dimensions');
+        await expect(reloadedDim.locator('dd').filter({ hasText: 'Length' })).toBeVisible();
+        await expect(reloadedDim.locator('dd').filter({ hasText: '50' })).toBeVisible();
+        await expect(reloadedDim.locator('dd').filter({ hasText: 'Depth' })).toBeVisible();
+        await expect(reloadedDim.locator('dd').filter({ hasText: '10' })).toBeVisible();
+    });
+
+    // #4393 — the v2 datetime picker should expose both date and time controls
+    test('datetime picker should display date and time controls', async ({ page }) => {
+        await goToFirstProduct(page);
+        const dp = detailPage(page);
+
+        const releaseDateItem = dp.formItem('Release Date');
+        const picker = releaseDateItem.locator('[data-slot="date-time-picker"]');
+        await expect(picker.locator('input[type="time"]')).toBeVisible();
+        await picker.getByRole('button').first().click();
+
+        const popover = page.locator('[data-slot="popover-content"]');
+        await expect(popover).toBeVisible();
+        await expect(popover.locator('[data-slot="calendar"]')).toBeVisible();
+    });
+
+    // #4393 — selecting a date should set the datetime and close the popover
+    test('datetime date selection should set a value and close the popover', async ({ page }) => {
+        await goToFirstProduct(page);
+        const dp = detailPage(page);
+
+        const releaseDateItem = dp.formItem('Release Date');
+        const picker = releaseDateItem.locator('[data-slot="date-time-picker"]');
+        const triggerButton = picker.getByRole('button').first();
+        await expect(triggerButton).toContainText('Pick a date and time');
+
+        await triggerButton.click();
+        const popover = page.locator('[data-slot="popover-content"]');
+        await expect(popover).toBeVisible();
+        await popover.locator('[data-slot="calendar"] button[data-day]:not([disabled])').first().click();
+
+        await expect(popover).not.toBeVisible();
+        await expect(triggerButton).not.toContainText('Pick a date and time');
+        await expect(picker.locator('input[type="time"]')).toBeEnabled();
+    });
+});
+
+// #4741 — when the form is invalid the submit button is disabled, and the page has to say why.
+// Uses the `numericCode` field (pattern `^[0-9]*$`). A stored value which fails the pattern is
+// simulated by rewriting the ProductDetail response, because the server rejects one on write.
+test.describe('Form error summary', () => {
+    const summary = (page: Page) => page.getByRole('alert').filter({ hasText: 'This cannot be saved' });
+
+    /** Serves every ProductDetail response with an invalid `numericCode`, passing each through `edit`. */
+    async function serveInvalidNumericCode(
+        page: Page,
+        edit: (product: any, call: number) => void = () => {},
+    ) {
+        let call = 0;
+        await page.route('**/admin-api**', async route => {
+            if (!/query ProductDetail\b/.test(route.request().postData() ?? '')) {
+                return route.fallback();
+            }
+            const response = await route.fetch();
+            const json = await response.json();
+            const product = json.data?.product;
+            if (product?.customFields) {
+                product.customFields.numericCode = 'not-numeric';
+                edit(product, call++);
+            }
+            await route.fulfill({ response, json });
+        });
+    }
+
+    test('lists an invalid field on the create page and clears once it is fixed', async ({ page }) => {
+        const dp = detailPage(page);
+        await dp.gotoNew();
+        await dp.expectNewPageLoaded();
+
+        await dp.fillInput('Product name', 'Form error summary test');
+        await expect(dp.createButton).toBeEnabled({ timeout: 10_000 });
+        await expect(summary(page)).toBeHidden();
+
+        await dp.fillInput('Numeric Code', 'abc');
+        await expect(dp.createButton).toBeDisabled();
+        await expect(summary(page)).toContainText('Numeric Code: Value must match pattern: ^[0-9]*$');
+
+        await dp.fillInput('Numeric Code', '12345');
+        await expect(summary(page)).toBeHidden();
+        await expect(dp.createButton).toBeEnabled();
+    });
+
+    test('lists a loaded value which fails validation before any field is touched', async ({ page }) => {
+        await serveInvalidNumericCode(page);
+        await goToProduct(page);
+
+        await expect(summary(page)).toContainText('Numeric Code: Value must match pattern: ^[0-9]*$');
+
+        // A valid edit to another field leaves Update disabled, and the reason stays on the page.
+        await detailPage(page).fillInput('Product name', 'Laptop edited');
+        await expect(page.getByRole('button', { name: 'Update', exact: true })).toBeDisabled();
+        await expect(summary(page)).toBeVisible();
+    });
+
+    test('lists the invalid value again after the same product is refetched', async ({ page }) => {
+        // The refetch returns a different name, so react-hook-form resets the form and clears its
+        // errors. The summary has to come back after that reset.
+        await serveInvalidNumericCode(page, (product, call) => {
+            if (call > 0) {
+                product.name = 'Laptop (refetched)';
+                for (const translation of product.translations ?? []) {
+                    translation.name = 'Laptop (refetched)';
+                }
+            }
+        });
+        await goToProduct(page);
+        await expect(summary(page)).toBeVisible();
+
+        // Leave and re-enter: the cached product renders first, then the stale query refetches.
+        // Suspense queries count as fresh for their first second, so wait that out on the list.
+        await page
+            .getByRole('navigation', { name: 'breadcrumb' })
+            .getByRole('link', { name: 'Products' })
+            .click();
+        const lp = listPage(page);
+        await lp.expectLoaded();
+        await lp.search('Laptop');
+        await page.waitForTimeout(1_500);
+        await lp.clickEntity('Laptop');
+        await expect(detailPage(page).formItem('Product name').getByRole('textbox')).toHaveValue(
+            'Laptop (refetched)',
+            { timeout: 10_000 },
+        );
+        await expect(summary(page)).toBeVisible();
+    });
+});
+
+/** Opens the seeded "Laptop" product without waiting for a clean form, which an invalid value prevents. */
+async function goToProduct(page: Page) {
+    const lp = listPage(page);
+    await lp.goto();
+    await lp.expectLoaded();
+    await lp.search('Laptop');
+    await lp.clickEntity('Laptop');
+    await expect(page).toHaveURL(/\/products\/[^/]+$/);
+    await expect(detailPage(page).formItem('Product name').getByRole('textbox')).toHaveValue('Laptop', {
+        timeout: 10_000,
+    });
+}

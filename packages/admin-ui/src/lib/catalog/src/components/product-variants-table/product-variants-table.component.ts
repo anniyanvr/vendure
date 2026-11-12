@@ -6,26 +6,38 @@ import {
     OnDestroy,
     OnInit,
 } from '@angular/core';
-import { FormArray, FormGroup } from '@angular/forms';
-import { ProductWithVariants } from '@vendure/admin-ui/core';
+import { UntypedFormArray, UntypedFormGroup } from '@angular/forms';
+import { Asset, Permission, ProductDetailFragment, ProductVariantFragment } from '@vendure/admin-ui/core';
 import { Subscription } from 'rxjs';
 import { debounceTime, distinctUntilChanged, map } from 'rxjs/operators';
 
-import { SelectedAssets } from '../product-detail/product-detail.component';
+interface SelectedAssets {
+    assets?: Asset[];
+    featuredAsset?: Asset;
+}
+
+interface PaginationConfig {
+    totalItems: number;
+    currentPage: number;
+    itemsPerPage: number;
+}
 
 @Component({
     selector: 'vdr-product-variants-table',
     templateUrl: './product-variants-table.component.html',
     styleUrls: ['./product-variants-table.component.scss'],
     changeDetection: ChangeDetectionStrategy.OnPush,
+    standalone: false
 })
 export class ProductVariantsTableComponent implements OnInit, OnDestroy {
-    @Input('productVariantsFormArray') formArray: FormArray;
-    @Input() variants: ProductWithVariants.Variants[];
+    @Input('productVariantsFormArray') formArray: UntypedFormArray;
+    @Input() variants: ProductVariantFragment[];
+    @Input() paginationConfig: PaginationConfig;
     @Input() channelPriceIncludesTax: boolean;
-    @Input() optionGroups: ProductWithVariants.OptionGroups[];
+    @Input() optionGroups: ProductDetailFragment['optionGroups'];
     @Input() pendingAssetChanges: { [variantId: string]: SelectedAssets };
-    formGroupMap = new Map<string, FormGroup>();
+    formGroupMap = new Map<string, UntypedFormGroup>();
+    readonly updatePermission = [Permission.UpdateCatalog, Permission.UpdateProduct];
     private subscription: Subscription;
 
     constructor(private changeDetector: ChangeDetectorRef) {}
@@ -50,7 +62,15 @@ export class ProductVariantsTableComponent implements OnInit, OnDestroy {
         }
     }
 
-    getFeaturedAsset(variant: ProductWithVariants.Variants) {
+    trackByFn(index: number, item: any) {
+        if ((item as any).id != null) {
+            return (item as any).id;
+        } else {
+            return index;
+        }
+    }
+
+    getFeaturedAsset(variant: ProductVariantFragment) {
         return this.pendingAssetChanges[variant.id]?.featuredAsset || variant.featuredAsset;
     }
 
@@ -62,7 +82,7 @@ export class ProductVariantsTableComponent implements OnInit, OnDestroy {
     private buildFormGroupMap() {
         this.formGroupMap.clear();
         for (const controlGroup of this.formArray.controls) {
-            this.formGroupMap.set(controlGroup.value.id, controlGroup as FormGroup);
+            this.formGroupMap.set(controlGroup.value.id, controlGroup as UntypedFormGroup);
         }
         this.changeDetector.markForCheck();
     }

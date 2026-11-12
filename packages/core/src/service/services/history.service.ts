@@ -1,28 +1,35 @@
 import { Injectable } from '@nestjs/common';
 import { UpdateCustomerInput as UpdateCustomerShopInput } from '@vendure/common/lib/generated-shop-types';
 import {
+    CurrencyCode,
     HistoryEntryListOptions,
     HistoryEntryType,
+    OrderLineInput,
     UpdateAddressInput,
     UpdateCustomerInput,
 } from '@vendure/common/lib/generated-types';
 import { ID, PaginatedList, Type } from '@vendure/common/lib/shared-types';
 
 import { RequestContext } from '../../api/common/request-context';
+import { EntityNotFoundError } from '../../common/error/errors';
+import { Instrument } from '../../common/instrument-decorator';
+import { TransactionalConnection } from '../../connection/transactional-connection';
 import { Administrator } from '../../entity/administrator/administrator.entity';
+import { Customer } from '../../entity/customer/customer.entity';
 import { CustomerHistoryEntry } from '../../entity/history-entry/customer-history-entry.entity';
 import { HistoryEntry } from '../../entity/history-entry/history-entry.entity';
 import { OrderHistoryEntry } from '../../entity/history-entry/order-history-entry.entity';
+import { EventBus } from '../../event-bus';
+import { HistoryEntryEvent } from '../../event-bus/events/history-entry-event';
 import { FulfillmentState } from '../helpers/fulfillment-state-machine/fulfillment-state';
 import { ListQueryBuilder } from '../helpers/list-query-builder/list-query-builder';
 import { OrderState } from '../helpers/order-state-machine/order-state';
 import { PaymentState } from '../helpers/payment-state-machine/payment-state';
 import { RefundState } from '../helpers/refund-state-machine/refund-state';
-import { TransactionalConnection } from '../transaction/transactional-connection';
+import { assertOrderIsInChannel } from '../helpers/utils/order-utils';
 
 import { AdministratorService } from './administrator.service';
-
-export type CustomerHistoryEntryData = {
+export interface CustomerHistoryEntryData {
     [HistoryEntryType.CUSTOMER_REGISTERED]: {
         strategy: string;
     };
@@ -48,9 +55,9 @@ export type CustomerHistoryEntryData = {
     [HistoryEntryType.CUSTOMER_ADDRESS_DELETED]: {
         address: string;
     };
-    [HistoryEntryType.CUSTOMER_PASSWORD_UPDATED]: {};
-    [HistoryEntryType.CUSTOMER_PASSWORD_RESET_REQUESTED]: {};
-    [HistoryEntryType.CUSTOMER_PASSWORD_RESET_VERIFIED]: {};
+    [HistoryEntryType.CUSTOMER_PASSWORD_UPDATED]: Record<string, never>;
+    [HistoryEntryType.CUSTOMER_PASSWORD_RESET_REQUESTED]: Record<string, never>;
+    [HistoryEntryType.CUSTOMER_PASSWORD_RESET_VERIFIED]: Record<string, never>;
     [HistoryEntryType.CUSTOMER_EMAIL_UPDATE_REQUESTED]: {
         oldEmailAddress: string;
         newEmailAddress: string;
@@ -62,9 +69,9 @@ export type CustomerHistoryEntryData = {
     [HistoryEntryType.CUSTOMER_NOTE]: {
         note: string;
     };
-};
+}
 
-export type OrderHistoryEntryData = {
+export interface OrderHistoryEntryData {
     [HistoryEntryType.ORDER_STATE_TRANSITION]: {
         from: OrderState;
         to: OrderState;
@@ -83,7 +90,8 @@ export type OrderHistoryEntryData = {
         fulfillmentId: ID;
     };
     [HistoryEntryType.ORDER_CANCELLATION]: {
-        orderItemIds: ID[];
+        lines: OrderLineInput[];
+        shippingCancelled: boolean;
         reason?: string;
     };
     [HistoryEntryType.ORDER_REFUND_TRANSITION]: {
@@ -105,7 +113,18 @@ export type OrderHistoryEntryData = {
     [HistoryEntryType.ORDER_MODIFIED]: {
         modificationId: ID;
     };
-};
+    [HistoryEntryType.ORDER_CUSTOMER_UPDATED]: {
+        previousCustomerId?: ID;
+        previousCustomerName?: ID;
+        newCustomerId: ID;
+        newCustomerName: ID;
+        note?: string;
+    };
+    [HistoryEntryType.ORDER_CURRENCY_UPDATED]: {
+        previousCurrency: CurrencyCode;
+        newCurrency: CurrencyCode;
+    };
+}
 
 export interface CreateCustomerHistoryEntryArgs<T extends keyof CustomerHistoryEntryData> {
     customerId: ID;
@@ -137,14 +156,111 @@ export interface UpdateCustomerHistoryEntryArgs<T extends keyof CustomerHistoryE
 }
 
 /**
- * The HistoryService is reponsible for creating and retrieving HistoryEntry entities.
+ * @description
+ * Contains methods relating to {@link HistoryEntry} entities. Histories are timelines of actions
+ * related to a particular Customer or Order, recording significant events such as creation, state changes,
+ * notes, etc.
+ *
+ * ## Custom History Entry Types
+ *
+ * Since Vendure v1.9.0, it is possible to define custom HistoryEntry types.
+ *
+ * Let's take an example where we have some Customers who are businesses. We want to verify their
+ * tax ID in order to allow them wholesale rates. As part of this verification, we'd like to add
+ * an entry into the Customer's history with data about the tax ID verification.
+ *
+ * First of all we'd extend the GraphQL `HistoryEntryType` enum for our new type as part of a plugin
+ *
+ * @example
+ * ```ts
+ * import { PluginCommonModule, VendurePlugin } from '\@vendure/core';
+ * import { VerificationService } from './verification.service';
+ *
+ * \@VendurePlugin({
+ *   imports: [PluginCommonModule],
+ *   adminApiExtensions: {
+ *     schema: gql`
+ *       extend enum HistoryEntryType {
+ *         CUSTOMER_TAX_ID_VERIFICATION
+ *       }
+ *     `,
+ *   },
+ *   providers: [VerificationService],
+ * })
+ * export class TaxIDVerificationPlugin {}
+ * ```
+ *
+ * Next we need to create a TypeScript type definition file where we extend the `CustomerHistoryEntryData` interface. This is done
+ * via TypeScript's [declaration merging](https://www.typescriptlang.org/docs/handbook/declaration-merging.html#merging-interfaces)
+ * and [ambient modules](https://www.typescriptlang.org/docs/handbook/modules.html#ambient-modules) features.
+ *
+ * @example
+ * ```ts
+ * // types.ts
+ * import { CustomerHistoryEntryData } from '\@vendure/core';
+ *
+ * export const CUSTOMER_TAX_ID_VERIFICATION = 'CUSTOMER_TAX_ID_VERIFICATION';
+ *
+ * declare module '@vendure/core' {
+ *   interface CustomerHistoryEntryData {
+ *     [CUSTOMER_TAX_ID_VERIFICATION]: {
+ *       taxId: string;
+ *       valid: boolean;
+ *       name?: string;
+ *       address?: string;
+ *     };
+ *   }
+ * }
+ * ```
+ *
+ * Note: it works exactly the same way if we wanted to add a custom type for Order history, except in that case we'd extend the
+ * `OrderHistoryEntryData` interface instead.
+ *
+ * Now that we have our types set up, we can use the HistoryService to add a new HistoryEntry in a type-safe manner:
+ *
+ * @example
+ * ```ts
+ * // verification.service.ts
+ * import { Injectable } from '\@nestjs/common';
+ * import { RequestContext } from '\@vendure/core';
+ * import { CUSTOMER_TAX_ID_VERIFICATION } from './types';
+ *
+ * \@Injectable()
+ * export class VerificationService {
+ *   constructor(private historyService: HistoryService) {}
+ *
+ *   async verifyTaxId(ctx: RequestContext, customerId: ID, taxId: string) {
+ *     const result = await someTaxIdCheckingService(taxId);
+ *
+ *     await this.historyService.createHistoryEntryForCustomer({
+ *       customerId,
+ *       ctx,
+ *       type: CUSTOMER_TAX_ID_VERIFICATION,
+ *       data: {
+ *         taxId,
+ *         valid: result.isValid,
+ *         name: result.companyName,
+ *         address: result.registeredAddress,
+ *       },
+ *     });
+ *   }
+ * }
+ * ```
+ * :::info
+ * It is also possible to define a UI component to display custom history entry types. See the
+ * [Custom History Timeline Components guide](/extending-the-admin-ui/custom-timeline-components/).
+ * :::
+ *
+ * @docsCategory services
  */
 @Injectable()
+@Instrument()
 export class HistoryService {
     constructor(
         private connection: TransactionalConnection,
         private administratorService: AdministratorService,
         private listQueryBuilder: ListQueryBuilder,
+        private eventBus: EventBus,
     ) {}
 
     async getHistoryForOrder(
@@ -154,7 +270,7 @@ export class HistoryService {
         options?: HistoryEntryListOptions,
     ): Promise<PaginatedList<OrderHistoryEntry>> {
         return this.listQueryBuilder
-            .build((HistoryEntry as any) as Type<OrderHistoryEntry>, options, {
+            .build(HistoryEntry as any as Type<OrderHistoryEntry>, options, {
                 where: {
                     order: { id: orderId } as any,
                     ...(publicOnly ? { isPublic: true } : {}),
@@ -182,7 +298,9 @@ export class HistoryService {
             order: { id: orderId },
             administrator,
         });
-        return this.connection.getRepository(ctx, OrderHistoryEntry).save(entry);
+        const history = await this.connection.getRepository(ctx, OrderHistoryEntry).save(entry);
+        await this.eventBus.publish(new HistoryEntryEvent(ctx, history, 'created', 'order', { type, data }));
+        return history;
     }
 
     async getHistoryForCustomer(
@@ -192,7 +310,7 @@ export class HistoryService {
         options?: HistoryEntryListOptions,
     ): Promise<PaginatedList<CustomerHistoryEntry>> {
         return this.listQueryBuilder
-            .build((HistoryEntry as any) as Type<CustomerHistoryEntry>, options, {
+            .build(HistoryEntry as any as Type<CustomerHistoryEntry>, options, {
                 where: {
                     customer: { id: customerId } as any,
                     ...(publicOnly ? { isPublic: true } : {}),
@@ -221,7 +339,11 @@ export class HistoryService {
             customer: { id: customerId },
             administrator,
         });
-        return this.connection.getRepository(ctx, CustomerHistoryEntry).save(entry);
+        const history = await this.connection.getRepository(ctx, CustomerHistoryEntry).save(entry);
+        await this.eventBus.publish(
+            new HistoryEntryEvent(ctx, history, 'created', 'customer', { type, data }),
+        );
+        return history;
     }
 
     async updateOrderHistoryEntry<T extends keyof OrderHistoryEntryData>(
@@ -230,7 +352,9 @@ export class HistoryService {
     ) {
         const entry = await this.connection.getEntityOrThrow(ctx, OrderHistoryEntry, args.entryId, {
             where: { type: args.type },
+            relations: ['order'],
         });
+        await assertOrderIsInChannel(ctx, this.connection, entry.order.id, 'OrderHistoryEntry', args.entryId);
 
         if (args.data) {
             entry.data = args.data;
@@ -242,12 +366,29 @@ export class HistoryService {
         if (administrator) {
             entry.administrator = administrator;
         }
-        return this.connection.getRepository(ctx, OrderHistoryEntry).save(entry);
+        const newEntry = await this.connection.getRepository(ctx, OrderHistoryEntry).save(entry);
+        await this.eventBus.publish(new HistoryEntryEvent(ctx, entry, 'updated', 'order', args));
+        return newEntry;
     }
 
-    async deleteOrderHistoryEntry(ctx: RequestContext, id: ID): Promise<void> {
-        const entry = await this.connection.getEntityOrThrow(ctx, OrderHistoryEntry, id);
+    /**
+     * @description
+     * Deletes an OrderHistoryEntry. Pass `options.type` to restrict the deletion to entries of that
+     * type, which is how the `deleteOrderNote` mutation avoids deleting any other kind of entry.
+     */
+    async deleteOrderHistoryEntry(
+        ctx: RequestContext,
+        id: ID,
+        options?: { type?: HistoryEntryType },
+    ): Promise<void> {
+        const entry = await this.connection.getEntityOrThrow(ctx, OrderHistoryEntry, id, {
+            where: options?.type ? { type: options.type } : {},
+            relations: ['order'],
+        });
+        await assertOrderIsInChannel(ctx, this.connection, entry.order.id, 'OrderHistoryEntry', id);
+        const deletedEntry = new OrderHistoryEntry(entry);
         await this.connection.getRepository(ctx, OrderHistoryEntry).remove(entry);
+        await this.eventBus.publish(new HistoryEntryEvent(ctx, deletedEntry, 'deleted', 'order', id));
     }
 
     async updateCustomerHistoryEntry<T extends keyof CustomerHistoryEntryData>(
@@ -256,7 +397,9 @@ export class HistoryService {
     ) {
         const entry = await this.connection.getEntityOrThrow(ctx, CustomerHistoryEntry, args.entryId, {
             where: { type: args.type },
+            relations: ['customer'],
         });
+        await this.assertCustomerIsInChannel(ctx, entry.customer.id, args.entryId);
 
         if (args.data) {
             entry.data = args.data;
@@ -265,18 +408,44 @@ export class HistoryService {
         if (administrator) {
             entry.administrator = administrator;
         }
-        return this.connection.getRepository(ctx, CustomerHistoryEntry).save(entry);
+        const newEntry = await this.connection.getRepository(ctx, CustomerHistoryEntry).save(entry);
+        await this.eventBus.publish(new HistoryEntryEvent(ctx, entry, 'updated', 'customer', args));
+        return newEntry;
     }
 
-    async deleteCustomerHistoryEntry(ctx: RequestContext, id: ID): Promise<void> {
-        const entry = await this.connection.getEntityOrThrow(ctx, CustomerHistoryEntry, id);
+    /**
+     * @description
+     * Deletes a CustomerHistoryEntry. Pass `options.type` to restrict the deletion to entries of that
+     * type, which is how the `deleteCustomerNote` mutation avoids deleting any other kind of entry.
+     */
+    async deleteCustomerHistoryEntry(
+        ctx: RequestContext,
+        id: ID,
+        options?: { type?: HistoryEntryType },
+    ): Promise<void> {
+        const entry = await this.connection.getEntityOrThrow(ctx, CustomerHistoryEntry, id, {
+            where: options?.type ? { type: options.type } : {},
+            relations: ['customer'],
+        });
+        await this.assertCustomerIsInChannel(ctx, entry.customer.id, id);
+        const deletedEntry = new CustomerHistoryEntry(entry);
         await this.connection.getRepository(ctx, CustomerHistoryEntry).remove(entry);
+        await this.eventBus.publish(new HistoryEntryEvent(ctx, deletedEntry, 'deleted', 'customer', id));
     }
 
     private async getAdministratorFromContext(ctx: RequestContext): Promise<Administrator | undefined> {
-        const administrator = ctx.activeUserId
-            ? await this.administratorService.findOneByUserId(ctx, ctx.activeUserId)
-            : undefined;
-        return administrator;
+        return this.administratorService.resolveActorAdministrator(ctx);
+    }
+
+    /**
+     * CustomerHistoryEntry is not ChannelAware, so the parent Customer is its only Channel boundary.
+     * The error names the entry rather than the Customer, so that it cannot be used to work out
+     * which Customer ids exist in other Channels.
+     */
+    private async assertCustomerIsInChannel(ctx: RequestContext, customerId: ID, entryId: ID): Promise<void> {
+        const customer = await this.connection.findOneInChannel(ctx, Customer, customerId, ctx.channelId);
+        if (!customer) {
+            throw new EntityNotFoundError('CustomerHistoryEntry', entryId);
+        }
     }
 }

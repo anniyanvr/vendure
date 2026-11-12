@@ -1,23 +1,40 @@
-import { LogicalOperator, SearchInput, SearchResult } from '@vendure/common/lib/generated-types';
+import { LogicalOperator, SearchResult } from '@vendure/common/lib/generated-types';
 import { ID } from '@vendure/common/lib/shared-types';
 import { Brackets, SelectQueryBuilder } from 'typeorm';
 
 import { RequestContext } from '../../../api/common/request-context';
+import { Injector } from '../../../common';
 import { UserInputError } from '../../../common/error/errors';
-import { TransactionalConnection } from '../../../service/transaction/transactional-connection';
-import { SearchIndexItem } from '../search-index-item.entity';
+import { TransactionalConnection } from '../../../connection/transactional-connection';
+import { PLUGIN_INIT_OPTIONS } from '../constants';
+import { SearchIndexItem } from '../entities/search-index-item.entity';
+import { DefaultSearchPluginInitOptions, SearchInput } from '../types';
 
 import { SearchStrategy } from './search-strategy';
-import { fieldsToSelect } from './search-strategy-common';
-import { createFacetIdCountMap, mapToSearchResult } from './search-strategy-utils';
+import { getFieldsToSelect } from './search-strategy-common';
+import {
+    applyLanguageConstraints,
+    createCollectionIdCountMap,
+    createFacetIdCountMap,
+    createPlaceholderFromId,
+    hasSortParameter,
+    mapToSearchResult,
+} from './search-strategy-utils';
 
 /**
- * A weighted fulltext search for PostgeSQL.
+ * @description A weighted fulltext search for PostgeSQL.
+ *
+ * @docsCategory DefaultSearchPlugin
  */
 export class PostgresSearchStrategy implements SearchStrategy {
     private readonly minTermLength = 2;
+    private connection: TransactionalConnection;
+    private options: DefaultSearchPluginInitOptions;
 
-    constructor(private connection: TransactionalConnection) {}
+    async init(injector: Injector) {
+        this.connection = injector.get(TransactionalConnection);
+        this.options = injector.get(PLUGIN_INIT_OPTIONS);
+    }
 
     async getFacetValueIds(
         ctx: RequestContext,
@@ -25,10 +42,10 @@ export class PostgresSearchStrategy implements SearchStrategy {
         enabledOnly: boolean,
     ): Promise<Map<ID, number>> {
         const facetValuesQb = this.connection
-            .getRepository(SearchIndexItem)
+            .getRepository(ctx, SearchIndexItem)
             .createQueryBuilder('si')
             .select(['"si"."productId"', 'MAX("si"."productVariantId")'])
-            .addSelect(`string_agg("si"."facetValueIds",',')`, 'facetValues');
+            .addSelect('string_agg("si"."facetValueIds",\',\')', 'facetValues');
 
         this.applyTermAndFilters(ctx, facetValuesQb, input, true);
         if (!input.groupByProduct) {
@@ -41,6 +58,28 @@ export class PostgresSearchStrategy implements SearchStrategy {
         return createFacetIdCountMap(facetValuesResult);
     }
 
+    async getCollectionIds(
+        ctx: RequestContext,
+        input: SearchInput,
+        enabledOnly: boolean,
+    ): Promise<Map<ID, number>> {
+        const collectionsQb = this.connection
+            .getRepository(ctx, SearchIndexItem)
+            .createQueryBuilder('si')
+            .select(['"si"."productId"', 'MAX("si"."productVariantId")'])
+            .addSelect('string_agg("si"."collectionIds",\',\')', 'collections');
+
+        this.applyTermAndFilters(ctx, collectionsQb, input, true);
+        if (!input.groupByProduct) {
+            collectionsQb.groupBy('"si"."productVariantId", "si"."productId"');
+        }
+        if (enabledOnly) {
+            collectionsQb.andWhere('"si"."enabled" = :enabled', { enabled: true });
+        }
+        const collectionsResult = await collectionsQb.getRawMany();
+        return createCollectionIdCountMap(collectionsResult);
+    }
+
     async getSearchResults(
         ctx: RequestContext,
         input: SearchInput,
@@ -50,47 +89,56 @@ export class PostgresSearchStrategy implements SearchStrategy {
         const skip = input.skip || 0;
         const sort = input.sort;
         const qb = this.connection
-            .getRepository(SearchIndexItem)
+            .getRepository(ctx, SearchIndexItem)
             .createQueryBuilder('si')
             .select(this.createPostgresSelect(!!input.groupByProduct));
         if (input.groupByProduct) {
-            qb.addSelect('MIN(price)', 'minPrice')
-                .addSelect('MAX(price)', 'maxPrice')
-                .addSelect('MIN("priceWithTax")', 'minPriceWithTax')
-                .addSelect('MAX("priceWithTax")', 'maxPriceWithTax');
+            qb.addSelect('MIN(si.price)', 'minPrice')
+                .addSelect('MAX(si.price)', 'maxPrice')
+                .addSelect('MIN(si.priceWithTax)', 'minPriceWithTax')
+                .addSelect('MAX(si.priceWithTax)', 'maxPriceWithTax');
         }
+
         this.applyTermAndFilters(ctx, qb, input);
 
-        if (sort) {
+        if (hasSortParameter(sort)) {
             if (sort.name) {
                 qb.addOrderBy('"si_productName"', sort.name);
             }
             if (sort.price) {
                 qb.addOrderBy('"si_price"', sort.price);
             }
-        } else {
-            if (input.term && input.term.length > this.minTermLength) {
-                qb.addOrderBy('score', 'DESC');
-            } else {
-                qb.addOrderBy('"si_productVariantId"', 'ASC');
-            }
+        } else if (input.term && input.term.length > this.minTermLength) {
+            qb.addOrderBy('score', 'DESC');
         }
+
+        // Required to ensure deterministic sorting.
+        // E.g. in case of sorting products with duplicate name, price or score results.
+        qb.addOrderBy('"si_productVariantId"', 'ASC');
+
         if (enabledOnly) {
             qb.andWhere('"si"."enabled" = :enabled', { enabled: true });
         }
 
         return qb
-            .take(take)
-            .skip(skip)
+            .limit(take)
+            .offset(skip)
             .getRawMany()
-            .then(res => res.map(r => mapToSearchResult(r, ctx.channel.currencyCode)));
+            .then(res =>
+                res.map(r =>
+                    mapToSearchResult(
+                        r,
+                        this.options.indexCurrencyCode ? r.si_currencyCode : ctx.channel.defaultCurrencyCode,
+                    ),
+                ),
+            );
     }
 
     async getTotalCount(ctx: RequestContext, input: SearchInput, enabledOnly: boolean): Promise<number> {
         const innerQb = this.applyTermAndFilters(
             ctx,
             this.connection
-                .getRepository(SearchIndexItem)
+                .getRepository(ctx, SearchIndexItem)
                 .createQueryBuilder('si')
                 .select(this.createPostgresSelect(!!input.groupByProduct)),
             input,
@@ -119,9 +167,19 @@ export class PostgresSearchStrategy implements SearchStrategy {
             facetValueOperator,
             collectionId,
             collectionSlug,
+            collectionIds,
+            collectionSlugs,
         } = input;
         // join multiple words with the logical AND operator
-        const termLogicalAnd = term ? term.trim().replace(/\s+/g, ' & ') : '';
+        const termLogicalAnd = term
+            ? term
+                  .trim()
+                  .replace(/['":\\!|&()]/g, ' ')
+                  .split(/\s+/g)
+                  .filter(t => t.length > 0)
+                  .map(t => `'${t}':*`)
+                  .join(' & ')
+            : '';
 
         qb.where('1 = 1');
         if (term && term.length > this.minTermLength) {
@@ -148,12 +206,19 @@ export class PostgresSearchStrategy implements SearchStrategy {
                 )
                 .setParameters({ term: termLogicalAnd });
         }
+        if (input.inStock != null) {
+            if (input.groupByProduct) {
+                qb.andWhere('si.productInStock = :inStock', { inStock: input.inStock });
+            } else {
+                qb.andWhere('si.inStock = :inStock', { inStock: input.inStock });
+            }
+        }
         if (facetValueIds?.length) {
             qb.andWhere(
                 new Brackets(qb1 => {
                     for (const id of facetValueIds) {
-                        const placeholder = '_' + id;
-                        const clause = `:${placeholder} = ANY (string_to_array(si.facetValueIds, ','))`;
+                        const placeholder = createPlaceholderFromId(id);
+                        const clause = `:${placeholder}::varchar = ANY (string_to_array(si.facetValueIds, ','))`;
                         const params = { [placeholder]: id };
                         if (facetValueOperator === LogicalOperator.AND) {
                             qb1.andWhere(clause, params);
@@ -174,15 +239,15 @@ export class PostgresSearchStrategy implements SearchStrategy {
                                     throw new UserInputError('error.facetfilterinput-invalid-input');
                                 }
                                 if (facetValueFilter.and) {
-                                    const placeholder = '_' + facetValueFilter.and;
-                                    const clause = `:${placeholder} = ANY (string_to_array(si.facetValueIds, ','))`;
+                                    const placeholder = createPlaceholderFromId(facetValueFilter.and);
+                                    const clause = `:${placeholder}::varchar = ANY (string_to_array(si.facetValueIds, ','))`;
                                     const params = { [placeholder]: facetValueFilter.and };
                                     qb2.where(clause, params);
                                 }
                                 if (facetValueFilter.or?.length) {
                                     for (const id of facetValueFilter.or) {
-                                        const placeholder = '_' + id;
-                                        const clause = `:${placeholder} = ANY (string_to_array(si.facetValueIds, ','))`;
+                                        const placeholder = createPlaceholderFromId(id);
+                                        const clause = `:${placeholder}::varchar = ANY (string_to_array(si.facetValueIds, ','))`;
                                         const params = { [placeholder]: id };
                                         qb2.orWhere(clause, params);
                                     }
@@ -194,18 +259,57 @@ export class PostgresSearchStrategy implements SearchStrategy {
             );
         }
         if (collectionId) {
-            qb.andWhere(`:collectionId = ANY (string_to_array(si.collectionIds, ','))`, { collectionId });
+            qb.andWhere(":collectionId::varchar = ANY (string_to_array(si.collectionIds, ','))", {
+                collectionId,
+            });
         }
         if (collectionSlug) {
-            qb.andWhere(`:collectionSlug = ANY (string_to_array(si.collectionSlugs, ','))`, {
+            qb.andWhere(":collectionSlug::varchar = ANY (string_to_array(si.collectionSlugs, ','))", {
                 collectionSlug,
             });
         }
-        qb.andWhere('si.languageCode = :languageCode', { languageCode: ctx.languageCode });
+        if (collectionIds?.length) {
+            qb.andWhere(
+                new Brackets(qb1 => {
+                    for (const id of Array.from(new Set(collectionIds))) {
+                        const placeholder = createPlaceholderFromId(id);
+                        qb1.orWhere(
+                            `:${placeholder}::varchar = ANY (string_to_array(si.collectionIds, ','))`,
+                            {
+                                [placeholder]: id,
+                            },
+                        );
+                    }
+                }),
+            );
+        }
+        if (collectionSlugs?.length) {
+            qb.andWhere(
+                new Brackets(qb1 => {
+                    for (const slug of Array.from(new Set(collectionSlugs))) {
+                        const placeholder = createPlaceholderFromId(slug);
+                        qb1.orWhere(
+                            `:${placeholder}::varchar = ANY (string_to_array(si.collectionSlugs, ','))`,
+                            {
+                                [placeholder]: slug,
+                            },
+                        );
+                    }
+                }),
+            );
+        }
+
         qb.andWhere('si.channelId = :channelId', { channelId: ctx.channelId });
+        applyLanguageConstraints(qb, ctx.languageCode, ctx.channel.defaultLanguageCode);
+
+        if (this.options.indexCurrencyCode) {
+            qb.andWhere('si.currencyCode = :currencyCode', { currencyCode: ctx.currencyCode });
+        }
+
         if (input.groupByProduct === true) {
             qb.groupBy('si.productId');
         }
+
         return qb;
     }
 
@@ -215,7 +319,7 @@ export class PostgresSearchStrategy implements SearchStrategy {
      * "MIN" function in this case to all other columns than the productId.
      */
     private createPostgresSelect(groupByProduct: boolean): string {
-        return fieldsToSelect
+        return getFieldsToSelect(this.options.indexStockStatus, this.options.indexCurrencyCode)
             .map(col => {
                 const qualifiedName = `si.${col}`;
                 const alias = `si_${col}`;
@@ -227,7 +331,7 @@ export class PostgresSearchStrategy implements SearchStrategy {
                         col === 'channelIds'
                     ) {
                         return `string_agg(${qualifiedName}, ',') as "${alias}"`;
-                    } else if (col === 'enabled') {
+                    } else if (col === 'enabled' || col === 'inStock' || col === 'productInStock') {
                         return `bool_or(${qualifiedName}) as "${alias}"`;
                     } else {
                         return `MIN(${qualifiedName}) as "${alias}"`;

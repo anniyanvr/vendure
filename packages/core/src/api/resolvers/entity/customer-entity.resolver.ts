@@ -8,10 +8,10 @@ import { Order } from '../../../entity/order/order.entity';
 import { CustomerService } from '../../../service/services/customer.service';
 import { HistoryService } from '../../../service/services/history.service';
 import { OrderService } from '../../../service/services/order.service';
-import { UserService } from '../../../service/services/user.service';
 import { ApiType } from '../../common/get-api-type';
 import { RequestContext } from '../../common/request-context';
 import { Api } from '../../decorators/api.decorator';
+import { RelationPaths, Relations } from '../../decorators/relations.decorator';
 import { Ctx } from '../../decorators/request-context.decorator';
 
 @Resolver('Customer')
@@ -19,7 +19,6 @@ export class CustomerEntityResolver {
     constructor(
         private customerService: CustomerService,
         private orderService: OrderService,
-        private userService: UserService,
     ) {}
     @ResolveField()
     async addresses(
@@ -40,27 +39,33 @@ export class CustomerEntityResolver {
         @Parent() customer: Customer,
         @Args() args: QueryOrdersArgs,
         @Api() apiType: ApiType,
+        @Relations(Order) relations: RelationPaths<Order>,
     ): Promise<PaginatedList<Order>> {
         if (apiType === 'shop' && !ctx.activeUserId) {
             // Guest customers should not be able to see this data
             return { items: [], totalItems: 0 };
         }
-        return this.orderService.findByCustomerId(ctx, customer.id, args.options || undefined);
+        return this.orderService.findByCustomerId(ctx, customer.id, args.options || undefined, relations);
     }
 
     @ResolveField()
-    user(@Ctx() ctx: RequestContext, @Parent() customer: Customer) {
+    async user(@Ctx() ctx: RequestContext, @Parent() customer: Customer) {
         if (customer.user) {
             return customer.user;
         }
-
-        return this.userService.getUserByEmailAddress(ctx, customer.emailAddress);
+        // Re-load the customer's actual user relation rather than looking up by email,
+        // since an email lookup can return a User belonging to a different Customer entity.
+        const loaded = await this.customerService.findOne(ctx, customer.id, ['user']);
+        return loaded?.user ?? null;
     }
 }
 
 @Resolver('Customer')
 export class CustomerAdminEntityResolver {
-    constructor(private customerService: CustomerService, private historyService: HistoryService) {}
+    constructor(
+        private customerService: CustomerService,
+        private historyService: HistoryService,
+    ) {}
 
     @ResolveField()
     groups(@Ctx() ctx: RequestContext, @Parent() customer: Customer) {

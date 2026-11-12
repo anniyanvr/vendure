@@ -1,0 +1,74 @@
+---
+title: "GraphiqlPlugin"
+generated: true
+---
+<GenerationInfo sourceFile="packages/graphiql-plugin/src/plugin.ts" sourceLine="59" packageName="@vendure/graphiql-plugin" />
+
+This plugin provides a GraphiQL UI for exploring and testing the Vendure GraphQL APIs.
+
+It adds routes `/graphiql/admin` and `/graphiql/shop` which serve the GraphiQL interface
+for the respective APIs. The `route` option changes the `graphiql` prefix.
+
+## Installation
+
+```ts
+import { GraphiqlPlugin } from '@vendure/graphiql-plugin';
+
+const config: VendureConfig = {
+  // Add an instance of the plugin to the plugins array
+  plugins: [
+    GraphiqlPlugin.init({
+      route: 'graphiql', // Optional, defaults to 'graphiql'
+    }),
+  ],
+};
+```
+
+## API URLs
+
+The GraphiQL page sends its requests to the Admin API and Shop API paths of your Vendure
+configuration (`apiOptions.adminApiPath` and `apiOptions.shopApiPath`), relative to the
+server that served the page. `apiOptions.hostname` is not used, so the page works behind
+a proxy or in a container that listens on `0.0.0.0`.
+
+## Query parameters
+
+You can add the following query parameters to the GraphiQL URL:
+
+- `?query=...` - Pre-populate the query editor with a GraphQL query.
+- `?embeddedMode=true` - This renders the editor in embedded mode, which hides the header and
+   the API switcher. This is useful for embedding GraphiQL in other applications such as documentation.
+   In this mode, the editor also does not persist changes across reloads.
+
+```ts title="Signature"
+class GraphiqlPlugin implements NestModule {
+    static options: Required<GraphiqlPluginOptions>;
+    constructor(processContext: ProcessContext, configService: ConfigService, graphiQLService: GraphiQLService)
+    init(options: GraphiqlPluginOptions = {}) => Type<GraphiqlPlugin>;
+    configure(consumer: MiddlewareConsumer) => ;
+}
+```
+* Implements: NestModule
+
+
+
+<div className="members-wrapper">
+
+### options
+
+<MemberInfo kind="property" type={`Required<GraphiqlPluginOptions>`}   />
+
+
+### init
+
+<MemberInfo kind="method" type={`(options: GraphiqlPluginOptions = {}) => Type<<a href='/reference/core-plugins/graphiql-plugin/#graphiqlplugin'>GraphiqlPlugin</a>>`}   />
+
+
+### configure
+
+<MemberInfo kind="method" type={`(consumer: MiddlewareConsumer) => `}   />
+
+
+
+
+</div>

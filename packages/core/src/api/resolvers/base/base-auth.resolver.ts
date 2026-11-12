@@ -1,4 +1,7 @@
-import { AuthenticationResult as ShopAuthenticationResult } from '@vendure/common/lib/generated-shop-types';
+import {
+    PasswordValidationError,
+    AuthenticationResult as ShopAuthenticationResult,
+} from '@vendure/common/lib/generated-shop-types';
 import {
     AuthenticationResult as AdminAuthenticationResult,
     CurrentUser,
@@ -11,18 +14,17 @@ import { Request, Response } from 'express';
 
 import { isGraphQlErrorResult } from '../../../common/error/error-result';
 import { ForbiddenError } from '../../../common/error/errors';
-import { NativeAuthStrategyError as AdminNativeAuthStrategyError } from '../../../common/error/generated-graphql-admin-errors';
 import {
     InvalidCredentialsError,
-    NativeAuthStrategyError as ShopNativeAuthStrategyError,
     NotVerifiedError,
 } from '../../../common/error/generated-graphql-shop-errors';
 import { NATIVE_AUTH_STRATEGY_NAME } from '../../../config/auth/native-authentication-strategy';
 import { ConfigService } from '../../../config/config.service';
-import { Logger } from '../../../config/logger/vendure-logger';
+import { LogLevel } from '../../../config/logger/vendure-logger';
 import { User } from '../../../entity/user/user.entity';
 import { getUserChannelsPermissions } from '../../../service/helpers/utils/get-user-channels-permissions';
 import { AdministratorService } from '../../../service/services/administrator.service';
+import { ApiKeyService } from '../../../service/services/api-key.service';
 import { AuthService } from '../../../service/services/auth.service';
 import { UserService } from '../../../service/services/user.service';
 import { extractSessionToken } from '../../common/extract-session-token';
@@ -31,18 +33,13 @@ import { RequestContext } from '../../common/request-context';
 import { setSessionToken } from '../../common/set-session-token';
 
 export class BaseAuthResolver {
-    protected readonly nativeAuthStrategyIsConfigured: boolean;
-
     constructor(
         protected authService: AuthService,
         protected userService: UserService,
         protected administratorService: AdministratorService,
         protected configService: ConfigService,
-    ) {
-        this.nativeAuthStrategyIsConfigured = !!this.configService.authOptions.shopAuthenticationStrategy.find(
-            strategy => strategy.name === NATIVE_AUTH_STRATEGY_NAME,
-        );
-    }
+        protected apiKeyService: ApiKeyService,
+    ) {}
 
     /**
      * Attempts a login given the username and password of a user. If successful, returns
@@ -66,11 +63,19 @@ export class BaseAuthResolver {
     }
 
     async logout(ctx: RequestContext, req: Request, res: Response): Promise<Success> {
-        const token = extractSessionToken(req, this.configService.authOptions.tokenMethod);
-        if (!token) {
+        const extraction = extractSessionToken(
+            req,
+            this.configService.authOptions.tokenMethod,
+            this.configService.authOptions.apiKeyHeaderKey,
+        );
+
+        // ApiKey "Sessions" are not meant to be logged out of
+        if (!extraction?.token || extraction.method === 'api-key') {
             return { success: false };
         }
-        await this.authService.destroyAuthenticatedSession(ctx, token);
+
+        await this.authService.destroyAuthenticatedSession(ctx, extraction.token);
+
         setSessionToken({
             req,
             res,
@@ -78,6 +83,7 @@ export class BaseAuthResolver {
             rememberMe: false,
             sessionToken: '',
         });
+
         return { success: true };
     }
 
@@ -87,12 +93,12 @@ export class BaseAuthResolver {
     async me(ctx: RequestContext, apiType: ApiType) {
         const userId = ctx.activeUserId;
         if (!userId) {
-            throw new ForbiddenError();
+            throw new ForbiddenError(LogLevel.Verbose);
         }
         if (apiType === 'admin') {
             const administrator = await this.administratorService.findOneByUserId(ctx, userId);
             if (!administrator) {
-                throw new ForbiddenError();
+                throw new ForbiddenError(LogLevel.Verbose);
             }
         }
         const user = userId && (await this.userService.getUserById(ctx, userId));
@@ -108,7 +114,11 @@ export class BaseAuthResolver {
         req: Request,
         res: Response,
     ): Promise<AdminAuthenticationResult | ShopAuthenticationResult | NotVerifiedError> {
-        const [method, data] = Object.entries(args.input)[0];
+        // Every field of AuthenticationInput is optional, so `{}` and `{ <strategy>: null }` pass validation.
+        const [method, data] = Object.entries(args.input)[0] ?? [];
+        if (!method || data == null) {
+            return new InvalidCredentialsError({ authenticationError: '' });
+        }
         const { apiType } = ctx;
         const session = await this.authService.authenticate(ctx, apiType, method, data);
         if (isGraphQlErrorResult(session)) {
@@ -117,7 +127,7 @@ export class BaseAuthResolver {
         if (apiType && apiType === 'admin') {
             const administrator = await this.administratorService.findOneByUserId(ctx, session.user.id);
             if (!administrator) {
-                return new InvalidCredentialsError('');
+                return new InvalidCredentialsError({ authenticationError: '' });
             }
         }
         setSessionToken({
@@ -137,7 +147,7 @@ export class BaseAuthResolver {
         ctx: RequestContext,
         currentPassword: string,
         newPassword: string,
-    ): Promise<boolean | InvalidCredentialsError> {
+    ): Promise<boolean | InvalidCredentialsError | PasswordValidationError> {
         const { activeUserId } = ctx;
         if (!activeUserId) {
             throw new ForbiddenError();
@@ -154,21 +164,5 @@ export class BaseAuthResolver {
             identifier: user.identifier,
             channels: getUserChannelsPermissions(user) as CurrentUserChannel[],
         };
-    }
-
-    protected requireNativeAuthStrategy():
-        | AdminNativeAuthStrategyError
-        | ShopNativeAuthStrategyError
-        | undefined {
-        if (!this.nativeAuthStrategyIsConfigured) {
-            const authStrategyNames = this.configService.authOptions.shopAuthenticationStrategy
-                .map(s => s.name)
-                .join(', ');
-            const errorMessage =
-                'This GraphQL operation requires that the NativeAuthenticationStrategy be configured for the Shop API.\n' +
-                `Currently the following AuthenticationStrategies are enabled: ${authStrategyNames}`;
-            Logger.error(errorMessage);
-            return new AdminNativeAuthStrategyError();
-        }
     }
 }

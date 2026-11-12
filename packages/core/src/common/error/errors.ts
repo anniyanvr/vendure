@@ -65,8 +65,30 @@ export class UnauthorizedError extends I18nError {
  * @docsPage Error Types
  */
 export class ForbiddenError extends I18nError {
+    constructor(logLevel: LogLevel = LogLevel.Warn) {
+        super('error.forbidden', {}, 'FORBIDDEN', logLevel);
+    }
+}
+
+/**
+ * @description
+ * This error should be thrown when an external authentication attempt presents an email
+ * address which already belongs to an existing account, but the external provider has not
+ * verified that the authenticating user owns that email address. Linking in this situation
+ * would allow account takeover, so it is refused.
+ *
+ * @docsCategory errors
+ * @docsPage Error Types
+ * @since 3.7.0
+ */
+export class UnverifiedExternalEmailError extends I18nError {
     constructor() {
-        super('error.forbidden', {}, 'FORBIDDEN', LogLevel.Warn);
+        super(
+            'error.unverified-external-email-conflict',
+            {},
+            'UNVERIFIED_EXTERNAL_EMAIL',
+            LogLevel.Warn,
+        );
     }
 }
 
@@ -93,7 +115,7 @@ export class ChannelNotFoundError extends I18nError {
  * @docsPage Error Types
  */
 export class EntityNotFoundError extends I18nError {
-    constructor(entityName: keyof typeof coreEntitiesMap, id: ID) {
+    constructor(entityName: keyof typeof coreEntitiesMap | string, id: ID) {
         super('error.entity-with-id-not-found', { entityName, id }, 'ENTITY_NOT_FOUND', LogLevel.Warn);
     }
 }

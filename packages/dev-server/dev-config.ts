@@ -1,59 +1,90 @@
-/* tslint:disable:no-console */
-import { AdminUiPlugin } from '@vendure/admin-ui-plugin';
+/* eslint-disable no-console */
+import { OnApplicationBootstrap } from '@nestjs/common';
 import { AssetServerPlugin } from '@vendure/asset-server-plugin';
 import { ADMIN_API_PATH, API_PORT, SHOP_API_PATH } from '@vendure/common/lib/shared-constants';
 import {
-    Asset,
     DefaultJobQueuePlugin,
     DefaultLogger,
+    DefaultSchedulerPlugin,
     DefaultSearchPlugin,
     dummyPaymentHandler,
-    examplePaymentHandler,
-    LanguageCode,
     LogLevel,
-    manualFulfillmentHandler,
-    PaymentMethodEligibilityChecker,
+    PluginCommonModule,
+    RequestContextService,
+    SettingsStoreScopes,
+    SettingsStoreService,
     VendureConfig,
+    VendurePlugin,
 } from '@vendure/core';
-import { ElasticsearchPlugin } from '@vendure/elasticsearch-plugin';
-import { defaultEmailHandlers, EmailPlugin } from '@vendure/email-plugin';
+import { DashboardPlugin } from '@vendure/dashboard/plugin';
+import { defaultEmailHandlers, EmailPlugin, FileBasedTemplateLoader } from '@vendure/email-plugin';
+import 'dotenv/config';
+import { createRequire } from 'node:module';
 import path from 'path';
-import { ConnectionOptions } from 'typeorm';
+import { DataSourceOptions } from 'typeorm';
 
-const testPaymentChecker = new PaymentMethodEligibilityChecker({
-    code: 'test-checker',
-    description: [{ languageCode: LanguageCode.en, value: 'test checker' }],
-    args: {},
-    check: (ctx, order) => true,
-});
+import { NavModifierPlugin } from './test-plugins/nav-modifier-plugin/nav-modifier-plugin';
+// import { FieldTestPlugin } from './test-plugins/field-test/field-test-plugin';
+import { InsightsTestPlugin } from './test-plugins/insights-test/insights-test-plugin';
+// import { ReviewsPlugin } from './test-plugins/reviews/reviews-plugin';
+
+const IS_INSTRUMENTED = process.env.IS_INSTRUMENTED === 'true';
+const SERVE_GRAPHIQL = process.env.VENDURE_SERVE_GRAPHIQL !== 'false';
+const SERVE_STATIC_DASHBOARD = process.env.VENDURE_SERVE_STATIC_DASHBOARD !== 'false';
+const loadPackage = createRequire(__filename);
+const dashboardUrl = process.env.VENDURE_DASHBOARD_URL || 'http://localhost:3000/dashboard';
+const dashboardAppDir =
+    path.basename(__dirname) === 'dist'
+        ? path.join(__dirname, './dashboard')
+        : path.join(__dirname, './dist/dashboard');
+
+@VendurePlugin({
+    imports: [PluginCommonModule],
+    configuration: config => {
+        config.settingsStoreFields = {
+            ...config.settingsStoreFields,
+            ReadonlyTest: [
+                { name: 'buildVersion', readonly: true },
+                { name: 'buildMeta', readonly: true },
+            ],
+        };
+        return config;
+    },
+})
+class ReadonlySettingsTestPlugin implements OnApplicationBootstrap {
+    constructor(
+        private settingsStoreService: SettingsStoreService,
+        private requestContextService: RequestContextService,
+    ) {}
+    async onApplicationBootstrap() {
+        const ctx = await this.requestContextService.create({ apiType: 'admin' });
+        await this.settingsStoreService.set(ctx, 'ReadonlyTest.buildVersion', 'v3.5.2' as any);
+        await this.settingsStoreService.set(ctx, 'ReadonlyTest.buildMeta', {
+            buildDate: '2026-03-06',
+            commit: 'd0384f3ed',
+            features: ['settings-store-ui', 'option-groups'],
+        });
+    }
+}
 
 /**
  * Config settings used during development
  */
 export const devConfig: VendureConfig = {
     apiOptions: {
-        port: API_PORT,
+        port: Number(process.env.PORT) || Number(process.env.API_PORT) || API_PORT,
+        trustProxy: process.env.VENDURE_TRUST_PROXY === 'true',
         adminApiPath: ADMIN_API_PATH,
-        adminApiPlayground: {
-            settings: {
-                'request.credentials': 'include',
-            } as any,
-        },
-        adminApiDebug: true,
         shopApiPath: SHOP_API_PATH,
-        shopApiPlayground: {
-            settings: {
-                'request.credentials': 'include',
-            } as any,
-        },
-        shopApiDebug: true,
     },
     authOptions: {
         disableAuth: false,
-        tokenMethod: 'cookie',
-        sessionSecret: 'some-secret',
+        tokenMethod: ['bearer', 'cookie', 'api-key'] as const,
         requireVerification: true,
         customPermissions: [],
+        cookieOptions: {
+            secret: 'abc',
+        },
     },
     dbConnectionOptions: {
         synchronize: false,
@@ -62,50 +93,69 @@ export const devConfig: VendureConfig = {
         ...getDbConfig(),
     },
     paymentOptions: {
-        paymentMethodEligibilityCheckers: [testPaymentChecker],
         paymentMethodHandlers: [dummyPaymentHandler],
     },
-    customFields: {
-        /*Asset: [{ name: 'description', type: 'string' }],*/
+    settingsStoreFields: {
+        MyPlugin: [
+            {
+                name: 'globalVal',
+            },
+            {
+                name: 'userVal',
+                scope: SettingsStoreScopes.user,
+            },
+        ],
     },
-    logger: new DefaultLogger({ level: LogLevel.Info }),
+    customFields: {},
+    logger: new DefaultLogger({ level: LogLevel.Verbose }),
     importExportOptions: {
         importAssetsDir: path.join(__dirname, 'import-assets'),
     },
-    shippingOptions: {
-        fulfillmentHandlers: [manualFulfillmentHandler],
-    },
     plugins: [
+        // MultivendorPlugin.init({
+        //     platformFeePercent: 10,
+        //     platformFeeSKU: 'FEE',
+        // }),
+        ReadonlySettingsTestPlugin,
+        // ReviewsPlugin,
+        InsightsTestPlugin,
+        // FieldTestPlugin,
+        NavModifierPlugin,
+        ...(SERVE_GRAPHIQL ? [loadPackage('@vendure/graphiql-plugin').GraphiqlPlugin.init()] : []),
         AssetServerPlugin.init({
             route: 'assets',
             assetUploadDir: path.join(__dirname, 'assets'),
         }),
-        DefaultSearchPlugin,
-        DefaultJobQueuePlugin,
-        // ElasticsearchPlugin.init({
-        //     host: 'http://localhost',
-        //     port: 9200,
-        // }),
+        DefaultSearchPlugin.init({ bufferUpdates: false, indexStockStatus: false }),
+        // Enable if you need to debug the job queue
+        // BullMQJobQueuePlugin.init({}),
+        DefaultJobQueuePlugin.init({}),
+        // JobQueueTestPlugin.init({ queueCount: 10 }),
+        DefaultSchedulerPlugin.init({}),
         EmailPlugin.init({
             devMode: true,
             route: 'mailbox',
             handlers: defaultEmailHandlers,
-            templatePath: path.join(__dirname, '../email-plugin/templates'),
+            templateLoader: new FileBasedTemplateLoader(path.join(__dirname, '../email-plugin/templates')),
             outputPath: path.join(__dirname, 'test-emails'),
             globalTemplateVars: {
-                verifyEmailAddressUrl: 'http://localhost:4201/verify',
-                passwordResetUrl: 'http://localhost:4201/reset-password',
-                changeEmailAddressUrl: 'http://localhost:4201/change-email-address',
+                verifyEmailAddressUrl: `${dashboardUrl}/verify`,
+                passwordResetUrl: `${dashboardUrl}/reset-password`,
+                changeEmailAddressUrl: `${dashboardUrl}/change-email-address`,
+                adminPasswordResetUrl: `${dashboardUrl}/reset-password`,
             },
         }),
-        AdminUiPlugin.init({
-            route: 'admin',
-            port: 5001,
-        }),
+        ...(IS_INSTRUMENTED ? [loadPackage('@vendure/telemetry-plugin').TelemetryPlugin.init({})] : []),
+        SERVE_STATIC_DASHBOARD
+            ? DashboardPlugin.init({
+                  route: 'dashboard',
+                  appDir: dashboardAppDir,
+              })
+            : DashboardPlugin,
     ],
 };
 
-function getDbConfig(): ConnectionOptions {
+function getDbConfig(): DataSourceOptions {
     const dbType = process.env.DB || 'mysql';
     switch (dbType) {
         case 'postgres':
@@ -113,16 +163,17 @@ function getDbConfig(): ConnectionOptions {
             return {
                 synchronize: true,
                 type: 'postgres',
-                host: '127.0.0.1',
-                port: 5432,
-                username: 'admin',
-                password: 'secret',
-                database: 'vendure-dev',
+                host: process.env.DB_HOST || 'localhost',
+                port: Number(process.env.DB_PORT) || 5432,
+                username: process.env.DB_USERNAME || 'vendure',
+                password: process.env.DB_PASSWORD || 'password',
+                database: process.env.DB_NAME || 'vendure-dev',
+                schema: process.env.DB_SCHEMA || 'public',
             };
         case 'sqlite':
             console.log('Using sqlite connection');
             return {
-                synchronize: false,
+                synchronize: true,
                 type: 'better-sqlite3',
                 database: path.join(__dirname, 'vendure.sqlite'),
             };
@@ -135,6 +186,7 @@ function getDbConfig(): ConnectionOptions {
                 location: path.join(__dirname, 'vendure.sqlite'),
             };
         case 'mysql':
+        case 'mariadb':
         default:
             console.log('Using mysql connection');
             return {
@@ -142,8 +194,8 @@ function getDbConfig(): ConnectionOptions {
                 type: 'mariadb',
                 host: '127.0.0.1',
                 port: 3306,
-                username: 'root',
-                password: '',
+                username: 'vendure',
+                password: 'password',
                 database: 'vendure-dev',
             };
     }

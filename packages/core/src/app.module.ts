@@ -1,19 +1,19 @@
 import { MiddlewareConsumer, Module, NestModule, OnApplicationShutdown } from '@nestjs/common';
-import { Type } from '@vendure/common/lib/shared-types';
+import cookieSession from 'cookie-session';
 
 import { ApiModule } from './api/api.module';
+import { Middleware, MiddlewareHandler } from './common';
 import { ConfigModule } from './config/config.module';
 import { ConfigService } from './config/config.service';
 import { Logger } from './config/logger/vendure-logger';
+import { ConnectionModule } from './connection/connection.module';
 import { HealthCheckModule } from './health-check/health-check.module';
 import { I18nModule } from './i18n/i18n.module';
 import { I18nService } from './i18n/i18n.service';
 import { PluginModule } from './plugin/plugin.module';
 import { ProcessContextModule } from './process-context/process-context.module';
 import { ServiceModule } from './service/service.module';
-
-// tslint:disable-next-line:ban-types
-type Middleware = Type<any> | Function;
+import { TelemetryModule } from './telemetry/telemetry.module';
 
 @Module({
     imports: [
@@ -23,21 +23,46 @@ type Middleware = Type<any> | Function;
         ApiModule,
         PluginModule.forRoot(),
         HealthCheckModule,
-        ServiceModule.forRoot(),
+        ServiceModule,
+        ConnectionModule,
+        TelemetryModule,
     ],
 })
 export class AppModule implements NestModule, OnApplicationShutdown {
-    constructor(private configService: ConfigService, private i18nService: I18nService) {}
+    constructor(
+        private configService: ConfigService,
+        private i18nService: I18nService,
+    ) {}
 
     configure(consumer: MiddlewareConsumer) {
         const { adminApiPath, shopApiPath, middleware } = this.configService.apiOptions;
+        const { cookieOptions } = this.configService.authOptions;
+
         const i18nextHandler = this.i18nService.handle();
-        const defaultMiddleware: Array<{ handler: Middleware; route?: string }> = [
+        const defaultMiddleware: Middleware[] = [
             { handler: i18nextHandler, route: adminApiPath },
             { handler: i18nextHandler, route: shopApiPath },
         ];
+
         const allMiddleware = defaultMiddleware.concat(middleware);
-        const middlewareByRoute = this.groupMiddlewareByRoute(allMiddleware);
+
+        // If the Admin API and Shop API should have specific cookies names, we need to create separate cookie sessions
+        if (typeof cookieOptions?.name === 'object') {
+            const shopApiCookieName = cookieOptions.name.shop;
+            const adminApiCookieName = cookieOptions.name.admin;
+            allMiddleware.push({
+                handler: cookieSession({ ...cookieOptions, name: adminApiCookieName }),
+                route: adminApiPath,
+            });
+            allMiddleware.push({
+                handler: cookieSession({ ...cookieOptions, name: shopApiCookieName }),
+                route: shopApiPath,
+            });
+        }
+
+        const consumableMiddlewares = allMiddleware.filter(mid => !mid.beforeListen);
+        const middlewareByRoute = this.groupMiddlewareByRoute(consumableMiddlewares);
+
         for (const [route, handlers] of Object.entries(middlewareByRoute)) {
             consumer.apply(...handlers).forRoutes(route);
         }
@@ -50,12 +75,10 @@ export class AppModule implements NestModule, OnApplicationShutdown {
     }
 
     /**
-     * Groups middleware handlers together in an object with the route as the key.
+     * Groups middleware handler together in an object with the route as the key.
      */
-    private groupMiddlewareByRoute(
-        middlewareArray: Array<{ handler: Middleware; route?: string }>,
-    ): { [route: string]: Middleware[] } {
-        const result = {} as { [route: string]: Middleware[] };
+    private groupMiddlewareByRoute(middlewareArray: Middleware[]): { [route: string]: MiddlewareHandler[] } {
+        const result = {} as { [route: string]: MiddlewareHandler[] };
         for (const middleware of middlewareArray) {
             const route = middleware.route || this.configService.apiOptions.adminApiPath;
             if (!result[route]) {

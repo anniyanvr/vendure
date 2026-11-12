@@ -1,6 +1,6 @@
-// tslint:disable:no-shadowed-variable
+/* eslint-disable no-shadow,@typescript-eslint/no-shadow */
 // prettier-ignore
-import { LanguageCode, LocalizedString } from './generated-types';
+import { LanguageCode,LocalizedString } from './generated-types';
 
 /**
  * A recursive implementation of the Partial<T> type.
@@ -12,12 +12,12 @@ export type DeepPartial<T> = {
         | (T[P] extends Array<infer U>
               ? Array<DeepPartial<U>>
               : T[P] extends ReadonlyArray<infer U>
-              ? ReadonlyArray<DeepPartial<U>>
-              : DeepPartial<T[P]>);
+                ? ReadonlyArray<DeepPartial<U>>
+                : DeepPartial<T[P]>);
 };
-// tslint:enable:no-shadowed-variable
+/* eslint-enable no-shadow, @typescript-eslint/no-shadow */
 
-// tslint:disable:ban-types
+/* eslint-disable @typescript-eslint/no-unsafe-function-type */
 /**
  * A recursive implementation of Required<T>.
  * Source: https://github.com/microsoft/TypeScript/issues/15012#issuecomment-365453623
@@ -29,13 +29,14 @@ export type DeepRequired<T, U extends object | undefined = undefined> = T extend
               : DeepRequired<NonNullable<T[P]>, U>;
       }
     : T;
-// tslint:enable:ban-types
+/* eslint-enable @typescript-eslint/no-unsafe-function-type */
 
 /**
  * A type representing the type rather than instance of a class.
  */
+// eslint-disable-next-line @typescript-eslint/no-unsafe-function-type
 export interface Type<T> extends Function {
-    // tslint:disable-next-line:callable-types
+    // eslint-disable-next-line @typescript-eslint/prefer-function-type
     new (...args: any[]): T;
 }
 
@@ -52,12 +53,16 @@ export type JsonCompatible<T> = {
     [P in keyof T]: T[P] extends Json
         ? T[P]
         : Pick<T, P> extends Required<Pick<T, P>>
-        ? never
-        : JsonCompatible<T[P]>;
+          ? never
+          : JsonCompatible<T[P]>;
 };
 
 /**
- * A type describing the shape of a paginated list response
+ * @description
+ * A type describing the shape of a paginated list response. In Vendure, almost all list queries
+ * (`products`, `collections`, `orders`, `customers` etc) return an object of this type.
+ *
+ * @docsCategory common
  */
 export type PaginatedList<T> = {
     items: T[];
@@ -82,13 +87,16 @@ export type ID = string | number;
  * -----        |---------                              |---------------
  * string       | varchar                               | String
  * localeString | varchar                               | String
+ * text         | longtext(m), text(p,s)                | String
+ * localeText   | longtext(m), text(p,s)                | String
  * int          | int                                   | Int
  * float        | double precision                      | Float
  * boolean      | tinyint (m), bool (p), boolean (s)    | Boolean
  * datetime     | datetime (m,s), timestamp (p)         | DateTime
+ * struct       | json (m), jsonb (p), text (s)         | JSON
  * relation     | many-to-one / many-to-many relation   | As specified in config
  *
- * Additionally, the CustomFieldType also dictates which [configuration options](/docs/typescript-api/custom-fields/#configuration-options)
+ * Additionally, the CustomFieldType also dictates which [configuration options](/developer-guide/custom-fields/#custom-field-config-properties)
  * are available for that custom field.
  *
  * @docsCategory custom-fields
@@ -100,7 +108,12 @@ export type CustomFieldType =
     | 'float'
     | 'boolean'
     | 'datetime'
-    | 'relation';
+    | 'relation'
+    | 'text'
+    | 'localeText'
+    | 'struct';
+
+export type StructFieldType = 'string' | 'int' | 'float' | 'boolean' | 'datetime' | 'text';
 
 /**
  * @description
@@ -126,39 +139,74 @@ export type ConfigArgType = 'string' | 'int' | 'float' | 'boolean' | 'datetime' 
 export type DefaultFormComponentId =
     | 'boolean-form-input'
     | 'currency-form-input'
+    | 'customer-group-form-input'
     | 'date-form-input'
     | 'facet-value-form-input'
+    | 'json-editor-form-input'
+    | 'html-editor-form-input'
     | 'number-form-input'
-    | 'select-form-input'
-    | 'product-selector-form-input'
-    | 'customer-group-form-input'
-    | 'text-form-input'
     | 'password-form-input'
-    | 'relation-form-input';
+    | 'product-selector-form-input'
+    | 'relation-form-input'
+    | 'rich-text-form-input'
+    | 'select-form-input'
+    | 'text-form-input'
+    | 'textarea-form-input'
+    | 'product-multi-form-input'
+    | 'combination-mode-form-input'
+    | 'struct-form-input';
 
 /**
  * @description
- * Used to defined the expected arguments for a given default form input component.
+ * Used to define the expected arguments for a given default form input component.
  *
  * @docsCategory ConfigurableOperationDef
  */
 type DefaultFormConfigHash = {
+    'boolean-form-input': Record<string, never>;
+    'currency-form-input': Record<string, never>;
+    'customer-group-form-input': Record<string, never>;
     'date-form-input': { min?: string; max?: string; yearRange?: number };
+    'facet-value-form-input': Record<string, never>;
+    'json-editor-form-input': { height?: string };
+    'html-editor-form-input': { height?: string };
     'number-form-input': { min?: number; max?: number; step?: number; prefix?: string; suffix?: string };
+    'password-form-input': Record<string, never>;
+    'product-selector-form-input': Record<string, never>;
+    'relation-form-input': Record<string, never>;
+    'rich-text-form-input': Record<string, never>;
     'select-form-input': {
         options?: Array<{ value: string; label?: Array<Omit<LocalizedString, '__typename'>> }>;
     };
-    'boolean-form-input': {};
-    'currency-form-input': {};
-    'facet-value-form-input': {};
-    'product-selector-form-input': {};
-    'customer-group-form-input': {};
-    'text-form-input': {};
-    'password-form-input': {};
-    'relation-form-input': {};
+    'text-form-input': { prefix?: string; suffix?: string };
+    'textarea-form-input': {
+        spellcheck?: boolean;
+    };
+    'product-multi-form-input': {
+        selectionMode?: 'product' | 'variant';
+    };
+    'combination-mode-form-input': Record<string, never>;
+    'struct-form-input': Record<string, never>;
 };
 
-export type DefaultFormComponentConfig<T extends DefaultFormComponentId> = DefaultFormConfigHash[T];
+export type DefaultFormComponentUiConfig<T extends DefaultFormComponentId | string> =
+    T extends DefaultFormComponentId ? DefaultFormConfigHash[T] : any;
+
+export type DefaultFormComponentConfig<T extends DefaultFormComponentId | string> =
+    DefaultFormComponentUiConfig<T> & {
+        ui?: DefaultFormComponentUiConfig<T>;
+    };
+
+export type UiComponentConfig<T extends DefaultFormComponentId | string> = T extends DefaultFormComponentId
+    ? {
+          component: T;
+          tab?: string;
+      } & DefaultFormConfigHash[T]
+    : {
+          component: string;
+          tab?: string;
+          [prop: string]: any;
+      };
 
 export type CustomFieldsObject = { [key: string]: any };
 
@@ -168,25 +216,25 @@ export type CustomFieldsObject = { [key: string]: any };
  * The values are loaded at run-time by the Admin UI app, and allow core configuration to be
  * managed without the need to re-build the application.
  *
- * @docsCategory AdminUiPlugin
+ * @docsCategory common/AdminUi
  */
 export interface AdminUiConfig {
     /**
      * @description
-     * The hostname of the Vendure server which the admin ui will be making API calls
+     * The hostname of the Vendure server which the admin UI will be making API calls
      * to. If set to "auto", the Admin UI app will determine the hostname from the
      * current location (i.e. `window.location.hostname`).
      *
-     * @default 'http://localhost'
+     * @default 'auto'
      */
     apiHost: string | 'auto';
     /**
      * @description
-     * The port of the Vendure server which the admin ui will be making API calls
+     * The port of the Vendure server which the admin UI will be making API calls
      * to. If set to "auto", the Admin UI app will determine the port from the
      * current location (i.e. `window.location.port`).
      *
-     * @default 3000
+     * @default 'auto'
      */
     apiPort: number | 'auto';
     /**
@@ -208,12 +256,19 @@ export interface AdminUiConfig {
     /**
      * @description
      * The header used when using the 'bearer' auth method. Should match the
-     * setting of the server's `authOptions.authTokenHeaderKey` config
-     * option.
+     * setting of the server's `authOptions.authTokenHeaderKey` config option.
      *
      * @default 'vendure-auth-token'
      */
     authTokenHeaderKey: string;
+    /**
+     * @description
+     * The name of the header which contains the channel token. Should match the
+     * setting of the server's `apiOptions.channelTokenKey` config option.
+     *
+     * @default 'vendure-token'
+     */
+    channelTokenKey: string;
     /**
      * @description
      * The default language for the Admin UI. Must be one of the
@@ -224,11 +279,27 @@ export interface AdminUiConfig {
     defaultLanguage: LanguageCode;
     /**
      * @description
-     * An array of languages for which translations exist for the Admin UI.
+     * The default locale for the Admin UI. The locale affects the formatting of
+     * currencies & dates. Must be one of the items specified
+     * in the `availableLocales` property.
      *
-     * @default [LanguageCode.en, LanguageCode.es]
+     * If not set, the browser default locale will be used.
+     *
+     * @since 2.2.0
+     */
+    defaultLocale?: string;
+    /**
+     * @description
+     * An array of languages for which translations exist for the Admin UI.
      */
     availableLanguages: LanguageCode[];
+    /**
+     * @description
+     * An array of locales to be used on Admin UI.
+     *
+     * @since 2.2.0
+     */
+    availableLocales: string[];
     /**
      * @description
      * If you are using an external {@link AuthenticationStrategy} for the Admin API, you can configure
@@ -256,18 +327,35 @@ export interface AdminUiConfig {
      * @default false
      */
     hideVersion?: boolean;
+    /**
+     * @description
+     * A url of a custom image to be used on the login screen, to override the images provided by Vendure's login image server.
+     *
+     * @since 1.9.0
+     */
+    loginImageUrl?: string;
+    /**
+     * @description
+     * Allows you to provide default reasons for a refund or cancellation. This will be used in the
+     * refund/cancel dialog. The values can be literal strings (e.g. "Not in stock") or translation
+     * tokens (see [Adding Admin UI Translations](/extending-the-admin-ui/adding-ui-translations/)).
+     *
+     * @since 1.5.0
+     * @default ['order.cancel-reason-customer-request', 'order.cancel-reason-not-available']
+     */
+    cancellationReasons?: string[];
 }
 
 /**
  * @description
  * Configures the path to a custom-build of the Admin UI app.
  *
- * @docsCategory common
+ * @docsCategory common/AdminUi
  */
 export interface AdminUiAppConfig {
     /**
      * @description
-     * The path to the compiled admin ui app files. If not specified, an internal
+     * The path to the compiled admin UI app files. If not specified, an internal
      * default build is used. This path should contain the `vendure-ui-config.json` file,
      * index.html, the compiled js bundles etc.
      */
@@ -290,12 +378,12 @@ export interface AdminUiAppConfig {
  * @description
  * Information about the Admin UI app dev server.
  *
- * @docsCategory common
+ * @docsCategory common/AdminUi
  */
 export interface AdminUiAppDevModeConfig {
     /**
      * @description
-     * The path to the uncompiled ui app source files. This path should contain the `vendure-ui-config.json` file.
+     * The path to the uncompiled UI app source files. This path should contain the `vendure-ui-config.json` file.
      */
     sourcePath: string;
     /**

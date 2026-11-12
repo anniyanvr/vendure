@@ -1,34 +1,24 @@
 import { Type } from '@vendure/common/lib/shared-types';
 
-import { BackoffStrategy } from '../../job-queue/polling-job-queue-strategy';
 import { PluginCommonModule } from '../plugin-common.module';
 import { VendurePlugin } from '../vendure-plugin';
 
+import { cleanJobsTask } from './clean-jobs-task';
+import { DEFAULT_JOB_QUEUE_PLUGIN_OPTIONS } from './constants';
+import { JobRecordBuffer } from './job-record-buffer.entity';
 import { JobRecord } from './job-record.entity';
+import { SqlJobBufferStorageStrategy } from './sql-job-buffer-storage-strategy';
 import { SqlJobQueueStrategy } from './sql-job-queue-strategy';
-
-/**
- * @description
- * Configuration options for the DefaultJobQueuePlugin. These values get passed into the
- * {@link SqlJobQueueStrategy}.
- *
- * @docsCategory JobQueue
- * @docsPage DefaultJobQueuePlugin
- */
-export interface DefaultJobQueueOptions {
-    pollInterval?: number | ((queueName: string) => number);
-    concurrency?: number;
-    backoffStrategy?: BackoffStrategy;
-}
+import { DefaultJobQueueOptions } from './types';
 
 /**
  * @description
  * A plugin which configures Vendure to use the SQL database to persist the JobQueue jobs using the {@link SqlJobQueueStrategy}. If you add this
- * plugin to an existing Vendure installation, you'll need to run a [database migration](/docs/developer-guide/migrations), since this
+ * plugin to an existing Vendure installation, you'll need to run a [database migration](/developer-guide/migrations), since this
  * plugin will add a new "job_record" table to the database.
  *
  * @example
- * ```TypeScript
+ * ```ts
  * import { DefaultJobQueuePlugin, VendureConfig } from '\@vendure/core';
  *
  * export const config: VendureConfig = {
@@ -50,7 +40,7 @@ export interface DefaultJobQueueOptions {
  * a pollInterval based on the queue name:
  *
  * @example
- * ```TypeScript
+ * ```ts
  * export const config: VendureConfig = {
  *   plugins: [
  *     DefaultJobQueuePlugin.init({
@@ -74,12 +64,12 @@ export interface DefaultJobQueueOptions {
  * Defines the backoff strategy used when retrying failed jobs. In other words, if a job fails
  * and is configured to be re-tried, how long should we wait before the next attempt?
  *
- * By default a job will be retried as soon as possible, but in some cases this is not desirable. For example,
+ * By default, a job will be retried as soon as possible, but in some cases this is not desirable. For example,
  * a job may interact with an unreliable 3rd-party API which is sensitive to too many requests. In this case, an
  * exponential backoff may be used which progressively increases the delay between each subsequent retry.
  *
  * @example
- * ```TypeScript
+ * ```ts
  * export const config: VendureConfig = {
  *   plugins: [
  *     DefaultJobQueuePlugin.init({
@@ -94,30 +84,83 @@ export interface DefaultJobQueueOptions {
  *         // A default delay for all other queues
  *         return 1000;
  *       },
+ *       setRetries: (queueName, job) => {
+ *         if (queueName === 'send-email') {
+ *           // Override the default number of retries
+ *           // for the 'send-email' job because we have
+ *           // a very unreliable email service.
+ *           return 10;
+ *         }
+ *         return job.retries;
+ *       }
+ *     }),
+ *   ],
+ * };
+ * ```
+ *
+ * ### Removing old jobs
+ * Since v3.3, the job queue will automatically remove old jobs from the database. This is done by a scheduled task
+ * which runs every 2 hours by default. The number of jobs to keep in the database can be configured using the
+ * `keepJobsCount` option. The default is 1000.
+ *
+ * @example
+ * ```ts
+ * export const config: VendureConfig = {
+ *   plugins: [
+ *     DefaultJobQueuePlugin.init({
+ *       // The number of completed/failed/cancelled
+ *       // jobs to keep in the database. The default is 1000.
+ *       keepJobsCount: 100,
+ *       // The interval at which to run the clean-up task.
+ *       // This can be a standard cron expression or a function
+ *       // that returns a cron expression. The default is every 2 hours.
+ *       cleanJobsSchedule: cron => cron.every(5).hours(),
  *     }),
  *   ],
  * };
  * ```
  *
  * @docsCategory JobQueue
+ * @docsPage DefaultJobQueuePlugin
  * @docsWeight 0
  */
 @VendurePlugin({
     imports: [PluginCommonModule],
-    entities: [JobRecord],
+    entities: () =>
+        DefaultJobQueuePlugin.options.useDatabaseForBuffer === true
+            ? [JobRecord, JobRecordBuffer]
+            : [JobRecord],
     configuration: config => {
-        const { pollInterval, concurrency, backoffStrategy } = DefaultJobQueuePlugin.options ?? {};
+        const { pollInterval, concurrency, backoffStrategy, setRetries, gracefulShutdownTimeout } =
+            DefaultJobQueuePlugin.options ?? {};
         config.jobQueueOptions.jobQueueStrategy = new SqlJobQueueStrategy({
             concurrency,
             pollInterval,
             backoffStrategy,
+            setRetries,
+            gracefulShutdownTimeout,
         });
+        if (DefaultJobQueuePlugin.options.useDatabaseForBuffer === true) {
+            config.jobQueueOptions.jobBufferStorageStrategy = new SqlJobBufferStorageStrategy();
+        }
+        config.schedulerOptions.tasks.push(
+            cleanJobsTask.configure({
+                schedule: DefaultJobQueuePlugin.options.cleanJobsSchedule,
+            }),
+        );
         return config;
     },
+    providers: [
+        {
+            provide: DEFAULT_JOB_QUEUE_PLUGIN_OPTIONS,
+            useFactory: () => DefaultJobQueuePlugin.options,
+        },
+    ],
+    compatibility: '>0.0.0',
 })
 export class DefaultJobQueuePlugin {
     /** @internal */
-    static options: DefaultJobQueueOptions;
+    static options: DefaultJobQueueOptions = {};
 
     static init(options: DefaultJobQueueOptions): Type<DefaultJobQueuePlugin> {
         DefaultJobQueuePlugin.options = options;

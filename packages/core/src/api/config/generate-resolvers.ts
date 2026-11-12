@@ -1,11 +1,10 @@
+import { IFieldResolver, IResolvers } from '@graphql-tools/utils';
 import { StockMovementType } from '@vendure/common/lib/generated-types';
-import { IFieldResolver, IResolvers } from 'apollo-server-express';
+import { REDACTED_SECRET_PLACEHOLDER } from '@vendure/common/lib/shared-constants';
 import { GraphQLSchema } from 'graphql';
-import { GraphQLDateTime } from 'graphql-iso-date';
-import GraphQLJSON from 'graphql-type-json';
-import { GraphQLUpload } from 'graphql-upload';
+import { GraphQLDateTime, GraphQLJSON } from 'graphql-scalars';
 
-import { REQUEST_CONTEXT_KEY } from '../../common/constants';
+import { InternalServerError } from '../../common/error/errors';
 import {
     adminErrorOperationTypeResolvers,
     ErrorResult,
@@ -13,18 +12,28 @@ import {
 import { shopErrorOperationTypeResolvers } from '../../common/error/generated-graphql-shop-errors';
 import { Translatable } from '../../common/types/locale-types';
 import { ConfigService } from '../../config/config.service';
-import { CustomFieldConfig, RelationCustomFieldConfig } from '../../config/custom-field/custom-field-types';
-import { CustomFieldRelationService } from '../../service/helpers/custom-field-relation/custom-field-relation.service';
+import {
+    CustomFieldConfig,
+    RelationCustomFieldConfig,
+    StructCustomFieldConfig,
+} from '../../config/custom-field/custom-field-types';
+import { Logger } from '../../config/logger/vendure-logger';
+import { Region } from '../../entity/region/region.entity';
+import { getPluginAPIExtensions } from '../../plugin/plugin-metadata';
 import { CustomFieldRelationResolverService } from '../common/custom-field-relation-resolver.service';
 import { ApiType } from '../common/get-api-type';
-import { RequestContext } from '../common/request-context';
+import { internal_getRequestContext } from '../common/request-context';
+import { userHasPermissionsOnCustomField } from '../common/user-has-permissions-on-custom-field';
+
+import { getCustomFieldsConfigWithoutInterfaces } from './get-custom-fields-config-without-interfaces';
+import { GraphQLMoney } from './money-scalar';
 
 /**
  * @description
  * Generates additional resolvers required for things like resolution of union types,
  * custom scalars and "relation"-type custom fields.
  */
-export function generateResolvers(
+export async function generateResolvers(
     configService: ConfigService,
     customFieldRelationResolverService: CustomFieldRelationResolverService,
     apiType: ApiType,
@@ -57,6 +66,20 @@ export function generateResolvers(
         },
     };
 
+    const regionResolveType = {
+        __resolveType(value: Region) {
+            switch (value.type) {
+                case 'country':
+                    return 'Country';
+                case 'province':
+                    return 'Province';
+                default: {
+                    throw new InternalServerError(`No __resolveType defined for Region type "${value.type}"`);
+                }
+            }
+        },
+    };
+
     const customFieldsConfigResolveType = {
         __resolveType(value: any) {
             switch (value.type) {
@@ -64,6 +87,10 @@ export function generateResolvers(
                     return 'StringCustomFieldConfig';
                 case 'localeString':
                     return 'LocaleStringCustomFieldConfig';
+                case 'text':
+                    return 'TextCustomFieldConfig';
+                case 'localeText':
+                    return 'LocaleTextCustomFieldConfig';
                 case 'int':
                     return 'IntCustomFieldConfig';
                 case 'float':
@@ -74,13 +101,38 @@ export function generateResolvers(
                     return 'DateTimeCustomFieldConfig';
                 case 'relation':
                     return 'RelationCustomFieldConfig';
+                case 'struct':
+                    return 'StructCustomFieldConfig';
             }
         },
     };
 
+    const structFieldConfigResolveType = {
+        __resolveType(value: any) {
+            switch (value.type) {
+                case 'string':
+                    return 'StringStructFieldConfig';
+                case 'text':
+                    return 'TextStructFieldConfig';
+                case 'int':
+                    return 'IntStructFieldConfig';
+                case 'float':
+                    return 'FloatStructFieldConfig';
+                case 'boolean':
+                    return 'BooleanStructFieldConfig';
+                case 'datetime':
+                    return 'DateTimeStructFieldConfig';
+            }
+        },
+    };
+
+    // @ts-ignore
+    const { default: GraphQLUpload } = await import('graphql-upload/GraphQLUpload.mjs');
+
     const commonResolvers = {
         JSON: GraphQLJSON,
         DateTime: GraphQLDateTime,
+        Money: GraphQLMoney,
         Node: dummyResolveType,
         PaginatedList: dummyResolveType,
         Upload: GraphQLUpload || dummyResolveType,
@@ -91,14 +143,16 @@ export function generateResolvers(
         },
         CustomFieldConfig: customFieldsConfigResolveType,
         CustomField: customFieldsConfigResolveType,
+        StructFieldConfig: structFieldConfigResolveType,
         ErrorResult: {
             __resolveType(value: ErrorResult) {
                 return value.__typename;
             },
         },
+        Region: regionResolveType,
     };
 
-    const customFieldRelationResolvers = generateCustomFieldRelationResolvers(
+    const customFieldResolvers = generateCustomFieldResolvers(
         configService,
         customFieldRelationResolverService,
         schema,
@@ -108,38 +162,46 @@ export function generateResolvers(
         StockMovementItem: stockMovementResolveType,
         StockMovement: stockMovementResolveType,
         ...adminErrorOperationTypeResolvers,
-        ...customFieldRelationResolvers.adminResolvers,
+        ...customFieldResolvers.adminResolvers,
     };
 
     const shopResolvers = {
         ...shopErrorOperationTypeResolvers,
-        ...customFieldRelationResolvers.shopResolvers,
+        ...customFieldResolvers.shopResolvers,
     };
 
     const resolvers =
         apiType === 'admin'
-            ? { ...commonResolvers, ...adminResolvers }
-            : { ...commonResolvers, ...shopResolvers };
+            ? { ...commonResolvers, ...adminResolvers, ...getCustomScalars(configService, 'admin') }
+            : { ...commonResolvers, ...shopResolvers, ...getCustomScalars(configService, 'shop') };
     return resolvers;
 }
 
 /**
  * @description
- * Based on the CustomFields config, this function dynamically creates resolver functions to perform
- * a DB query to fetch the related entity for any custom fields of type "relation".
+ * Based on the CustomFields config, this function dynamically creates resolver functions to handle
+ * the resolution of more complex custom field types:
+ *
+ * - `relation` type custom fields: These are resolved by querying the database for the related entity.
+ * - `struct` type custom fields: These are resolved by iterating over the fields of the struct and
+ *   resolving each field individually.
+ *
+ * This function also performs additional checks to ensure that only users with the correct permissions
+ * are able to access custom fields, and that custom field data is not being leaked via the JSON type.
  */
-function generateCustomFieldRelationResolvers(
+function generateCustomFieldResolvers(
     configService: ConfigService,
     customFieldRelationResolverService: CustomFieldRelationResolverService,
     schema: GraphQLSchema,
 ) {
     const ENTITY_ID_KEY = '__entityId__';
+    const ENTITY_KEY = '__entity__';
     const adminResolvers: IResolvers = {};
     const shopResolvers: IResolvers = {};
 
-    for (const [entityName, customFields] of Object.entries(configService.customFields)) {
-        const relationCustomFields = customFields.filter(isRelationalType);
-        if (relationCustomFields.length === 0 || !schema.getType(entityName)) {
+    const customFieldsConfig = getCustomFieldsConfigWithoutInterfaces(configService.customFields, schema);
+    for (const [entityName, customFields] of customFieldsConfig) {
+        if (!schema.getType(entityName)) {
             continue;
         }
         const customFieldTypeName = `${entityName}CustomFields`;
@@ -149,59 +211,194 @@ function generateCustomFieldRelationResolvers(
         const excludeFromShopApi = ['GlobalSettings'].includes(entityName);
 
         // In order to resolve the relations in the CustomFields type, we need
-        // access to the entity id. Therefore we attach it to the resolved value
+        // access to the entity id. Therefore, we attach it to the resolved value
         // so that it is available to the `relationResolver` below.
         const customFieldResolver: IFieldResolver<any, any> = (source: any) => {
             return {
                 ...source.customFields,
                 [ENTITY_ID_KEY]: source.id,
+                // Retain the owning entity so that field resolvers (e.g. secret-field redaction) can
+                // pass the real VendureEntity to strategies, rather than this customFields wrapper.
+                [ENTITY_KEY]: source,
             };
         };
-        adminResolvers[entityName] = {
+        const resolverObject = {
             customFields: customFieldResolver,
         };
+        adminResolvers[entityName] = resolverObject;
         if (!excludeFromShopApi) {
-            shopResolvers[entityName] = {
-                customFields: customFieldResolver,
-            };
+            shopResolvers[entityName] = resolverObject;
+            if (entityName === 'ShippingMethod') {
+                shopResolvers.ShippingMethodQuote = resolverObject;
+            }
+            if (entityName === 'PaymentMethod') {
+                shopResolvers.PaymentMethodQuote = resolverObject;
+            }
         }
-        for (const fieldDef of relationCustomFields) {
-            const relationResolver: IFieldResolver<any, any> = async (
-                source: any,
-                args: any,
-                context: any,
-            ) => {
-                if (source[fieldDef.name] != null) {
+        for (const fieldDef of customFields) {
+            if (fieldDef.internal === true) {
+                // Do not create any resolvers for internal relations
+                continue;
+            }
+            let resolver: IFieldResolver<any, any>;
+            if (isRelationalType(fieldDef)) {
+                resolver = async (source: any, args: any, context: any) => {
+                    const ctx = internal_getRequestContext(context.req);
+                    if (!userHasPermissionsOnCustomField(ctx, fieldDef)) {
+                        return null;
+                    }
+                    const eagerEntity = source[fieldDef.name];
+                    // If the relation is eager-loaded, we can simply try to translate this relation entity if they have translations
+                    if (eagerEntity != null) {
+                        try {
+                            return await customFieldRelationResolverService.translateEntity(
+                                ctx,
+                                eagerEntity,
+                                fieldDef,
+                            );
+                        } catch (e: any) {
+                            Logger.debug(
+                                `Error resolving eager-loaded custom field entity relation "${entityName}.${fieldDef.name}": ${e.message as string}`,
+                            );
+                        }
+                    }
+                    const entityId = source[ENTITY_ID_KEY];
+                    return customFieldRelationResolverService.resolveRelation({
+                        ctx,
+                        fieldDef,
+                        entityName,
+                        entityId,
+                    });
+                };
+            } else if (isStructType(fieldDef)) {
+                resolver = async (source: any) => {
+                    const fields = fieldDef.fields;
+                    function buildStructObject(valueFromDb: any) {
+                        const result: Record<string, any> = {};
+                        for (const structField of fields) {
+                            const value = valueFromDb?.[structField.name];
+                            if (structField.list === true) {
+                                const valueArray = Array.isArray(value) ? value : value ? [value] : [];
+                                result[structField.name] = valueArray;
+                            } else {
+                                result[structField.name] = value ?? null;
+                            }
+                        }
+                        return result;
+                    }
+                    if (fieldDef.list === true) {
+                        const structArray = Array.isArray(source[fieldDef.name])
+                            ? source[fieldDef.name]
+                            : source[fieldDef.name]
+                              ? [source[fieldDef.name]]
+                              : [];
+                        source[fieldDef.name] = structArray.map(buildStructObject);
+                    } else {
+                        source[fieldDef.name] = buildStructObject(source[fieldDef.name]);
+                    }
+
                     return source[fieldDef.name];
+                };
+                adminResolvers[customFieldTypeName] = {
+                    ...adminResolvers[customFieldTypeName],
+                    [fieldDef.name]: resolver,
+                } as any;
+
+                if (fieldDef.public !== false && !excludeFromShopApi) {
+                    shopResolvers[customFieldTypeName] = {
+                        ...shopResolvers[customFieldTypeName],
+                        [fieldDef.name]: resolver,
+                    } as any;
                 }
-                const ctx: RequestContext = context.req[REQUEST_CONTEXT_KEY];
-                const entityId = source[ENTITY_ID_KEY];
-                return customFieldRelationResolverService.resolveRelation({
-                    ctx,
-                    fieldDef,
-                    entityName,
-                    entityId,
-                });
-            };
+            } else {
+                resolver = async (source: any, args: any, context: any) => {
+                    const ctx = internal_getRequestContext(context.req);
+                    if (!userHasPermissionsOnCustomField(ctx, fieldDef)) {
+                        return null;
+                    }
+                    const value = source[fieldDef.name];
+                    if (fieldDef.secret === true && value != null) {
+                        const secretAccessStrategy = configService.systemOptions.secretAccessStrategy;
+                        const canReveal = secretAccessStrategy
+                            ? await secretAccessStrategy.canAccessSecret(ctx, {
+                                  kind: 'customField',
+                                  entityType: entityName,
+                                  fieldName: fieldDef.name,
+                                  entity: source[ENTITY_KEY],
+                              })
+                            : false;
+                        return canReveal ? value : REDACTED_SECRET_PLACEHOLDER;
+                    }
+                    return value;
+                };
+            }
 
             adminResolvers[customFieldTypeName] = {
                 ...adminResolvers[customFieldTypeName],
-                [fieldDef.name]: relationResolver,
+                [fieldDef.name]: resolver,
             } as any;
 
             if (fieldDef.public !== false && !excludeFromShopApi) {
                 shopResolvers[customFieldTypeName] = {
                     ...shopResolvers[customFieldTypeName],
-                    [fieldDef.name]: relationResolver,
+                    [fieldDef.name]: resolver,
                 } as any;
             }
+
+            if (isRelationalType(fieldDef) && fieldDef.list !== true) {
+                // Non-list relation custom fields also expose a `<name>Id` field, which is
+                // subject to the same permissions as the relation field itself.
+                const idResolver: IFieldResolver<any, any> = (source: any, args: any, context: any) => {
+                    const ctx = internal_getRequestContext(context.req);
+                    if (!userHasPermissionsOnCustomField(ctx, fieldDef)) {
+                        return null;
+                    }
+                    return source[`${fieldDef.name}Id`];
+                };
+                adminResolvers[customFieldTypeName] = {
+                    ...adminResolvers[customFieldTypeName],
+                    [`${fieldDef.name}Id`]: idResolver,
+                } as any;
+                if (fieldDef.public !== false && !excludeFromShopApi) {
+                    shopResolvers[customFieldTypeName] = {
+                        ...shopResolvers[customFieldTypeName],
+                        [`${fieldDef.name}Id`]: idResolver,
+                    } as any;
+                }
+            }
+        }
+        const allCustomFieldsAreNonPublic =
+            customFields.length && customFields.every(f => f.public === false || f.internal === true);
+        if (allCustomFieldsAreNonPublic) {
+            // When an entity has only non-public custom fields, the GraphQL type used for the
+            // customFields field is `JSON`. This type will simply return the full object, which
+            // will cause a leak of private data unless we force a `null` return value in the case
+            // that there are no public fields.
+            // See https://github.com/vendurehq/vendure/issues/3049
+            shopResolvers[entityName] = { customFields: () => null };
         }
     }
     return { adminResolvers, shopResolvers };
 }
 
+function getCustomScalars(configService: ConfigService, apiType: 'admin' | 'shop') {
+    return getPluginAPIExtensions(configService.plugins, apiType)
+        .map(e => (typeof e.scalars === 'function' ? e.scalars() : (e.scalars ?? {})))
+        .reduce(
+            (all, scalarMap) => ({
+                ...all,
+                ...scalarMap,
+            }),
+            {},
+        );
+}
+
 function isRelationalType(input: CustomFieldConfig): input is RelationCustomFieldConfig {
     return input.type === 'relation';
+}
+
+function isStructType(input: CustomFieldConfig): input is StructCustomFieldConfig {
+    return input.type === 'struct';
 }
 
 function isTranslatable(input: unknown): input is Translatable {

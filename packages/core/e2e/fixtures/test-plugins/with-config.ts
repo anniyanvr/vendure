@@ -1,16 +1,10 @@
 import { LanguageCode } from '@vendure/common/lib/generated-types';
-import {
-    ConfigModule,
-    ConfigService,
-    OnVendureBootstrap,
-    OnVendureClose,
-    VendurePlugin,
-} from '@vendure/core';
+import { ConfigModule, VendurePlugin } from '@vendure/core';
 
 @VendurePlugin({
     imports: [ConfigModule],
     configuration: config => {
-        // tslint:disable-next-line:no-non-null-assertion
+        // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
         config.defaultLanguageCode = LanguageCode.zh;
         return config;
     },

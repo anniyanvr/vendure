@@ -3,6 +3,9 @@ scalar JSON
 scalar DateTime
 scalar Upload
 
+# Our custom scalars
+scalar Money
+
 interface PaginatedList {
     items: [Node!]!
     totalItems: Int!
@@ -21,7 +24,8 @@ type Adjustment {
     adjustmentSource: String!
     type: AdjustmentType!
     description: String!
-    amount: Int!
+    amount: Money!
+    data: JSON
 }
 
 type TaxLine {
@@ -43,6 +47,7 @@ type ConfigArgDefinition {
     label: String
     description: String
     ui: JSON
+    secret: Boolean
 }
 
 type ConfigurableOperation {
@@ -73,6 +78,7 @@ input ConfigurableOperationInput {
     arguments: [ConfigArgInput!]!
 }
 
+"Operators for filtering on a String field"
 input StringOperators {
     eq: String
     notEq: String
@@ -81,10 +87,22 @@ input StringOperators {
     in: [String!]
     notIn: [String!]
     regex: String
+    isNull: Boolean
 }
 
+"Operators for filtering on an ID field"
+input IDOperators {
+    eq: String
+    notEq: String
+    in: [String!]
+    notIn: [String!]
+    isNull: Boolean
+}
+
+"Operators for filtering on a Boolean field"
 input BooleanOperators {
     eq: Boolean
+    isNull: Boolean
 }
 
 input NumberRange {
@@ -92,6 +110,7 @@ input NumberRange {
     end: Float!
 }
 
+"Operators for filtering on a Int or Float field"
 input NumberOperators {
     eq: Float
     lt: Float
@@ -99,6 +118,7 @@ input NumberOperators {
     gt: Float
     gte: Float
     between: NumberRange
+    isNull: Boolean
 }
 
 input DateRange {
@@ -106,11 +126,38 @@ input DateRange {
     end: DateTime!
 }
 
+"Operators for filtering on a DateTime field"
 input DateOperators {
     eq: DateTime
     before: DateTime
     after: DateTime
     between: DateRange
+    isNull: Boolean
+}
+
+"Operators for filtering on a list of String fields"
+input StringListOperators {
+    inList: String!
+}
+
+"Operators for filtering on a list of Number fields"
+input NumberListOperators {
+    inList: Float!
+}
+
+"Operators for filtering on a list of Boolean fields"
+input BooleanListOperators {
+    inList: Boolean!
+}
+
+"Operators for filtering on a list of ID fields"
+input IDListOperators {
+    inList: ID!
+}
+
+"Operators for filtering on a list of Date fields"
+input DateListOperators {
+    inList: DateTime!
 }
 
 """
@@ -132,7 +179,9 @@ input SearchInput {
     facetValueOperator: LogicalOperator @deprecated(reason: "Use `facetValueFilters` instead")
     facetValueFilters: [FacetValueFilterInput!]
     collectionId: ID
+    collectionIds: [ID!]
     collectionSlug: String
+    collectionSlugs: [String!]
     groupByProduct: Boolean
     take: Int
     skip: Int
@@ -152,6 +201,13 @@ input CreateCustomerInput {
     emailAddress: String!
 }
 
+"""
+Input used to create an Address.
+
+The countryCode must correspond to a `code` property of a Country that has been defined in the
+Vendure server. The `code` property is typically a 2-character ISO code such as "GB", "US", "DE" etc.
+If an invalid code is passed, the mutation will fail.
+"""
 input CreateAddressInput {
     fullName: String
     company: String
@@ -166,6 +222,13 @@ input CreateAddressInput {
     defaultBillingAddress: Boolean
 }
 
+"""
+Input used to update an Address.
+
+The countryCode must correspond to a `code` property of a Country that has been defined in the
+Vendure server. The `code` property is typically a 2-character ISO code such as "GB", "US", "DE" etc.
+If an invalid code is passed, the mutation will fail.
+"""
 input UpdateAddressInput {
     id: ID!
     fullName: String
@@ -190,8 +253,8 @@ type Success {
 
 type ShippingMethodQuote {
     id: ID!
-    price: Int!
-    priceWithTax: Int!
+    price: Money!
+    priceWithTax: Money!
     code: String!
     name: String!
     description: String!
@@ -207,3 +270,20 @@ type PaymentMethodQuote {
     isEligible: Boolean!
     eligibilityMessage: String
 }
+
+union UpdateOrderItemsResult =
+      Order
+    | OrderModificationError
+    | OrderLimitError
+    | NegativeQuantityError
+    | InsufficientStockError
+    | OrderInterceptorError
+
+union RemoveOrderItemsResult = Order | OrderModificationError | OrderInterceptorError
+union SetOrderShippingMethodResult =
+      Order
+    | OrderModificationError
+    | IneligibleShippingMethodError
+    | NoActiveOrderError
+union ApplyCouponCodeResult = Order | CouponCodeExpiredError | CouponCodeInvalidError | CouponCodeLimitError
+

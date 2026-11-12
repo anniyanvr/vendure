@@ -1,139 +1,114 @@
-# Vendure
+<h2 align="center">The ecommerce platform for complex B2B</h2>
 
-A headless [GraphQL](https://graphql.org/) ecommerce framework built on [Node.js](https://nodejs.org) with [Nest](https://nestjs.com/) & [TypeScript](http://www.typescriptlang.org/), with a focus on developer productivity and ease of customization.
+<p align="center">
+  <a href="https://vendure.io">Website</a> ·
+  <a href="https://docs.vendure.io">Documentation</a> ·
+  <a href="https://vendure.io/pricing">Pricing</a> ·
+  <a href="https://vendure.io/blog">Blog</a> ·
+  <a href="https://vendure.io/discord">Discord</a>
+</p>
 
-[![Build Status](https://github.com/vendure-ecommerce/vendure/workflows/Build%20&%20Test/badge.svg)](https://github.com/vendure-ecommerce/vendure/actions) 
-![Publish & Install](https://github.com/vendure-ecommerce/vendure/workflows/Publish%20&%20Install/badge.svg)
-[![lerna](https://img.shields.io/badge/maintained%20with-lerna-cc00ff.svg)](https://lernajs.io/)
+<p align="center">
+  <a href="https://docs.vendure.io/guides/getting-started/installation/">
+    <img src="https://raw.githubusercontent.com/vendurehq/.github/main/profile/vendure-banner.png" width="1280" alt="Vendure: the ecommerce platform for complex B2B, built on GraphQL, NestJS and React" />
+  </a>
+</p>
 
-### [www.vendure.io](https://www.vendure.io/)
+<p align="center">
+  <a href="https://www.npmjs.com/package/@vendure/core"><img src="https://img.shields.io/npm/v/@vendure/core?label=npm" alt="@vendure/core on npm" /></a>
+  <a href="./LICENSE.md"><img src="https://img.shields.io/badge/license-GPLv3-blue.svg" alt="Vendure is released under the GPLv3 licence" /></a>
+  <a href="https://github.com/vendurehq/vendure/stargazers"><img src="https://img.shields.io/github/stars/vendurehq/vendure" alt="GitHub stars" /></a>
+  <a href="https://github.com/vendurehq/vendure/pulse"><img src="https://img.shields.io/github/commit-activity/m/vendurehq/vendure" alt="Commits per month" /></a>
+  <a href="https://vendure.io/discord"><img src="https://img.shields.io/badge/join-our%20discord-7289DA.svg" alt="Join our Discord" /></a>
+  <a href="./CONTRIBUTING.md"><img src="https://img.shields.io/badge/PRs-welcome-brightgreen.svg?style=flat" alt="PRs welcome" /></a>
+</p>
 
-* [Getting Started](https://www.vendure.io/docs/getting-started/): Get Vendure up and running locally in a matter of minutes with a single command
-* [Live Demo](https://demo.vendure.io/)
-* [Vendure Slack](https://join.slack.com/t/vendure-ecommerce/shared_invite/enQtNzA1NTcyMDY3NTg0LTMzZGQzNDczOWJiMTU2YjAyNWJlMzdmZGE3ZDY5Y2RjMGYxZWNlYTI4NmU4Y2Q1MDNlYzE4MzQ5ODcyYTdmMGU) Join us on Slack for support and answers to your questions
+<br />
 
-## Structure
+# Why Vendure
 
-This project is a monorepo managed with [Lerna](https://github.com/lerna/lerna). Several npm packages are published from this repo, which can be found in the `packages/` directory.
+Vendure is a commerce backend that engineering teams can change at the core. Model the catalog, orders, pricing, promotions and customers the way your business works, and serve B2B, D2C, marketplace and omnichannel sales from one GraphQL API.
 
+- **Model your business, no forks required**: Extend or override any part of the system through stable plugin contracts and service overrides. Add custom entities, pricing logic, and workflows, and change core behaviour without patching it.
+- **One backend, every channel**: A single extensible core serves any frontend through a GraphQL API, across D2C, B2B, marketplace, and omnichannel. No stitching together separate commerce services.
+- **One TypeScript stack**: Node.js, NestJS, and GraphQL, with strong types across the stack and no proprietary query language. The introspectable GraphQL schema makes it straightforward to wire up LLM tool-calling, MCP servers, and agent frameworks.
+- **Commerce building blocks from day one**: Catalog, orders, customers, promotions, channels, tax, shipping, payments, and stock are built in. The same extension model lets you build the workflows specific to your business on top.
+- **Proven in production**: Used in production by enterprise teams and proven at high transaction volume. Stable plugin contracts give you safe extension points without forking.
+
+<a href="https://vendure.io/core">Learn why we built Vendure this way</a> · <a href="https://vendure.io/compare">See how Vendure compares</a> · <a href="https://vendure.io/migrate">Moving from another platform</a>
+
+<br />
+
+# Installation
+
+### Quick start
+
+Scaffold a project with the server, worker, admin dashboard and GraphQL APIs ready to run:
+
+```bash
+npx @vendure/create my-shop
 ```
-vendure/
-├── docs/           # Documentation source
-├── e2e-common/     # Shared config for package e2e tests
-├── packages/       # Source for the Vendure server, admin-ui & plugin packages
-├── scripts/
-    ├── changelog/  # Scripts used to generate the changelog based on the git history
-    ├── codegen/    # Scripts used to generate TypeScript code from the GraphQL APIs
-    ├── docs/       # Scripts used to generate documentation markdown from the source
-```
 
-## Development
+Requires Node.js 22.12+ (20.19+ still runs, but Node.js 20 is end-of-life) and a SQL database (PostgreSQL, MySQL, MariaDB or SQLite). The [getting started guide](https://docs.vendure.io/guides/getting-started/installation/) covers configuration, seed data and your first plugin. Ask questions on [our Discord](https://vendure.io/discord).
 
-The following instructions are for those who want to develop the Vendure core framework or plugins (e.g. if you intend to make a pull request). For instructions on how to build a project *using* Vendure, please see the [Getting Started guide](https://www.vendure.io/docs/getting-started/).
+### Self-hosting
 
-### 1. Install top-level dependencies
+Vendure runs anywhere Node.js runs, including Docker, Kubernetes, a single VM or any cloud provider. Self-hosting is free, and your data stays in your own database. See the [deployment guides](https://docs.vendure.io/guides/deployment/).
 
-`yarn`
+### Vendure Cloud
 
-The root directory has a `package.json` which contains build-related dependencies for tasks including:
+[Vendure Cloud](https://vendure.io/cloud) is the managed runtime for Vendure. It deploys on git push, creates a preview environment for every pull request, and manages the database, queues, search, backups and scaling. It runs the same application you can self-host, so you can move to Cloud without rebuilding it. Every paid plan includes Cloud at no extra cost. Cloud is in design-partner preview now, with general availability planned for Q1 2027.
 
-* Building & deploying the docs 
-* Generating TypeScript types from the GraphQL schema
-* Linting, formatting & testing tasks to run on git commit & push
+<br />
 
-### 2. Bootstrap the packages
+# What Core includes
 
-`yarn bootstrap`
+Plugins let you extend or replace any of the features below.
 
-This runs the Lerna "bootstrap" command, which cross-links monorepo dependencies.
+| Feature | What it covers |
+|---|---|
+| **[Catalog](https://docs.vendure.io/guides/core-concepts/products/)** | Products, variants, facets, collections and [custom fields](https://docs.vendure.io/guides/developer-guide/custom-fields/) on any entity |
+| **[Orders](https://docs.vendure.io/guides/core-concepts/orders/)** | Carts, draft orders, modifications, fulfillment and returns |
+| **[Stock](https://docs.vendure.io/guides/core-concepts/stock-control/)** | Multi-location inventory, allocation and backorders |
+| **[Promotions](https://docs.vendure.io/guides/core-concepts/promotions/)** | Conditions and actions you compose, or write your own |
+| **[Payments](https://docs.vendure.io/guides/core-concepts/payment/)** | Provider-agnostic payment and shipping integrations |
+| **[Channels](https://docs.vendure.io/guides/core-concepts/channels/)** | Multi-channel, multi-region, multi-currency and multi-language from one instance |
+| **[Plugins](https://docs.vendure.io/guides/developer-guide/plugins/)** | Extend or override any service, entity or strategy without forking the core |
+| **[GraphQL APIs](https://docs.vendure.io/guides/developer-guide/extending-the-graphql-api/)** | Typed Shop and Admin APIs that you can extend. Agent frameworks and MCP servers can read the schema through introspection |
+| **[Dashboard](https://docs.vendure.io/guides/extending-the-dashboard/getting-started/)** | React and TanStack admin app, extensible with your own pages and form elements |
+| **[TypeScript API](https://docs.vendure.io/reference/typescript-api/)** | Typed reference docs for every service, strategy and event |
 
-### 3. Build all packages
+<br />
 
-`yarn build`
+# Beyond the open-source core
 
-Packages must be built (i.e. TypeScript compiled, admin ui app built, certain assets copied etc.) before being used.
+Vendure has four paid plans built on top of this repository: Starter, Growth, Scale and Enterprise. They add B2B features such as company accounts, quotes, contract pricing, account hierarchies, approvals, single sign-on and audit logs. Every paid plan also includes direct support from the Vendure team, a commercial license and Vendure Cloud at no extra cost. See [plans and pricing](https://vendure.io/pricing).
 
-Note that this can take a few minutes.
+# What's in this repo
 
-### 4. Set up the server
+This is the Vendure source monorepo: the `@vendure/core` framework, the React and TanStack admin dashboard, the CLI, the official plugins, and an e2e testing harness. To build with Vendure, run `npx @vendure/create` (see [Getting started](#installation)) rather than cloning; clone this repo only to contribute to Vendure itself.
 
-The server requires an SQL database to be available. The simplest option is to use SQLite, but if you have Docker available you can use the [dev-server docker-compose file](./packages/dev-server/docker-compose.yml) which will start up both MariaDB and Postgres as well as their GUI management tools.
+# Contribution
 
-Vendure uses [TypeORM](http://typeorm.io), and officially supports **MySQL**, **PostgreSQL** and **SQLite**, though other TypeORM-supported databases may work.
+Contributions are welcome: bugs, features, or docs. Our **[Contribution Guide](./CONTRIBUTING.md)** covers everything from setting up your development environment to submitting your first pull request.
 
-1. Configure the [dev config](./packages/dev-server/dev-config.ts), making sure the connection settings in the `getDbConfig()` function are correct for the database type you will be using.
-2. Create the database using your DB admin tool of choice (e.g. phpMyAdmin if you are using the docker image suggested above). Name it according to the `getDbConfig()` settings. If you are using SQLite, you can skip this step.
-3. Populate mock data: 
-   ```bash
-    cd packages/dev-server
-    DB=<mysql|postgres|sqlite> yarn populate
-    ```
-   If you do not specify the `DB` variable, it will default to "mysql".
+Pick up a [labelled issue](https://github.com/vendurehq/vendure/issues?q=is%3Aissue%20state%3Aopen%20label%3A%22%F0%9F%91%8B%20contributions%20welcome%22) as a good first contribution.
 
-### 5. Run the dev server
+# Security
 
-```
-cd packages/dev-server
-DB=<mysql|postgres|sqlite> yarn start
-```
-Or if you are in the root package 
-```
-DB=<mysql|postgres|sqlite> yarn dev-server:start
-```
-If you do not specify the `DB` argument, it will default to "mysql".
+To report a suspected security vulnerability, use
+[GitHub's private vulnerability reporting](https://github.com/vendurehq/vendure/security/advisories/new).
+Do not disclose security vulnerabilities through public GitHub issues or email. See our
+[security policy](./SECURITY.md) for details.
 
-### 6. Launch the admin ui
+# Releases
 
-1. `cd packages/admin-ui`
-2. `yarn start`
-3. Go to http://localhost:4200 and log in with "superadmin", "superadmin"
+Patch releases ship regularly. Check our [release notes](https://github.com/vendurehq/vendure/releases) to keep up to date.
 
-### Code generation
+# License
 
-[graphql-code-generator](https://github.com/dotansimha/graphql-code-generator) is used to automatically create TypeScript interfaces for all GraphQL server operations and admin ui queries. These generated interfaces are used in both the admin ui and the server.
+Vendure is open source under the [GPLv3 license](./LICENSE.md). Building against the GraphQL API doesn't make your storefront or services subject to GPLv3, and a [plugin license exception](./license/plugin-exception.txt) lets you release your own Vendure plugins under any license you choose (see the [licensing FAQ](./license/license-faq.md)). Every paid plan includes a commercial license. See [pricing](https://vendure.io/pricing).
 
-Running `yarn codegen` will generate the following files:
+# Professional services
 
-* [`packages/common/src/generated-types.ts`](./packages/common/src/generated-types.ts): Types, Inputs & resolver args relating to the Admin API
-* [`packages/common/src/generated-shop-types.ts`](./packages/common/src/generated-shop-types.ts): Types, Inputs & resolver args relating to the Shop API
-* [`packages/admin-ui/src/lib/core/src/common/generated-types.ts`](./packages/admin-ui/src/lib/core/src/common/generated-types.ts): Types & operations relating to the admin-ui queries & mutations.
-* [`packages/admin-ui/src/lib/core/src/common/introspection-result.ts`](./packages/admin-ui/src/lib/core/src/common/introspection-result.ts): Used by the Apollo Client [`IntrospectionFragmentMatcher`](https://www.apollographql.com/docs/react/data/fragments/#fragments-on-unions-and-interfaces) to correctly handle fragements in the Admin UI.
-* Also generates types used in e2e tests in those packages which feature e2e tests (core, elasticsearch-plugin, asset-server-plugin etc).
-
-### Testing
-
-#### Server Unit Tests
-
-The core and several other packages have unit tests which are can be run all together by running `yarn test` from the root directory, or individually by running it from the package directory.
-
-Unit tests are co-located with the files which they test, and have the suffix `.spec.ts`.
-
-#### End-to-end Tests
-
-Certain packages have e2e tests, which are located at `/packages/<name>/e2e/`. All e2e tests can be run by running `yarn e2e` from the root directory, or individually by running it from the package directory.
-
-e2e tests use the `@vendure/testing` package. For details of how the setup works, see the [Testing docs](https://www.vendure.io/docs/developer-guide/testing/)
-
-When **debugging e2e tests**, set an environment variable `E2E_DEBUG=true` which will increase the global Jest timeout and allow you to step through the e2e tests without the tests automatically failing due to timeout.
-
-### Release Process
-
-All packages in this repo are released at every version change (using [Lerna's fixed mode](https://github.com/lerna/lerna#fixedlocked-mode-default)). This simplifies both the development (tracking multiple disparate versions is tough) and also the developer experience for users of the framework (it is simple to see that all packages are up-to-date and compatible).
-
-To make a release:
-
-##### 1. `yarn publish-release`
-
-It will run `lerna publish` which will prompt for which version to update to. Although we are using [conventional commits](https://www.conventionalcommits.org), the version is not automatically being calculated from the commit messages. Therefore the next version should be manually selected. 
-
-Next it will build all packages to ensure the distributed files are up to date.
-
-Finally the command will create changelog entries for this release.
-
-##### 2. `git push origin master --follow-tags`
-
-The reason we do not rely on Lerna to push the release to Git is that this repo has a lengthy pre-push hook which runs all tests and builds the admin ui. This long wait then invalidates the npm OTP and the publish will fail. So the solution is to publish first and then push.
-
-## License
-
-MIT
+Need help getting your build to production? Our team offers [professional services](https://vendure.io/services): architecture review, implementation support, and launch readiness from the people who build Vendure.

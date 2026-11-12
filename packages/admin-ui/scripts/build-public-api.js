@@ -1,13 +1,13 @@
 // @ts-check
-const fs = require('fs');
-const path = require('path');
+const fs = require('node:fs');
+const path = require('node:path');
 // This script finds all app sources and then generates a "public-api.ts" file exporting their
 // contents. This is then used as the public API entrypoint for the Angular CLI's library
 // builder process.
 
 console.log('Generating public apis...');
 const SOURCES_DIR = path.join(__dirname, '/../src/lib');
-const APP_SOURCE_FILE_PATTERN = /\.ts$/;
+const APP_SOURCE_FILE_PATTERN = /\.tsx?$/;
 const EXCLUDED_PATTERNS = [/(public_api|spec|mock)\.ts$/];
 
 const MODULES = [
@@ -20,6 +20,7 @@ const MODULES = [
     'order',
     'settings',
     'system',
+    'react',
 ];
 
 for (const moduleDir of MODULES) {
@@ -30,7 +31,11 @@ for (const moduleDir of MODULES) {
         const excluded = EXCLUDED_PATTERNS.reduce((result, re) => result || re.test(filename), false);
         if (!excluded) {
             const relativeFilename =
-                '.' + filename.replace(modulePath, '').replace(/\\/g, '/').replace(/\.ts$/, '');
+                '.' +
+                filename
+                    .replace(modulePath, '')
+                    .replace(/\\/g, '/')
+                    .replace(/\.tsx?$/, '');
             files.push(relativeFilename);
         }
     });

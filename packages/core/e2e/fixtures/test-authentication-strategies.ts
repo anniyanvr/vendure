@@ -3,12 +3,20 @@ import {
     ExternalAuthenticationService,
     Injector,
     RequestContext,
+    RoleService,
+    TransactionalConnection,
     User,
 } from '@vendure/core';
 import { DocumentNode } from 'graphql';
 import gql from 'graphql-tag';
+import { Readable } from 'stream';
 
 export const VALID_AUTH_TOKEN = 'valid-auth-token';
+
+const TEST_ADMIN_AVATAR = Buffer.from(
+    'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=',
+    'base64',
+);
 
 export type TestAuthPayload = {
     token: string;
@@ -61,6 +69,302 @@ export class TestAuthenticationStrategy implements AuthenticationStrategy<TestAu
             firstName: userData.firstName,
             lastName: userData.lastName,
             verified: true,
+        });
+    }
+}
+
+export class TestSSOStrategyAdmin implements AuthenticationStrategy<{ email: string }> {
+    readonly name = 'test_sso_strategy_admin';
+    private externalAuthenticationService: ExternalAuthenticationService;
+    private roleService: RoleService;
+
+    init(injector: Injector) {
+        this.externalAuthenticationService = injector.get(ExternalAuthenticationService);
+        this.roleService = injector.get(RoleService);
+    }
+
+    defineInputType(): DocumentNode {
+        return gql`
+            input TestSSOInputAdmin {
+                email: String!
+            }
+        `;
+    }
+
+    async authenticate(ctx: RequestContext, data: { email: string }): Promise<User | false | string> {
+        const { email } = data;
+        const user = await this.externalAuthenticationService.findUser(ctx, this.name, email);
+        if (user) {
+            return user;
+        }
+        const superAdminRole = await this.roleService.getSuperAdminRole();
+        return this.externalAuthenticationService.createAdministratorAndUser(ctx, {
+            strategy: this.name,
+            externalIdentifier: email,
+            emailAddress: email,
+            firstName: 'SSO Admin First Name',
+            lastName: 'SSO Admin Last Name',
+            identifier: email,
+            roles: [superAdminRole],
+            avatar: {
+                filename: 'external-profile.png',
+                mimetype: 'image/png',
+                createReadStream: () => Readable.from([TEST_ADMIN_AVATAR]),
+            },
+        });
+    }
+}
+
+/**
+ * Synchronizes the provider profile image on every login through
+ * ExternalAuthenticationService.setAdministratorAvatar(), which is the flow that method's
+ * documentation describes. The Administrator is deliberately created without an avatar, so an avatar
+ * which is present afterwards can only have been set by the synchronization.
+ */
+export class TestSSOStrategyAdminAvatarSync implements AuthenticationStrategy<{
+    email: string;
+    avatarFilename: string;
+}> {
+    readonly name = 'test_sso_strategy_admin_avatar_sync';
+    private externalAuthenticationService: ExternalAuthenticationService;
+    private roleService: RoleService;
+
+    init(injector: Injector) {
+        this.externalAuthenticationService = injector.get(ExternalAuthenticationService);
+        this.roleService = injector.get(RoleService);
+    }
+
+    defineInputType(): DocumentNode {
+        return gql`
+            input TestSSOInputAdminAvatarSync {
+                email: String!
+                avatarFilename: String!
+            }
+        `;
+    }
+
+    async authenticate(
+        ctx: RequestContext,
+        data: { email: string; avatarFilename: string },
+    ): Promise<User | false | string> {
+        const { email, avatarFilename } = data;
+        let user = await this.externalAuthenticationService.findUser(ctx, this.name, email);
+        if (!user) {
+            const superAdminRole = await this.roleService.getSuperAdminRole();
+            user = await this.externalAuthenticationService.createAdministratorAndUser(ctx, {
+                strategy: this.name,
+                externalIdentifier: email,
+                emailAddress: email,
+                firstName: 'Avatar Sync SSO Admin First Name',
+                lastName: 'Avatar Sync SSO Admin Last Name',
+                identifier: email,
+                roles: [superAdminRole],
+            });
+        }
+        // The request is still anonymous here, because the session is only minted once this method
+        // has returned the User.
+        await this.externalAuthenticationService.setAdministratorAvatar(ctx, user.id, {
+            filename: avatarFilename,
+            mimetype: 'image/png',
+            createReadStream: () => Readable.from([TEST_ADMIN_AVATAR]),
+        });
+        return user;
+    }
+}
+
+/**
+ * The same as TestSSOStrategyAdmin under a different name, so that a test can register it on the
+ * Shop API only. The Admin API then has no input field for it, and a Shop-minted session is the only
+ * route to the administrator's permissions on the Admin API.
+ */
+export class TestSSOStrategyShopOnlyAdmin implements AuthenticationStrategy<{ email: string }> {
+    readonly name = 'test_sso_strategy_shop_only_admin';
+    private externalAuthenticationService: ExternalAuthenticationService;
+    private roleService: RoleService;
+
+    init(injector: Injector) {
+        this.externalAuthenticationService = injector.get(ExternalAuthenticationService);
+        this.roleService = injector.get(RoleService);
+    }
+
+    defineInputType(): DocumentNode {
+        return gql`
+            input TestSSOInputShopOnlyAdmin {
+                email: String!
+            }
+        `;
+    }
+
+    async authenticate(ctx: RequestContext, data: { email: string }): Promise<User | false | string> {
+        const { email } = data;
+        const user = await this.externalAuthenticationService.findUser(ctx, this.name, email);
+        if (user) {
+            return user;
+        }
+        const superAdminRole = await this.roleService.getSuperAdminRole();
+        return this.externalAuthenticationService.createAdministratorAndUser(ctx, {
+            strategy: this.name,
+            externalIdentifier: email,
+            emailAddress: email,
+            firstName: 'Shop Only SSO Admin First Name',
+            lastName: 'Shop Only SSO Admin Last Name',
+            identifier: email,
+            roles: [superAdminRole],
+        });
+    }
+}
+
+/**
+ * Resolves a User which carries the SuperAdmin role but has no Administrator row, which
+ * ExternalAuthenticationService.createUser permits. The Admin API refuses to issue a session for such
+ * a User, so a Shop-minted session is the only way its permissions can reach the Admin API.
+ */
+export class TestSSOStrategyRoleOnly implements AuthenticationStrategy<{ email: string }> {
+    readonly name = 'test_sso_strategy_role_only';
+    private externalAuthenticationService: ExternalAuthenticationService;
+    private roleService: RoleService;
+    private connection: TransactionalConnection;
+
+    init(injector: Injector) {
+        this.externalAuthenticationService = injector.get(ExternalAuthenticationService);
+        this.roleService = injector.get(RoleService);
+        this.connection = injector.get(TransactionalConnection);
+    }
+
+    defineInputType(): DocumentNode {
+        return gql`
+            input TestSSOInputRoleOnly {
+                email: String!
+            }
+        `;
+    }
+
+    async authenticate(ctx: RequestContext, data: { email: string }): Promise<User | false | string> {
+        const { email } = data;
+        const existing = await this.externalAuthenticationService.findUser(ctx, this.name, email);
+        if (existing) {
+            return existing;
+        }
+        const user = await this.externalAuthenticationService.createUser(ctx, {
+            strategy: this.name,
+            externalIdentifier: email,
+        });
+        user.roles = [await this.roleService.getSuperAdminRole()];
+        return this.connection.getRepository(ctx, User).save(user);
+    }
+}
+
+export class TestSSOStrategyShop implements AuthenticationStrategy<{ email: string }> {
+    readonly name = 'test_sso_strategy_shop';
+    private externalAuthenticationService: ExternalAuthenticationService;
+
+    init(injector: Injector) {
+        this.externalAuthenticationService = injector.get(ExternalAuthenticationService);
+    }
+
+    defineInputType(): DocumentNode {
+        return gql`
+            input TestSSOInputShop {
+                email: String!
+            }
+        `;
+    }
+
+    async authenticate(ctx: RequestContext, data: { email: string }): Promise<User | false | string> {
+        const { email } = data;
+        const user = await this.externalAuthenticationService.findUser(ctx, this.name, email);
+        if (user) {
+            return user;
+        }
+        return this.externalAuthenticationService.createCustomerAndUser(ctx, {
+            strategy: this.name,
+            externalIdentifier: email,
+            emailAddress: email,
+            firstName: 'SSO Customer First Name',
+            lastName: 'SSO Customer Last Name',
+            verified: true,
+        });
+    }
+}
+
+/**
+ * Like TestSSOStrategyShop, but looks up the User with findCustomerUser(), which only checks the
+ * current Channel, as the documented example of an AuthenticationStrategy does.
+ */
+export class TestSSOStrategyShopChannelScoped implements AuthenticationStrategy<{
+    email: string;
+    verified?: boolean;
+}> {
+    readonly name = 'test_sso_strategy_shop_channel_scoped';
+    private externalAuthenticationService: ExternalAuthenticationService;
+
+    init(injector: Injector) {
+        this.externalAuthenticationService = injector.get(ExternalAuthenticationService);
+    }
+
+    defineInputType(): DocumentNode {
+        return gql`
+            input TestSSOInputShopChannelScoped {
+                email: String!
+                verified: Boolean
+            }
+        `;
+    }
+
+    async authenticate(
+        ctx: RequestContext,
+        data: { email: string; verified?: boolean },
+    ): Promise<User | false | string> {
+        const { email, verified } = data;
+        const user = await this.externalAuthenticationService.findCustomerUser(ctx, this.name, email);
+        if (user) {
+            return user;
+        }
+        return this.externalAuthenticationService.createCustomerAndUser(ctx, {
+            strategy: this.name,
+            externalIdentifier: email,
+            emailAddress: email,
+            firstName: 'SSO Customer First Name',
+            lastName: 'SSO Customer Last Name',
+            verified: verified ?? true,
+        });
+    }
+}
+
+/**
+ * Simulates an external provider which forwards an email address that has NOT been verified as
+ * belonging to the authenticating user (e.g. a custom OAuth provider that omits `email_verified`).
+ * Used to assert that such an identity cannot be linked to a pre-existing account.
+ */
+export class TestUnverifiedEmailStrategy implements AuthenticationStrategy<{ email: string }> {
+    readonly name = 'test_unverified_strategy';
+    private externalAuthenticationService: ExternalAuthenticationService;
+
+    init(injector: Injector) {
+        this.externalAuthenticationService = injector.get(ExternalAuthenticationService);
+    }
+
+    defineInputType(): DocumentNode {
+        return gql`
+            input TestUnverifiedInput {
+                email: String!
+            }
+        `;
+    }
+
+    async authenticate(ctx: RequestContext, data: { email: string }): Promise<User | false | string> {
+        const { email } = data;
+        const user = await this.externalAuthenticationService.findUser(ctx, this.name, email);
+        if (user) {
+            return user;
+        }
+        return this.externalAuthenticationService.createCustomerAndUser(ctx, {
+            strategy: this.name,
+            externalIdentifier: email,
+            emailAddress: email,
+            firstName: 'Unverified',
+            lastName: 'Customer',
+            verified: false,
         });
     }
 }

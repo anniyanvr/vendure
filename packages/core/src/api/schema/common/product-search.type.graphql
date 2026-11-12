@@ -6,6 +6,7 @@ type SearchResponse {
     items: [SearchResult!]!
     totalItems: Int!
     facetValues: [FacetValueResult!]!
+    collections: [CollectionResult!]!
 }
 
 """
@@ -14,6 +15,15 @@ by the search, and in what quantity.
 """
 type FacetValueResult {
     facetValue: FacetValue!
+    count: Int!
+}
+
+"""
+Which Collections are present in the products returned
+by the search, and in what quantity.
+"""
+type CollectionResult {
+    collection: Collection!
     count: Int!
 }
 
@@ -28,11 +38,9 @@ type SearchResult {
     slug: String!
     productId: ID!
     productName: String!
-    productPreview: String! @deprecated(reason: "Use `productAsset.preview` instead")
     productAsset: SearchResultAsset
     productVariantId: ID!
     productVariantName: String!
-    productVariantPreview: String! @deprecated(reason: "Use `productVariantAsset.preview` instead")
     productVariantAsset: SearchResultAsset
     price: SearchResultPrice!
     priceWithTax: SearchResultPrice!
@@ -42,7 +50,7 @@ type SearchResult {
     facetValueIds: [ID!]!
     "An array of ids of the Collections in which this result appears"
     collectionIds: [ID!]!
-    "A relevence score for the result. Differs between database implementations"
+    "A relevance score for the result. Differs between database implementations"
     score: Float!
 }
 
@@ -51,11 +59,11 @@ union SearchResultPrice = PriceRange | SinglePrice
 
 "The price value where the result has a single price"
 type SinglePrice {
-    value: Int!
+    value: Money!
 }
 
 "The price range where the result has more than one price"
 type PriceRange {
-    min: Int!
-    max: Int!
+    min: Money!
+    max: Money!
 }

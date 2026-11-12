@@ -1,27 +1,122 @@
 import { Module, OnApplicationBootstrap, OnApplicationShutdown } from '@nestjs/common';
 import { ModuleRef } from '@nestjs/core';
+import { DEFAULT_REFUND_DESTINATION_CODE } from '@vendure/common/lib/shared-constants';
+import { ConfigArgType } from '@vendure/common/lib/shared-types';
 
-import { ConfigurableOperationDef } from '../common/configurable-operation';
+import { ConfigArgDef, ConfigurableOperationDef } from '../common/configurable-operation';
 import { Injector } from '../common/injector';
 import { InjectableStrategy } from '../common/types/injectable-strategy';
 
+import { resetConfig } from './config-helpers';
 import { ConfigService } from './config.service';
+import { ConfigDefType, getConfigurableOperationDefinitions } from './configurable-operation-registry';
 
 @Module({
     providers: [ConfigService],
     exports: [ConfigService],
 })
 export class ConfigModule implements OnApplicationBootstrap, OnApplicationShutdown {
-    constructor(private configService: ConfigService, private moduleRef: ModuleRef) {}
+    constructor(
+        private configService: ConfigService,
+        private moduleRef: ModuleRef,
+    ) {}
 
     async onApplicationBootstrap() {
+        this.validateRefundDestinations();
         await this.initInjectableStrategies();
         await this.initConfigurableOperations();
+        this.assertSecretConfigArgsAreValid();
+        this.assertEncryptionConfiguredIfSecretsUsed();
+    }
+
+    /**
+     * A `secret` config arg is encrypted to an unbounded string at rest, so it is only supported on
+     * a non-list `string` arg. This mirrors the equivalent validation for `secret` custom fields.
+     */
+    private assertSecretConfigArgsAreValid() {
+        for (const operation of this.getConfigurableOperations()) {
+            for (const [name, argDef] of Object.entries<ConfigArgDef<ConfigArgType>>(operation.args)) {
+                if (argDef.secret !== true) {
+                    continue;
+                }
+                if (argDef.type !== 'string') {
+                    throw new Error(
+                        `ERROR: The "${operation.code}" config arg "${name}" has "secret: true", ` +
+                            'which is only supported on "string" args.',
+                    );
+                }
+                if (argDef.list === true) {
+                    throw new Error(
+                        `ERROR: The "${operation.code}" config arg "${name}" cannot combine ` +
+                            '"secret: true" with "list: true".',
+                    );
+                }
+            }
+        }
+    }
+
+    /**
+     * If any custom field or config arg is marked `secret` but no usable EncryptionStrategy is
+     * configured, fail fast at bootstrap rather than throwing later when a secret value is first
+     * written or read.
+     */
+    private assertEncryptionConfiguredIfSecretsUsed() {
+        const { encryptionStrategy } = this.configService.systemOptions;
+        if (encryptionStrategy?.isConfigured()) {
+            return;
+        }
+        const hasSecretCustomField = Object.values(this.configService.customFields).some(fields =>
+            (fields ?? []).some(f => f.secret === true),
+        );
+        const hasSecretConfigArg = this.getConfigurableOperations().some(op =>
+            Object.values<ConfigArgDef<ConfigArgType>>(op.args).some(arg => arg.secret === true),
+        );
+        if (hasSecretCustomField || hasSecretConfigArg) {
+            throw new Error(
+                '[Vendure] A `secret` custom field or config arg is configured, but no EncryptionStrategy ' +
+                    'with a usable key is available. Configure one in your VendureConfig:\n\n' +
+                    "  import { DefaultEncryptionStrategy } from '@vendure/core';\n\n" +
+                    '  systemOptions: {\n' +
+                    '    encryptionStrategy: new DefaultEncryptionStrategy({\n' +
+                    '      secret: process.env.VENDURE_ENCRYPTION_KEY,\n' +
+                    '    }),\n' +
+                    '  }\n\n' +
+                    'and set the VENDURE_ENCRYPTION_KEY environment variable to a stable, secret value. It ' +
+                    'must not change once secret data has been written, or that data can no longer be decrypted.',
+            );
+        }
     }
 
     async onApplicationShutdown(signal?: string) {
         await this.destroyInjectableStrategies();
         await this.destroyConfigurableOperations();
+        /**
+         * When the application shuts down, we reset the activeConfig to the default. Usually this is
+         * redundant, as the app shutdown would normally coincide with the process ending. However, in some
+         * circumstances, such as when running migrations immediately followed by app bootstrap, the activeConfig
+         * will persist between these two applications and mutations e.g. to the CustomFields will result in
+         * hard-to-debug errors. So resetting is a precaution against this scenario.
+         */
+        resetConfig();
+    }
+
+    private validateRefundDestinations() {
+        const refundDestinations = this.configService.paymentOptions.refundDestinations ?? [];
+        const seen = new Set<string>();
+        for (const strategy of refundDestinations) {
+            if (strategy.code === DEFAULT_REFUND_DESTINATION_CODE) {
+                throw new Error(
+                    `RefundDestinationStrategy code "${DEFAULT_REFUND_DESTINATION_CODE}" is reserved ` +
+                        `for the built-in default destination. Please use a different code for your strategy.`,
+                );
+            }
+            if (seen.has(strategy.code)) {
+                throw new Error(
+                    `Duplicate RefundDestinationStrategy code "${strategy.code}". Each strategy must have a unique code.`,
+                );
+            }
+            seen.add(strategy.code);
+        }
     }
 
     private async initInjectableStrategies() {
@@ -43,8 +138,16 @@ export class ConfigModule implements OnApplicationBootstrap, OnApplicationShutdo
 
     private async initConfigurableOperations() {
         const injector = new Injector(this.moduleRef);
-        for (const operation of this.getConfigurableOperations()) {
-            await operation.init(injector);
+        const { encryptionStrategy } = this.configService.systemOptions;
+        const registries = getConfigurableOperationDefinitions(this.configService);
+        for (const [defType, operations] of Object.entries(registries) as Array<
+            [ConfigDefType, Array<ConfigurableOperationDef<any>>]
+        >) {
+            for (const operation of operations) {
+                operation.setDefType(defType);
+                await operation.init(injector);
+                operation.setEncryptionStrategy(encryptionStrategy);
+            }
         }
     }
 
@@ -55,74 +158,123 @@ export class ConfigModule implements OnApplicationBootstrap, OnApplicationShutdo
     }
 
     private getInjectableStrategies(): InjectableStrategy[] {
-        const {
-            assetNamingStrategy,
-            assetPreviewStrategy,
-            assetStorageStrategy,
-        } = this.configService.assetOptions;
+        const { assetNamingStrategy, assetPreviewStrategy, assetStorageStrategy } =
+            this.configService.assetOptions;
         const {
             productVariantPriceCalculationStrategy,
+            productVariantPriceSelectionStrategy,
+            productVariantPriceUpdateStrategy,
             stockDisplayStrategy,
+            stockLocationStrategy,
         } = this.configService.catalogOptions;
         const {
             adminAuthenticationStrategy,
             shopAuthenticationStrategy,
             sessionCacheStrategy,
+            passwordHashingStrategy,
+            passwordValidationStrategy,
+            verificationTokenStrategy,
+            adminApiKeyStrategy,
+            shopApiKeyStrategy,
+            entityAccessControlStrategy,
+            customerChannelAssignmentStrategy,
         } = this.configService.authOptions;
-        const { taxZoneStrategy } = this.configService.taxOptions;
-        const { jobQueueStrategy } = this.configService.jobQueueOptions;
+        const { taxZoneStrategy, taxLineCalculationStrategy, orderTaxCalculationStrategy } =
+            this.configService.taxOptions;
+        const { jobQueueStrategy, jobBufferStorageStrategy } = this.configService.jobQueueOptions;
+        const { schedulerStrategy } = this.configService.schedulerOptions;
         const {
             mergeStrategy,
             checkoutMergeStrategy,
             orderItemPriceCalculationStrategy,
-            process,
+            process: orderProcess,
             orderCodeStrategy,
+            orderByCodeAccessStrategy,
             stockAllocationStrategy,
+            activeOrderStrategy,
+            changedPriceHandlingStrategy,
+            orderLineDiscountDistributionStrategy,
+            orderSellerStrategy,
+            guestCheckoutStrategy,
+            orderInterceptors,
+            orderRecalculationStrategy,
         } = this.configService.orderOptions;
-        const { customFulfillmentProcess } = this.configService.shippingOptions;
-        const { customPaymentProcess } = this.configService.paymentOptions;
-        const { entityIdStrategy } = this.configService;
+        const {
+            customFulfillmentProcess,
+            process: fulfillmentProcess,
+            shippingLineAssignmentStrategy,
+        } = this.configService.shippingOptions;
+        const {
+            customPaymentProcess,
+            process: paymentProcess,
+            refundDestinations,
+        } = this.configService.paymentOptions;
+        const { entityIdStrategy: entityIdStrategyDeprecated } = this.configService;
+        const { entityIdStrategy: entityIdStrategyCurrent } = this.configService.entityOptions;
+        const { healthChecks, errorHandlers } = this.configService.systemOptions;
+        const { assetImportStrategy } = this.configService.importExportOptions;
+        const { refundProcess: refundProcess } = this.configService.paymentOptions;
+        const { cacheStrategy, instrumentationStrategy, encryptionStrategy, secretAccessStrategy } =
+            this.configService.systemOptions;
+        const entityIdStrategy = entityIdStrategyCurrent ?? entityIdStrategyDeprecated;
         return [
             ...adminAuthenticationStrategy,
             ...shopAuthenticationStrategy,
             sessionCacheStrategy,
+            passwordHashingStrategy,
+            passwordValidationStrategy,
+            verificationTokenStrategy,
             assetNamingStrategy,
             assetPreviewStrategy,
             assetStorageStrategy,
             taxZoneStrategy,
+            taxLineCalculationStrategy,
+            orderTaxCalculationStrategy,
             jobQueueStrategy,
+            jobBufferStorageStrategy,
             mergeStrategy,
             checkoutMergeStrategy,
             orderCodeStrategy,
+            orderByCodeAccessStrategy,
             entityIdStrategy,
             productVariantPriceCalculationStrategy,
+            productVariantPriceUpdateStrategy,
             orderItemPriceCalculationStrategy,
-            ...process,
+            ...orderProcess,
             ...customFulfillmentProcess,
+            ...fulfillmentProcess,
             ...customPaymentProcess,
+            ...paymentProcess,
             stockAllocationStrategy,
             stockDisplayStrategy,
+            ...healthChecks,
+            ...errorHandlers,
+            assetImportStrategy,
+            changedPriceHandlingStrategy,
+            ...(orderRecalculationStrategy ? [orderRecalculationStrategy] : []),
+            orderLineDiscountDistributionStrategy,
+            ...(Array.isArray(activeOrderStrategy) ? activeOrderStrategy : [activeOrderStrategy]),
+            orderSellerStrategy,
+            shippingLineAssignmentStrategy,
+            stockLocationStrategy,
+            productVariantPriceSelectionStrategy,
+            guestCheckoutStrategy,
+            ...refundProcess,
+            ...(refundDestinations ?? []),
+            cacheStrategy,
+            ...(instrumentationStrategy ? [instrumentationStrategy] : []),
+            ...(encryptionStrategy ? [encryptionStrategy] : []),
+            ...(secretAccessStrategy ? [secretAccessStrategy] : []),
+            ...orderInterceptors,
+            schedulerStrategy,
+            adminApiKeyStrategy,
+            shopApiKeyStrategy,
+            entityAccessControlStrategy,
+            customerChannelAssignmentStrategy,
         ];
     }
 
     private getConfigurableOperations(): Array<ConfigurableOperationDef<any>> {
-        const { paymentMethodHandlers, paymentMethodEligibilityCheckers } = this.configService.paymentOptions;
-        const { collectionFilters } = this.configService.catalogOptions;
-        const { promotionActions, promotionConditions } = this.configService.promotionOptions;
-        const {
-            shippingCalculators,
-            shippingEligibilityCheckers,
-            fulfillmentHandlers,
-        } = this.configService.shippingOptions;
-        return [
-            ...(paymentMethodEligibilityCheckers || []),
-            ...paymentMethodHandlers,
-            ...collectionFilters,
-            ...(promotionActions || []),
-            ...(promotionConditions || []),
-            ...(shippingCalculators || []),
-            ...(shippingEligibilityCheckers || []),
-            ...(fulfillmentHandlers || []),
-        ];
+        return Object.values(getConfigurableOperationDefinitions(this.configService)).flat();
     }
 }

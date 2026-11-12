@@ -5,11 +5,20 @@ import { DataService } from '../../data/providers/data.service';
 import { LocaleBasePipe } from './locale-base.pipe';
 
 /**
+ * @description
  * Displays a human-readable name for a given ISO 4217 currency code.
+ *
+ * @example
+ * ```HTML
+ * {{ order.currencyCode | localeCurrencyName }}
+ * ```
+ *
+ * @docsCategory pipes
  */
 @Pipe({
     name: 'localeCurrencyName',
     pure: false,
+    standalone: false,
 })
 export class LocaleCurrencyNamePipe extends LocaleBasePipe implements PipeTransform {
     constructor(@Optional() dataService?: DataService, @Optional() changeDetectorRef?: ChangeDetectorRef) {
@@ -24,25 +33,24 @@ export class LocaleCurrencyNamePipe extends LocaleBasePipe implements PipeTransf
         }
         let name = '';
         let symbol = '';
-        const activeLocale = typeof locale === 'string' ? locale : this.locale ?? 'en';
+        const activeLocale = this.getActiveLocale(locale);
 
         if (display === 'full' || display === 'name') {
-            name = new Intl.NumberFormat(activeLocale, {
-                style: 'currency',
-                currency: value,
-                currencyDisplay: 'name',
-            })
-                .format(undefined as any)
-                .replace(/\s*NaN\s*/, '');
+            name =
+                new Intl.DisplayNames([activeLocale], {
+                    type: 'currency',
+                }).of(value) ?? '';
         }
         if (display === 'full' || display === 'symbol') {
-            symbol = new Intl.NumberFormat(activeLocale, {
-                style: 'currency',
-                currency: value,
-                currencyDisplay: 'symbol',
-            })
-                .format(undefined as any)
-                .replace(/\s*NaN\s*/, '');
+            const parts = (
+                new Intl.NumberFormat(activeLocale, {
+                    style: 'currency',
+                    currency: value,
+                    currencyDisplay: 'symbol',
+                }) as any
+            ).formatToParts();
+
+            symbol = parts.find(p => p.type === 'currency')?.value || value;
         }
         return display === 'full' ? `${name} (${symbol})` : display === 'name' ? name : symbol;
     }

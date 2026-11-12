@@ -1,12 +1,18 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, OnModuleInit } from '@nestjs/common';
 import { ID } from '@vendure/common/lib/shared-types';
 import crypto from 'crypto';
-import ms from 'ms';
-import { EntitySubscriberInterface, InsertEvent, RemoveEvent, UpdateEvent } from 'typeorm';
+import ms, { type StringValue } from 'ms';
+import { Brackets, EntitySubscriberInterface, InsertEvent, RemoveEvent, UpdateEvent } from 'typeorm';
 
-import { RequestContext } from '../../api/common/request-context';
+import { ApiType } from '../../api/common/get-api-type';
+import { DeserializedCachedSession, RequestContext } from '../../api/common/request-context';
+import { Instrument } from '../../common/instrument-decorator';
+import { API_KEY_AUTH_STRATEGY_DEFAULT_DURATION_MS, API_KEY_AUTH_STRATEGY_NAME, Logger } from '../../config';
 import { ConfigService } from '../../config/config.service';
 import { CachedSession, SessionCacheStrategy } from '../../config/session-cache/session-cache-strategy';
+import { findOptionsArrayToObject } from '../../connection/find-options-array-to-object';
+import { TransactionalConnection } from '../../connection/transactional-connection';
+import { ApiKey } from '../../entity/api-key/api-key.entity';
 import { Channel } from '../../entity/channel/channel.entity';
 import { Order } from '../../entity/order/order.entity';
 import { Role } from '../../entity/role/role.entity';
@@ -14,38 +20,83 @@ import { AnonymousSession } from '../../entity/session/anonymous-session.entity'
 import { AuthenticatedSession } from '../../entity/session/authenticated-session.entity';
 import { Session } from '../../entity/session/session.entity';
 import { User } from '../../entity/user/user.entity';
+import { JobQueue } from '../../job-queue/job-queue';
+import { JobQueueService } from '../../job-queue/job-queue.service';
+import { RequestContextService } from '../helpers/request-context/request-context.service';
 import { getUserChannelsPermissions } from '../helpers/utils/get-user-channels-permissions';
-import { TransactionalConnection } from '../transaction/transactional-connection';
 
 import { OrderService } from './order.service';
 
+/**
+ * @description
+ * Contains methods relating to {@link Session} entities.
+ *
+ * @docsCategory services
+ */
 @Injectable()
-export class SessionService implements EntitySubscriberInterface {
+@Instrument()
+export class SessionService implements EntitySubscriberInterface, OnModuleInit {
     private sessionCacheStrategy: SessionCacheStrategy;
+    private cleanSessionsJobQueue: JobQueue<{ batchSize: number }>;
     private readonly sessionDurationInMs: number;
+    private readonly sessionCacheTimeoutMs = 50;
+    /**
+     * `user` is declared on AuthenticatedSession, not the abstract Session queried here, so an
+     * object literal typed against Session does not compile.
+     */
+    private readonly userRelations = findOptionsArrayToObject<Session>([
+        'user',
+        'user.roles',
+        'user.roles.channels',
+    ]);
 
     constructor(
         private connection: TransactionalConnection,
         private configService: ConfigService,
         private orderService: OrderService,
+        private jobQueueService: JobQueueService,
+        private requestContextService: RequestContextService,
     ) {
         this.sessionCacheStrategy = this.configService.authOptions.sessionCacheStrategy;
-        this.sessionDurationInMs = ms(this.configService.authOptions.sessionDuration as string);
+
+        const { sessionDuration } = this.configService.authOptions;
+        this.sessionDurationInMs =
+            typeof sessionDuration === 'string' ? ms(sessionDuration as StringValue) : sessionDuration;
+
         // This allows us to register this class as a TypeORM Subscriber while also allowing
         // the injection on dependencies. See https://docs.nestjs.com/techniques/database#subscribers
         this.connection.rawConnection.subscribers.push(this);
     }
 
-    afterInsert(event: InsertEvent<any>): Promise<any> | void {
-        this.clearSessionCacheOnDataChange(event);
+    async onModuleInit() {
+        this.cleanSessionsJobQueue = await this.jobQueueService.createQueue({
+            name: 'clean-sessions',
+            process: async job => {
+                const ctx = await this.requestContextService.create({
+                    apiType: 'admin',
+                });
+                const result = await this.cleanExpiredSessions(ctx, job.data.batchSize);
+                return {
+                    batchSize: job.data.batchSize,
+                    sessionsRemoved: result,
+                };
+            },
+        });
     }
 
-    afterRemove(event: RemoveEvent<any>): Promise<any> | void {
-        this.clearSessionCacheOnDataChange(event);
+    /** @internal */
+    async afterInsert(event: InsertEvent<any>): Promise<any> {
+        await this.clearSessionCacheOnDataChange(event);
     }
 
-    afterUpdate(event: UpdateEvent<any>): Promise<any> | void {
-        this.clearSessionCacheOnDataChange(event);
+    /** @internal */
+    async afterRemove(event: RemoveEvent<any>): Promise<any> {
+        await this.clearSessionCacheOnDataChange(event);
+    }
+
+    /** @internal */
+    async afterUpdate(event: UpdateEvent<any>): Promise<any> {
+        await this.clearSessionCacheOnDataChange(event);
     }
 
     private async clearSessionCacheOnDataChange(
@@ -56,64 +107,106 @@ export class SessionService implements EntitySubscriberInterface {
             // session cache will be wrong, so we just clear the entire cache. It should however
             // be a very rare occurrence in normal operation, once initial setup is complete.
             if (event.entity instanceof Channel || event.entity instanceof Role) {
-                await this.sessionCacheStrategy.clear();
+                await this.withTimeout(this.sessionCacheStrategy.clear());
             }
         }
     }
 
+    /**
+     * @description
+     * Creates a new {@link AuthenticatedSession}. To be used after successful authentication.
+     *
+     * The `apiType` argument records the API the session belongs to. The AuthGuard refuses a session
+     * on the Admin API unless it records the Admin API, so this argument is a security control: pass
+     * it whenever the request context is not the API the caller authenticated against, for example a
+     * REST controller which completes an SSO callback for the Shop API.
+     *
+     * When it is omitted, the API is taken from `ctx.apiType` if the context carries a request, which
+     * covers every resolver and every REST route. A context with no request states nothing about the
+     * caller: `RequestContext.empty()` hardcodes `apiType: 'admin'`, `RequestContextService.create()`
+     * takes whatever the caller passed, and `RequestContext.deserialize()` drops the request, so a job
+     * queue worker has none either. A session created from such a context records `shop`, the
+     * lower-privilege API, so that omitting the argument fails closed rather than granting Admin API
+     * access.
+     */
     async createNewAuthenticatedSession(
         ctx: RequestContext,
         user: User,
         authenticationStrategyName: string,
+        sessionToken?: string,
+        apiType?: ApiType,
     ): Promise<AuthenticatedSession> {
-        const token = await this.generateSessionToken();
+        const token = sessionToken ?? (await this.generateSessionToken());
+        // See the API rule in this method's docs: a context which carries no request states nothing
+        // about the API the caller reached, so such a session belongs to the lower-privilege API.
+        const sessionApiType = ctx.req ? ctx.apiType : 'shop';
+        if (apiType == null && sessionApiType !== ctx.apiType) {
+            Logger.warn(
+                `Creating a session from a RequestContext with no request. Recording apiType ` +
+                    `'${sessionApiType}' rather than '${ctx.apiType}'. Pass the apiType argument of ` +
+                    `createNewAuthenticatedSession() to state which API the caller authenticated against.`,
+            );
+        }
         const guestOrder =
             ctx.session && ctx.session.activeOrderId
                 ? await this.orderService.findOne(ctx, ctx.session.activeOrderId)
                 : undefined;
         const existingOrder = await this.orderService.getActiveOrderForUser(ctx, user.id);
         const activeOrder = await this.orderService.mergeOrders(ctx, user, guestOrder, existingOrder);
+
+        const expires = this.getExpiryDate(
+            authenticationStrategyName === API_KEY_AUTH_STRATEGY_NAME
+                ? API_KEY_AUTH_STRATEGY_DEFAULT_DURATION_MS
+                : this.sessionDurationInMs,
+        );
+
         const authenticatedSession = await this.connection.getRepository(ctx, AuthenticatedSession).save(
             new AuthenticatedSession({
                 token,
                 user,
                 activeOrder,
                 authenticationStrategy: authenticationStrategyName,
-                expires: this.getExpiryDate(this.sessionDurationInMs),
+                expires,
                 invalidated: false,
+                apiType: apiType ?? sessionApiType,
             }),
         );
-        await this.sessionCacheStrategy.set(this.serializeSession(authenticatedSession));
+        await this.withTimeout(this.sessionCacheStrategy.set(this.serializeSession(authenticatedSession)));
         return authenticatedSession;
     }
 
     /**
-     * Create an anonymous session.
+     * @description
+     * Create an {@link AnonymousSession} and caches it using the configured {@link SessionCacheStrategy},
+     * and returns the cached session object.
      */
     async createAnonymousSession(): Promise<CachedSession> {
         const token = await this.generateSessionToken();
-        const anonymousSessionDurationInMs = ms('1y');
         const session = new AnonymousSession({
             token,
-            expires: this.getExpiryDate(anonymousSessionDurationInMs),
+            expires: this.getExpiryDate(this.sessionDurationInMs),
             invalidated: false,
         });
         // save the new session
-        const newSession = await this.connection.getRepository(AnonymousSession).save(session);
+        const newSession = await this.connection.rawConnection.getRepository(AnonymousSession).save(session);
         const serializedSession = this.serializeSession(newSession);
-        await this.sessionCacheStrategy.set(serializedSession);
+        await this.withTimeout(this.sessionCacheStrategy.set(serializedSession));
         return serializedSession;
     }
 
+    /**
+     * @description
+     * Returns the cached session object matching the given session token.
+     */
     async getSessionFromToken(sessionToken: string): Promise<CachedSession | undefined> {
-        let serializedSession = await this.sessionCacheStrategy.get(sessionToken);
+        let serializedSession = await this.withTimeout(this.sessionCacheStrategy.get(sessionToken));
         const stale = !!(serializedSession && serializedSession.cacheExpiry < new Date().getTime() / 1000);
         const expired = !!(serializedSession && serializedSession.expires < new Date());
         if (!serializedSession || stale || expired) {
             const session = await this.findSessionByToken(sessionToken);
             if (session) {
                 serializedSession = this.serializeSession(session);
-                await this.sessionCacheStrategy.set(serializedSession);
+                await this.withTimeout(this.sessionCacheStrategy.set(serializedSession));
                 return serializedSession;
             } else {
                 return;
@@ -122,9 +215,16 @@ export class SessionService implements EntitySubscriberInterface {
         return serializedSession;
     }
 
+    /**
+     * @description
+     * Serializes a {@link Session} instance into a simplified plain object suitable for caching.
+     */
     serializeSession(session: AuthenticatedSession | AnonymousSession): CachedSession {
-        const expiry =
-            Math.floor(new Date().getTime() / 1000) + this.configService.authOptions.sessionCacheTTL;
+        const { sessionCacheTTL } = this.configService.authOptions;
+        const sessionCacheTTLSeconds =
+            typeof sessionCacheTTL === 'string' ? ms(sessionCacheTTL as StringValue) / 1000 : sessionCacheTTL;
+
+        const expiry = new Date().getTime() / 1000 + sessionCacheTTLSeconds;
         const serializedSession: CachedSession = {
             cacheExpiry: expiry,
             id: session.id,
@@ -135,6 +235,7 @@ export class SessionService implements EntitySubscriberInterface {
         };
         if (this.isAuthenticatedSession(session)) {
             serializedSession.authenticationStrategy = session.authenticationStrategy;
+            serializedSession.apiType = session.apiType ?? undefined;
             const { user } = session;
             serializedSession.user = {
                 id: user.id,
@@ -147,10 +248,23 @@ export class SessionService implements EntitySubscriberInterface {
     }
 
     /**
+     * If the session cache is taking longer than say 50ms then something is wrong - it is supposed to
+     * be very fast after all! So we will return undefined and let the request continue without a cached session.
+     */
+    private withTimeout<T>(maybeSlow: Promise<T> | T): Promise<T | undefined> {
+        return Promise.race([
+            new Promise<undefined>(resolve =>
+                setTimeout(() => resolve(undefined), this.sessionCacheTimeoutMs),
+            ),
+            maybeSlow,
+        ]);
+    }
+
+    /**
      * Looks for a valid session with the given token and returns one if found.
      */
     private async findSessionByToken(token: string): Promise<Session | undefined> {
-        const session = await this.connection
+        const session = await this.connection.rawConnection
             .getRepository(Session)
             .createQueryBuilder('session')
             .leftJoinAndSelect('session.user', 'user')
@@ -166,29 +280,48 @@ export class SessionService implements EntitySubscriberInterface {
         }
     }
 
-    async setActiveOrder(
+    /**
+     * @description
+     * Sets the `activeOrder` on the given cached session object and updates the cache.
+     *
+     * Accepts the session of a deserialized {@link RequestContext} too, which has no token. The
+     * returned session is re-read from the database, so it does have one, unless the session row
+     * no longer exists, in which case the input is returned as is.
+     */
+    async setActiveOrder<T extends CachedSession | DeserializedCachedSession>(
         ctx: RequestContext,
-        serializedSession: CachedSession,
+        serializedSession: T,
         order: Order,
-    ): Promise<CachedSession> {
-        const session = await this.connection
-            .getRepository(Session)
-            .findOne(serializedSession.id, { relations: ['user', 'user.roles', 'user.roles.channels'] });
+    ): Promise<CachedSession | T> {
+        const session = await this.connection.getRepository(ctx, Session).findOne({
+            where: { id: serializedSession.id },
+            relations: this.userRelations,
+        });
         if (session) {
             session.activeOrder = order;
             await this.connection.getRepository(ctx, Session).save(session, { reload: false });
             const updatedSerializedSession = this.serializeSession(session);
-            await this.sessionCacheStrategy.set(updatedSerializedSession);
+            await this.withTimeout(this.sessionCacheStrategy.set(updatedSerializedSession));
             return updatedSerializedSession;
         }
         return serializedSession;
     }
 
-    async unsetActiveOrder(ctx: RequestContext, serializedSession: CachedSession): Promise<CachedSession> {
+    /**
+     * @description
+     * Clears the `activeOrder` on the given cached session object and updates the cache.
+     *
+     * Accepts the session of a deserialized {@link RequestContext} too, see {@link setActiveOrder}.
+     */
+    async unsetActiveOrder<T extends CachedSession | DeserializedCachedSession>(
+        ctx: RequestContext,
+        serializedSession: T,
+    ): Promise<CachedSession | T> {
         if (serializedSession.activeOrderId) {
-            const session = await this.connection
-                .getRepository(Session)
-                .findOne(serializedSession.id, { relations: ['user', 'user.roles', 'user.roles.channels'] });
+            const session = await this.connection.getRepository(ctx, Session).findOne({
+                where: { id: serializedSession.id },
+                relations: this.userRelations,
+            });
             if (session) {
                 session.activeOrder = null;
                 await this.connection.getRepository(ctx, Session).save(session);
@@ -200,44 +333,111 @@ export class SessionService implements EntitySubscriberInterface {
         return serializedSession;
     }
 
+    /**
+     * @description
+     * Sets the `activeChannel` on the given cached session object and updates the cache.
+     */
     async setActiveChannel(serializedSession: CachedSession, channel: Channel): Promise<CachedSession> {
-        const session = await this.connection
-            .getRepository(Session)
-            .findOne(serializedSession.id, { relations: ['user', 'user.roles', 'user.roles.channels'] });
+        const session = await this.connection.rawConnection.getRepository(Session).findOne({
+            where: { id: serializedSession.id },
+            relations: this.userRelations,
+        });
         if (session) {
             session.activeChannel = channel;
-            await this.connection.getRepository(Session).save(session, { reload: false });
+            await this.connection.rawConnection.getRepository(Session).save(session, { reload: false });
             const updatedSerializedSession = this.serializeSession(session);
-            await this.sessionCacheStrategy.set(updatedSerializedSession);
+            await this.withTimeout(this.sessionCacheStrategy.set(updatedSerializedSession));
             return updatedSerializedSession;
         }
         return serializedSession;
     }
 
     /**
+     * @description
      * Deletes all existing sessions for the given user.
      */
     async deleteSessionsByUser(ctx: RequestContext, user: User): Promise<void> {
         const userSessions = await this.connection
             .getRepository(ctx, AuthenticatedSession)
-            .find({ where: { user } });
+            .find({ where: { user: { id: user.id } } });
         await this.connection.getRepository(ctx, AuthenticatedSession).remove(userSessions);
         for (const session of userSessions) {
-            await this.sessionCacheStrategy.delete(session.token);
+            await this.withTimeout(this.sessionCacheStrategy.delete(session.token));
         }
     }
 
     /**
+     * @description
+     * Deletes session related to API-Key
+     */
+    async deleteApiKeySession(ctx: RequestContext, apiKey: ApiKey): Promise<void> {
+        await this.connection.getRepository(ctx, AuthenticatedSession).delete({
+            token: apiKey.apiKeyHash,
+            user: { id: apiKey.userId },
+            authenticationStrategy: API_KEY_AUTH_STRATEGY_NAME,
+        });
+        await this.withTimeout(this.sessionCacheStrategy.delete(apiKey.apiKeyHash));
+    }
+
+    /**
+     * @description
      * Deletes all existing sessions with the given activeOrder.
      */
     async deleteSessionsByActiveOrderId(ctx: RequestContext, activeOrderId: ID): Promise<void> {
-        const sessions = await this.connection.getRepository(ctx, Session).find({ where: { activeOrderId } });
+        const sessions = await this.connection
+            .getRepository(ctx, Session)
+            // Using a query builder here because sessions utilize @TableInheritance,
+            // `authenticationStrategy` only exists on `AuthenticatedSession`
+            .createQueryBuilder('s')
+            .where('s.activeOrderId = :activeOrderId', { activeOrderId })
+            // Specifically do not delete api key based sessions,
+            // else the api key becomes unusable!
+            .andWhere('(s.authenticationStrategy != :name OR s.authenticationStrategy IS NULL)', {
+                name: API_KEY_AUTH_STRATEGY_NAME,
+            })
+            .getMany();
         await this.connection.getRepository(ctx, Session).remove(sessions);
         for (const session of sessions) {
-            await this.sessionCacheStrategy.delete(session.token);
+            await this.withTimeout(this.sessionCacheStrategy.delete(session.token));
         }
     }
 
+    /**
+     * @description
+     * Triggers the clean sessions job.
+     */
+    async triggerCleanSessionsJob(batchSize: number) {
+        await this.cleanSessionsJobQueue.add({ batchSize });
+    }
+
+    /**
+     * @description
+     * Cleans expired sessions from the database & the session cache.
+     */
+    async cleanExpiredSessions(ctx: RequestContext, batchSize: number) {
+        const sessions = await this.connection
+            .getRepository(ctx, Session)
+            .createQueryBuilder('session')
+            .where('session.expires < :now', { now: new Date() })
+            .orWhere(
+                new Brackets(qb1 => {
+                    qb1.where('session.userId IS NULL')
+                        .andWhere('session.activeOrderId IS NULL')
+                        .andWhere('session.updatedAt < :updatedAt', {
+                            updatedAt: new Date(Date.now() - ms('7d')),
+                        });
+                }),
+            )
+            .take(batchSize)
+            .getMany();
+        Logger.verbose(`Cleaning ${sessions.length} expired sessions`);
+        await this.connection.getRepository(ctx, Session).remove(sessions);
+        for (const session of sessions) {
+            await this.withTimeout(this.sessionCacheStrategy.delete(session.token));
+        }
+        Logger.verbose(`Cleaned ${sessions.length} expired sessions`);
+        return sessions.length;
+    }
     /**
      * If we are over half way to the current session's expiry date, then we update it.
      *
@@ -245,11 +445,15 @@ export class SessionService implements EntitySubscriberInterface {
      * needing to run an update query on *every* request.
      */
     private async updateSessionExpiry(session: Session) {
-        const now = new Date().getTime();
-        if (session.expires.getTime() - now < this.sessionDurationInMs / 2) {
-            const newExpiryDate = this.getExpiryDate(this.sessionDurationInMs);
+        const isApiKeySession =
+            this.isAuthenticatedSession(session) &&
+            session.authenticationStrategy === API_KEY_AUTH_STRATEGY_NAME;
+        const ttlMs = isApiKeySession ? API_KEY_AUTH_STRATEGY_DEFAULT_DURATION_MS : this.sessionDurationInMs;
+
+        if (session.expires.getTime() - Date.now() < ttlMs / 2) {
+            const newExpiryDate = this.getExpiryDate(ttlMs);
             session.expires = newExpiryDate;
-            await this.connection
+            await this.connection.rawConnection
                 .getRepository(Session)
                 .update({ id: session.id }, { expires: newExpiryDate });
         }
@@ -277,6 +481,6 @@ export class SessionService implements EntitySubscriberInterface {
     }
 
     private isAuthenticatedSession(session: Session): session is AuthenticatedSession {
-        return session.hasOwnProperty('user');
+        return session.hasOwnProperty('user') && !!(session as AuthenticatedSession).user;
     }
 }

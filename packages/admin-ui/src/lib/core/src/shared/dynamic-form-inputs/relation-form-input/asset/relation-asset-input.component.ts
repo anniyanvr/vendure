@@ -1,31 +1,49 @@
 import { ChangeDetectionStrategy, Component, Input, OnInit } from '@angular/core';
-import { FormControl } from '@angular/forms';
+import { UntypedFormControl } from '@angular/forms';
+import { gql } from 'apollo-angular';
 import { Observable, of } from 'rxjs';
 import { distinctUntilChanged, map, startWith, switchMap } from 'rxjs/operators';
-
-import { GetAsset, RelationCustomFieldConfig } from '../../../../common/generated-types';
+import { GetAssetQuery, RelationCustomFieldConfig } from '../../../../common/generated-types';
+import { ASSET_FRAGMENT, TAG_FRAGMENT } from '../../../../data/definitions/product-definitions';
 import { DataService } from '../../../../data/providers/data.service';
 import { ModalService } from '../../../../providers/modal/modal.service';
 import { AssetPickerDialogComponent } from '../../../components/asset-picker-dialog/asset-picker-dialog.component';
 import { AssetPreviewDialogComponent } from '../../../components/asset-preview-dialog/asset-preview-dialog.component';
+
+export const RELATION_ASSET_INPUT_QUERY = gql`
+    query RelationAssetInputQuery($id: ID!) {
+        asset(id: $id) {
+            ...Asset
+            tags {
+                ...Tag
+            }
+        }
+    }
+    ${ASSET_FRAGMENT}
+    ${TAG_FRAGMENT}
+`;
 
 @Component({
     selector: 'vdr-relation-asset-input',
     templateUrl: './relation-asset-input.component.html',
     styleUrls: ['./relation-asset-input.component.scss'],
     changeDetection: ChangeDetectionStrategy.OnPush,
+    standalone: false,
 })
 export class RelationAssetInputComponent implements OnInit {
     @Input() readonly: boolean;
-    @Input() parentFormControl: FormControl;
+    @Input('parentFormControl') formControl: UntypedFormControl;
     @Input() config: RelationCustomFieldConfig;
-    asset$: Observable<GetAsset.Asset | undefined>;
+    asset$: Observable<GetAssetQuery['asset'] | undefined>;
 
-    constructor(private modalService: ModalService, private dataService: DataService) {}
+    constructor(
+        private modalService: ModalService,
+        private dataService: DataService,
+    ) {}
 
     ngOnInit() {
-        this.asset$ = this.parentFormControl.valueChanges.pipe(
-            startWith(this.parentFormControl.value),
+        this.asset$ = this.formControl.valueChanges.pipe(
+            startWith(this.formControl.value),
             map(asset => asset?.id),
             distinctUntilChanged(),
             switchMap(id => {
@@ -48,18 +66,18 @@ export class RelationAssetInputComponent implements OnInit {
             })
             .subscribe(result => {
                 if (result && result.length) {
-                    this.parentFormControl.setValue(result[0]);
-                    this.parentFormControl.markAsDirty();
+                    this.formControl.setValue(result[0]);
+                    this.formControl.markAsDirty();
                 }
             });
     }
 
     remove() {
-        this.parentFormControl.setValue(null);
-        this.parentFormControl.markAsDirty();
+        this.formControl.setValue(null);
+        this.formControl.markAsDirty();
     }
 
-    previewAsset(asset: GetAsset.Asset) {
+    previewAsset(asset: NonNullable<GetAssetQuery['asset']>) {
         this.modalService
             .fromComponent(AssetPreviewDialogComponent, {
                 size: 'xl',

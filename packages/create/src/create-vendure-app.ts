@@ -1,28 +1,76 @@
-/* tslint:disable:no-console */
-import chalk from 'chalk';
-import program from 'commander';
-import detectPort from 'detect-port';
+import { intro, note, outro, select, spinner } from '@clack/prompts';
+import { SUPER_ADMIN_USER_IDENTIFIER, SUPER_ADMIN_USER_PASSWORD } from '@vendure/common/lib/shared-constants';
+import { program } from 'commander';
 import fs from 'fs-extra';
-import Listr from 'listr';
-import os from 'os';
-import path from 'path';
-import { Observable } from 'rxjs';
+import Handlebars from 'handlebars';
+import { ChildProcess, spawn } from 'node:child_process';
+import { randomBytes } from 'node:crypto';
+import os from 'node:os';
+import path from 'node:path';
+import { setTimeout as sleep } from 'node:timers/promises';
+import pc from 'picocolors';
 
-import { REQUIRED_NODE_VERSION, SERVER_PORT } from './constants';
-import { gatherCiUserResponses, gatherUserResponses } from './gather-user-responses';
+import { showConsoleHint } from './console-hint';
 import {
+    AUTO_RUN_DELAY_MS,
+    CI_PAUSE_AFTER_CLOSE_MS,
+    CI_PAUSE_BEFORE_CLOSE_MS,
+    DEFAULT_PROJECT_VERSION,
+    NORMAL_PAUSE_BEFORE_CLOSE_MS,
+    PORT_SCAN_RANGE,
+    REQUIRED_NODE_VERSION,
+    SCAFFOLD_DELAY_MS,
+    SERVER_PORT,
+    STOREFRONT_PORT,
+    TIP_INTERVAL_MS,
+    TIPS_WHILE_WAITING,
+} from './constants';
+import {
+    getCiConfiguration,
+    getManualConfiguration,
+    getQuickStartConfiguration,
+} from './gather-user-responses';
+import {
+    checkCancel,
     checkDbConnection,
     checkNodeVersion,
     checkThatNpmCanReadCwd,
+    cleanUpDockerResources,
+    createProjectRequire,
+    detectPackageManager,
+    DOCKER_NOT_RESPONDING_MESSAGE,
+    downloadAndExtractStorefront,
+    findAvailablePort,
     getDependencies,
+    getMonorepoRootPackageJson,
+    getPackageManagerInfo,
+    getPnpmWorkspaceYaml,
+    getServerPackageScripts,
+    getSingleProjectPackageJson,
+    getYarnRcYml,
     installPackages,
     isSafeToCreateProjectIn,
-    isServerPortInUse,
-    shouldUseYarn,
+    probeDockerDaemon,
+    registerTemplateHelpers,
+    resolvePackageRootDir,
+    scaffoldAlreadyExists,
+    startPostgresDatabase,
 } from './helpers';
-import { CliLogLevel } from './types';
+import { log, setLogLevel } from './logger';
+import { offerPlatformTrial } from './platform-trial';
+import {
+    configureStorefrontPackageJson,
+    getStorefrontStarter,
+    parseStorefrontId,
+    renderStorefrontEnvironment,
+    resolveCiStorefront,
+    STOREFRONT_STARTERS,
+    StorefrontId,
+    StorefrontStarter,
+} from './storefront-starters';
+import { CliLogLevel, PackageManager, UserResponses } from './types';
 
-// tslint:disable-next-line:no-var-requires
+// eslint-disable-next-line @typescript-eslint/no-var-requires
 const packageJson = require('../package.json');
 checkNodeVersion(REQUIRED_NODE_VERSION);
 
@@ -37,269 +85,791 @@ process.env[createEnvVar] = 'true';
 program
     .version(packageJson.version)
     .arguments('<project-directory>')
-    .usage(`${chalk.green('<project-directory>')} [options]`)
+    .usage(`${pc.green('<project-directory>')} [options]`)
     .action(name => {
         projectName = name;
     })
     .option(
         '--log-level <logLevel>',
-        `Log level, either 'silent', 'info', or 'verbose'`,
+        "Log level, either 'silent', 'info', or 'verbose'",
         /^(silent|info|verbose)$/i,
-        'silent',
+        'info',
     )
-    .option('--use-npm', 'Uses npm rather than Yarn as the default package manager')
-    .option('--ci', 'Runs without prompts for use in CI scenarios')
+    .option('--verbose', 'Alias for --log-level verbose', false)
+    .option('--use-npm', 'Force npm, overriding auto-detection of the package manager that invoked the CLI')
+    .option('--ci', 'Runs without prompts for use in CI scenarios', false)
+    .option(
+        '--storefront <starter>',
+        `Storefront to include with --ci: ${STOREFRONT_STARTERS.map(starter => starter.id).join(', ')}`,
+        parseStorefrontId,
+    )
+    .option(
+        '--with-storefront',
+        'Include the Next.js storefront with --ci. Deprecated: use --storefront nextjs',
+        false,
+    )
+    .option(
+        '--db <database>',
+        "Database to use with --ci: 'sqlite' or 'postgres' (postgres is started via Docker)",
+        /^(sqlite|postgres)$/i,
+        'sqlite',
+    )
     .parse(process.argv);
 
 const options = program.opts();
-createApp(projectName, options.useNpm, options.logLevel || 'silent', options.ci);
+const selectedCiStorefront = resolveCiStorefront(options);
+void createVendureApp(
+    projectName,
+    options.useNpm,
+    options.verbose ? 'verbose' : options.logLevel || 'info',
+    options.ci,
+    selectedCiStorefront,
+    // The --db regex validates case-insensitively, but the comparisons downstream
+    // are against the lowercase literals.
+    options.db?.toLowerCase(),
+).catch(err => {
+    log(err);
+    process.exit(1);
+});
 
-async function createApp(
+export async function createVendureApp(
     name: string | undefined,
-    useNpm: boolean,
+    _useNpm: boolean, // Legacy flag: forces npm, overriding package-manager auto-detection
     logLevel: CliLogLevel,
     isCi: boolean = false,
+    ciStorefront?: StorefrontId,
+    ciDbType: 'sqlite' | 'postgres' = 'sqlite',
 ) {
-    if (!runPreChecks(name, useNpm)) {
+    setLogLevel(logLevel);
+    if (!runPreChecks(name)) {
         return;
     }
-    if (await isServerPortInUse()) {
-        console.log(chalk.red(`Port ${SERVER_PORT} is in use. Please make it available and then re-try.`));
+
+    intro(
+        `Let's create a ${pc.blue(pc.bold('Vendure App'))} ✨ ${pc.dim(`v${packageJson.version as string}`)}`,
+    );
+
+    const mode = isCi
+        ? 'ci'
+        : ((await select({
+              message: 'How should we proceed?',
+              options: [
+                  { label: 'Quick Start', value: 'quick', hint: 'Get up an running in a single step' },
+                  {
+                      label: 'Manual Configuration',
+                      value: 'manual',
+                      hint: 'Customize your Vendure project with more advanced settings',
+                  },
+              ],
+              initialValue: 'quick' as 'quick' | 'manual',
+          })) as 'quick' | 'manual');
+    checkCancel(mode);
+
+    const portSpinner = spinner();
+    let port: number;
+    portSpinner.start(`Establishing port...`);
+    try {
+        port = await findAvailablePort(SERVER_PORT, PORT_SCAN_RANGE);
+        portSpinner.stop(`Using port ${port}`);
+    } catch (e: any) {
+        portSpinner.stop(pc.red('Could not find an available port'));
+        outro(e.message);
         process.exit(1);
     }
-
-    console.log(`Welcome to @vendure/create v${packageJson.version}!`);
-    console.log();
-    console.log(`Let's configure a new Vendure project. First a few questions:`);
-    console.log();
+    // Read back by the generated vendure-config when the dashboard build introspects it later in
+    // this same process. Set as PORT because that is the name the config resolves first, so an
+    // unrelated PORT already in the shell environment cannot override the port we just verified.
+    process.env.PORT = port.toString();
 
     const root = path.resolve(name);
     const appName = path.basename(root);
+    const scaffoldExists = scaffoldAlreadyExists(root, name);
+
+    // `--use-npm` is honoured as an explicit override of auto-detection; otherwise we
+    // detect the manager that invoked the CLI (bunx/pnpm dlx/yarn dlx) so the generated
+    // project, install step and instructions all match what the user is actually using.
+    const packageManager: PackageManager = _useNpm ? 'npm' : detectPackageManager();
+    const pmInfo = getPackageManagerInfo(packageManager);
+    registerTemplateHelpers(pmInfo);
+
+    if (scaffoldExists) {
+        log(
+            pc.yellow(
+                'It appears that a new Vendure project scaffold already exists. Re-using the existing files...',
+            ),
+            { newline: 'after' },
+        );
+    }
+    // No spinner around this call: the quick start and manual modes prompt from here, and a
+    // running spinner erases the prompt every 80ms and takes over Ctrl+C via clack's block().
+    let configResult: UserResponses;
+    try {
+        configResult =
+            mode === 'ci'
+                ? await getCiConfiguration(root, packageManager, port, ciStorefront, ciDbType)
+                : mode === 'manual'
+                  ? await getManualConfiguration(root, packageManager, port)
+                  : await getQuickStartConfiguration(root, packageManager, port);
+    } catch (e: any) {
+        // generateSources scans for the storefront port, so an exhausted port range surfaces
+        // here rather than at the scan's own call site.
+        outro(pc.red(e.message));
+        process.exit(1);
+    }
     const {
         dbType,
-        usingTs,
         configSource,
+        envSource,
+        envDtsSource,
         indexSource,
         indexWorkerSource,
-        migrationSource,
         readmeSource,
+        dockerfileSource,
+        dockerComposeSource,
+        tsconfigDashboardSource,
+        viteConfigSource,
+        agentsSource,
         populateProducts,
-    } = isCi ? await gatherCiUserResponses(root) : await gatherUserResponses(root);
+        storefront: storefrontId,
+        storefrontPort,
+    } = configResult;
+    const storefront = storefrontId ? getStorefrontStarter(storefrontId) : undefined;
+    const includeStorefront = storefront != null;
 
-    const useYarn = useNpm ? false : shouldUseYarn();
-    const originalDirectory = process.cwd();
+    // Determine the server root directory (either root or apps/server for monorepo)
+    const serverRoot = includeStorefront ? path.join(root, 'apps', 'server') : root;
+    const storefrontRoot = path.join(root, 'apps', 'storefront');
+
     process.chdir(root);
-    if (!useYarn && !checkThatNpmCanReadCwd()) {
+    // This check spawns `npm` itself, so it only makes sense (and only works) for npm.
+    if (packageManager === 'npm' && !checkThatNpmCanReadCwd()) {
         process.exit(1);
     }
 
-    const packageJsonContents = {
-        name: appName,
-        version: '0.1.0',
-        private: true,
-        scripts: {
-            'run:server': usingTs ? 'ts-node ./src/index.ts' : 'node ./src/index.js',
-            'run:worker': usingTs ? 'ts-node ./src/index-worker.ts' : 'node ./src/index-worker.js',
-            start: useYarn ? 'concurrently yarn:run:*' : 'concurrently npm:run:*',
-            ...(usingTs ? { build: 'tsc' } : undefined),
-            'migration:generate': usingTs ? 'ts-node migration generate' : 'node migration generate',
-            'migration:run': usingTs ? 'ts-node migration run' : 'node migration run',
-            'migration:revert': usingTs ? 'ts-node migration revert' : 'node migration revert',
-        },
-        /**
-         * A work-around for the breaking update of tslib as described here:
-         * https://github.com/typeorm/typeorm/issues/6054
-         * TODO: Remove this once the TypeScript team come up with a solution
-         */
-        resolutions: {
-            tslib: '1.11.2',
-        },
-    };
+    const setupSpinner = spinner();
+    const projectType = includeStorefront ? 'monorepo' : 'project';
+    setupSpinner.start(
+        `Setting up your new Vendure ${projectType} in ${pc.green(root)}\nThis may take a few minutes...`,
+    );
 
-    console.log();
-    console.log(`Setting up your new Vendure project in ${chalk.green(root)}`);
-    console.log('This may take a few minutes...');
-    console.log();
+    const assetPath = (fileName: string) => path.join(__dirname, '../assets', fileName);
+    const templatePath = (fileName: string) => path.join(__dirname, '../assets/monorepo', fileName);
 
-    const tasks = new Listr([
-        {
-            title: 'Installing dependencies',
-            task: (() => {
-                return new Observable(subscriber => {
-                    subscriber.next('Creating package.json');
-                    fs.writeFileSync(
-                        path.join(root, 'package.json'),
-                        JSON.stringify(packageJsonContents, null, 2) + os.EOL,
-                    );
-                    const { dependencies, devDependencies } = getDependencies(
-                        usingTs,
-                        dbType,
-                        isCi ? `@${packageJson.version}` : '',
-                    );
+    if (includeStorefront) {
+        // Create monorepo structure
+        await fs.ensureDir(path.join(root, 'apps'));
+        await fs.ensureDir(serverRoot);
+        await fs.ensureDir(path.join(serverRoot, 'src'));
 
-                    subscriber.next(`Installing ${dependencies.join(', ')}`);
-                    installPackages(root, useYarn, dependencies, false, logLevel, isCi)
-                        .then(() => {
-                            if (devDependencies.length) {
-                                subscriber.next(`Installing ${devDependencies.join(', ')}`);
-                                return installPackages(root, useYarn, devDependencies, true, logLevel, isCi);
-                            }
-                        })
-                        .then(() => subscriber.complete())
-                        .catch(err => subscriber.error(err));
-                });
-            }) as any,
-        },
-        {
-            title: 'Generating app scaffold',
-            task: ctx => {
-                return new Observable(subscriber => {
-                    fs.ensureDirSync(path.join(root, 'src'));
-                    const assetPath = (fileName: string) => path.join(__dirname, '../assets', fileName);
-                    const srcPathScript = (fileName: string): string =>
-                        path.join(root, 'src', `${fileName}.${usingTs ? 'ts' : 'js'}`);
-                    const rootPathScript = (fileName: string): string =>
-                        path.join(root, `${fileName}.${usingTs ? 'ts' : 'js'}`);
-                    ctx.configFile = srcPathScript('vendure-config');
+        // Generate root package.json with package-manager-aware workspace scripts
+        fs.writeFileSync(
+            path.join(root, 'package.json'),
+            JSON.stringify(getMonorepoRootPackageJson(appName, pmInfo, dbType), null, 2) + os.EOL,
+        );
 
-                    fs.writeFile(ctx.configFile, configSource)
-                        .then(() => fs.writeFile(srcPathScript('index'), indexSource))
-                        .then(() => fs.writeFile(srcPathScript('index-worker'), indexWorkerSource))
-                        .then(() => fs.writeFile(rootPathScript('migration'), migrationSource))
-                        .then(() => fs.writeFile(path.join(root, 'README.md'), readmeSource))
-                        .then(() =>
-                            fs.copyFile(assetPath('gitignore.template'), path.join(root, '.gitignore')),
-                        )
-                        .then(() => {
-                            subscriber.next(`Created files`);
-                            if (usingTs) {
-                                return fs.copyFile(
-                                    assetPath('tsconfig.template.json'),
-                                    path.join(root, 'tsconfig.json'),
-                                );
-                            }
-                        })
-                        .then(() => createDirectoryStructure(root))
-                        .then(() => {
-                            subscriber.next(`Created directory structure`);
-                            return copyEmailTemplates(root);
-                        })
-                        .then(() => {
-                            subscriber.next(`Copied email templates`);
-                            subscriber.complete();
-                        })
-                        .catch(err => subscriber.error(err));
-                });
-            },
-        },
-        {
-            title: 'Initializing server',
-            task: async ctx => {
-                try {
-                    if (usingTs) {
-                        // register ts-node so that the config file can be loaded
-                        require(path.join(root, 'node_modules/ts-node')).register();
-                    }
-                    const { populate } = await import(
-                        path.join(root, 'node_modules/@vendure/core/cli/populate')
-                    );
-                    const { bootstrap, DefaultLogger, LogLevel, JobQueueService } = await import(
-                        path.join(root, 'node_modules/@vendure/core/dist/index')
-                    );
-                    const { config } = await import(ctx.configFile);
-                    const assetsDir = path.join(__dirname, '../assets');
+        // pnpm does not read the package.json `workspaces` field; it requires a
+        // pnpm-workspace.yaml instead. The file also carries pnpm's settings,
+        // including the build-script allowlist for native dependencies.
+        if (pmInfo.name === 'pnpm') {
+            fs.writeFileSync(
+                path.join(root, 'pnpm-workspace.yaml'),
+                getPnpmWorkspaceYaml(dbType, ['apps/*']),
+            );
+        }
+        if (pmInfo.name === 'yarn') {
+            fs.writeFileSync(path.join(root, '.yarnrc.yml'), getYarnRcYml());
+        }
 
-                    const initialDataPath = path.join(assetsDir, 'initial-data.json');
-                    const port = await detectPort(3000);
-                    const vendureLogLevel =
-                        logLevel === 'silent'
-                            ? LogLevel.Error
-                            : logLevel === 'verbose'
-                            ? LogLevel.Verbose
-                            : LogLevel.Info;
+        // Generate root README from template
+        const rootReadmeTemplate = await fs.readFile(templatePath('root-readme.hbs'), 'utf-8');
+        const rootReadmeContent = Handlebars.compile(rootReadmeTemplate)({
+            name: appName,
+            packageManager,
+            storefrontName: storefront?.frameworkName,
+            storefrontDocumentationUrl: storefront?.documentationUrl,
+            serverPort: port,
+            storefrontPort,
+            superadminIdentifier: SUPER_ADMIN_USER_IDENTIFIER,
+            superadminPassword: SUPER_ADMIN_USER_PASSWORD,
+        });
+        fs.writeFileSync(path.join(root, 'README.md'), rootReadmeContent);
 
-                    const bootstrapFn = async () => {
-                        await checkDbConnection(config.dbConnectionOptions, root);
-                        const _app = await bootstrap({
-                            ...config,
-                            apiOptions: {
-                                ...(config.apiOptions ?? {}),
-                                port,
-                            },
-                            silent: logLevel === 'silent',
-                            dbConnectionOptions: {
-                                ...config.dbConnectionOptions,
-                                synchronize: true,
-                            },
-                            logger: new DefaultLogger({ level: vendureLogLevel }),
-                            importExportOptions: {
-                                importAssetsDir: path.join(assetsDir, 'images'),
-                            },
-                        });
-                        await _app.get(JobQueueService).start();
-                        return _app;
-                    };
+        // Copy root .gitignore
+        await fs.copyFile(templatePath('root-gitignore.template'), path.join(root, '.gitignore'));
 
-                    const app = await populate(
-                        bootstrapFn,
-                        initialDataPath,
-                        populateProducts ? path.join(assetsDir, 'products.csv') : undefined,
-                    );
+        // Create server package.json
+        const serverPackageJsonContents = {
+            name: 'server',
+            version: DEFAULT_PROJECT_VERSION,
+            private: true,
+            scripts: getServerPackageScripts(),
+        };
+        fs.writeFileSync(
+            path.join(serverRoot, 'package.json'),
+            JSON.stringify(serverPackageJsonContents, null, 2) + os.EOL,
+        );
+    } else {
+        // Single project structure (original behavior)
+        fs.writeFileSync(
+            path.join(root, 'package.json'),
+            JSON.stringify(getSingleProjectPackageJson(appName, pmInfo, dbType), null, 2) + os.EOL,
+        );
+        // Since pnpm v11, all pnpm settings (including the build-script allowlist for
+        // native dependencies) live in pnpm-workspace.yaml, even for single projects.
+        if (pmInfo.name === 'pnpm') {
+            fs.writeFileSync(path.join(root, 'pnpm-workspace.yaml'), getPnpmWorkspaceYaml(dbType));
+        }
+        if (pmInfo.name === 'yarn') {
+            fs.writeFileSync(path.join(root, '.yarnrc.yml'), getYarnRcYml());
+        }
+        fs.ensureDirSync(path.join(root, 'src'));
+    }
 
-                    // Pause to ensure the worker jobs have time to complete.
-                    if (isCi) {
-                        console.log('[CI] Pausing before close...');
-                    }
-                    await new Promise(resolve => setTimeout(resolve, isCi ? 30000 : 2000));
-                    await app.close();
-                    if (isCi) {
-                        console.log('[CI] Pausing after close...');
-                        await new Promise(resolve => setTimeout(resolve, 10000));
-                    }
-                } catch (e) {
-                    console.log(e);
-                    throw e;
-                }
-            },
-        },
-    ]);
+    setupSpinner.stop(`Created ${pc.green('package.json')}`);
+
+    // Download storefront if needed
+    if (includeStorefront) {
+        const storefrontSpinner = spinner();
+        storefrontSpinner.start(`Downloading ${storefront.name} storefront...`);
+        try {
+            await downloadAndExtractStorefront(storefrontRoot, storefront);
+
+            const storefrontSetupContext = {
+                projectName: appName,
+                serverPort: port,
+                storefrontPort,
+                revalidationSecret: randomBytes(32).toString('base64'),
+            };
+            const storefrontPackageJsonPath = path.join(storefrontRoot, 'package.json');
+            const storefrontPackageJson = await fs.readJson(storefrontPackageJsonPath);
+            await fs.writeJson(
+                storefrontPackageJsonPath,
+                configureStorefrontPackageJson(storefrontPackageJson, storefront, storefrontSetupContext),
+                { spaces: 2 },
+            );
+            fs.writeFileSync(
+                path.join(storefrontRoot, storefront.envFile),
+                renderStorefrontEnvironment(storefront, storefrontSetupContext),
+            );
+
+            storefrontSpinner.stop(`Downloaded ${storefront.name} storefront`);
+        } catch (e: any) {
+            storefrontSpinner.stop(pc.red(`Failed to download storefront`));
+            log(e.message, { level: 'verbose' });
+            outro(pc.red(`Failed to download storefront: ${e.message as string}`));
+            process.exit(1);
+        }
+    }
+
+    // Install dependencies
+    const { dependencies, devDependencies } = getDependencies(
+        dbType,
+        `@${packageJson.version as string}`,
+        packageManager,
+    );
+
+    // Install server dependencies
+    await installDependenciesWithSpinner({
+        dependencies,
+        packageManager,
+        logLevel,
+        cwd: serverRoot,
+        spinnerMessage: `Installing ${dependencies[0]} + ${dependencies.length - 1} more dependencies`,
+        successMessage: `Successfully installed ${dependencies.length} dependencies`,
+        failureMessage: 'Failed to install dependencies. Please try again.',
+    });
+
+    if (devDependencies.length) {
+        await installDependenciesWithSpinner({
+            dependencies: devDependencies,
+            isDevDependencies: true,
+            packageManager,
+            logLevel,
+            cwd: serverRoot,
+            spinnerMessage: `Installing ${devDependencies[0]} + ${devDependencies.length - 1} more dev dependencies`,
+            successMessage: `Successfully installed ${devDependencies.length} dev dependencies`,
+            failureMessage: 'Failed to install dev dependencies. Please try again.',
+        });
+    }
+
+    if (includeStorefront) {
+        // Install the whole workspace from the root so that root-level devDependencies
+        // (concurrently, used by the `dev`/`start` scripts) are reified alongside each
+        // app's deps. A child-scoped install only reifies that app's subtree and leaves
+        // the root's own deps out.
+        const workspaceInstalled = await installDependenciesWithSpinner({
+            dependencies: [],
+            packageManager,
+            logLevel,
+            cwd: root,
+            spinnerMessage: 'Installing workspace dependencies...',
+            successMessage: 'Installed workspace dependencies',
+            failureMessage: 'Failed to install workspace dependencies',
+            warnOnFailure: true,
+        });
+        if (!workspaceInstalled) {
+            log(`You may need to run ${pmInfo.install} in the project root manually.`, {
+                level: 'info',
+            });
+        }
+    }
+
+    const scaffoldSpinner = spinner();
+    scaffoldSpinner.start(`Generating app scaffold`);
+    // We add this pause so that the above output is displayed before the
+    // potentially lengthy file operations begin, which can prevent that
+    // from displaying and thus make the user think that the process has hung.
+    await sleep(SCAFFOLD_DELAY_MS);
+
+    const srcPathScript = (fileName: string): string => path.join(serverRoot, 'src', `${fileName}.ts`);
+
+    if (!includeStorefront) {
+        fs.ensureDirSync(path.join(serverRoot, 'src'));
+    }
+
+    const configFile = srcPathScript('vendure-config');
 
     try {
-        await tasks.run();
-    } catch (e) {
-        console.error(chalk.red(JSON.stringify(e)));
+        await fs
+            .writeFile(configFile, configSource)
+            .then(() => fs.writeFile(path.join(serverRoot, '.env'), envSource))
+            .then(() => fs.writeFile(srcPathScript('environment.d'), envDtsSource))
+            .then(() => fs.writeFile(srcPathScript('index'), indexSource))
+            .then(() => fs.writeFile(srcPathScript('index-worker'), indexWorkerSource))
+            .then(() => fs.writeFile(path.join(serverRoot, 'README.md'), readmeSource))
+            .then(() => fs.writeFile(path.join(serverRoot, 'Dockerfile'), dockerfileSource))
+            .then(() => fs.writeFile(path.join(serverRoot, 'docker-compose.yml'), dockerComposeSource))
+            .then(() => fs.ensureDir(path.join(serverRoot, 'src/plugins')))
+            .then(() => fs.copyFile(assetPath('gitignore.template'), path.join(serverRoot, '.gitignore')))
+            .then(() =>
+                fs.copyFile(assetPath('dockerignore.template'), path.join(serverRoot, '.dockerignore')),
+            )
+            .then(() =>
+                fs.copyFile(assetPath('tsconfig.template.json'), path.join(serverRoot, 'tsconfig.json')),
+            )
+            .then(() =>
+                fs.writeFile(path.join(serverRoot, 'tsconfig.dashboard.json'), tsconfigDashboardSource),
+            )
+            .then(() => fs.writeFile(path.join(serverRoot, 'vite.config.mts'), viteConfigSource))
+            .then(() => writeFileIfMissing(path.join(root, 'AGENTS.md'), agentsSource))
+            .then(() => createDirectoryStructure(serverRoot))
+            .then(() => copyEmailTemplates(serverRoot));
+    } catch (e: any) {
+        outro(pc.red(`Failed to create app scaffold: ${e.message as string}`));
         process.exit(1);
     }
-    const startCommand = useYarn ? 'yarn start' : 'npm run start';
-    console.log();
-    console.log(chalk.green(`Success! Created a new Vendure server at ${root}`));
-    console.log();
-    console.log(`We suggest that you start by typing:`);
-    console.log();
-    console.log(chalk.green(`    cd ${name}`));
-    console.log(chalk.green(`    ${startCommand}`));
-    console.log();
-    console.log('Happy hacking!');
-    process.exit(0);
+    scaffoldSpinner.stop(`Generated app scaffold`);
+
+    // Manual mode is excluded: there the user supplies their own database connection,
+    // so no Docker container is started on their behalf.
+    if ((mode === 'quick' || mode === 'ci') && dbType === 'postgres') {
+        // --ci skips the Docker check in the prompts, and in quick start the daemon can
+        // stop answering while the scaffold is written. Every later step calls `docker`.
+        if ((await probeDockerDaemon()) !== 'running') {
+            outro(pc.red(DOCKER_NOT_RESPONDING_MESSAGE));
+            process.exit(1);
+        }
+        // appName (the resolved directory basename) is what the docker-compose labels are
+        // keyed off — the raw CLI argument may be a nested path like `apps/my-shop`.
+        cleanUpDockerResources(appName);
+        const dbStarted = await startPostgresDatabase(serverRoot, appName);
+        if (!dbStarted) {
+            outro(
+                pc.red(
+                    'The PostgreSQL database could not be started. Check the Docker logs, ' +
+                        'then run the create command again.',
+                ),
+            );
+            process.exit(1);
+        }
+    }
+
+    const populateSpinner = spinner();
+    populateSpinner.start(`Initializing your new Vendure server`);
+
+    // We want to display a set of tips and instructions to the user
+    // as the initialization process is running because it can take
+    // a few minutes to complete.
+    const tips = [
+        populateProducts
+            ? 'We are populating sample data so that you can start testing right away'
+            : 'We are setting up your Vendure server',
+        ...TIPS_WHILE_WAITING,
+    ];
+
+    let tipIndex = 0;
+    let timer: any;
+
+    function displayTip() {
+        populateSpinner.message(tips[tipIndex]);
+        tipIndex++;
+        if (tipIndex >= tips.length) {
+            // skip the intro tips if looping
+            tipIndex = 3;
+        }
+        timer = setTimeout(displayTip, TIP_INTERVAL_MS);
+    }
+
+    timer = setTimeout(displayTip, TIP_INTERVAL_MS);
+
+    // Change to serverRoot so that ts-node can correctly resolve modules.
+    // In monorepo mode, dependencies are hoisted to the root node_modules,
+    // but ts-node needs to be anchored in the server directory for proper
+    // module resolution and to find the tsconfig.json.
+    process.chdir(serverRoot);
+
+    // register ts-node so that the config file can be loaded
+    // We use transpileOnly to skip type checking during bootstrap, as the
+    // complex module resolution with npm workspaces and ESM packages can
+    // cause false TypeScript errors. Type checking happens when users run
+    // their own build/dev commands.
+    // ts-node resolves its `typescript` peer from whichever package required it, so the
+    // generated project has to be the one that requires it.
+    createProjectRequire(serverRoot)('ts-node').register({
+        project: path.join(serverRoot, 'tsconfig.json'),
+        transpileOnly: true,
+    });
+
+    let superAdminCredentials: { identifier: string; password: string } | undefined;
+    try {
+        // Required rather than imported, to keep this CommonJS graph off the ESM loader.
+        // See createProjectRequire.
+        const projectRequire = createProjectRequire(serverRoot);
+        const { populate } = projectRequire(
+            path.join(resolvePackageRootDir('@vendure/core', serverRoot), 'cli', 'populate'),
+        );
+        const { bootstrap, generateMigration, runMigrations, DefaultLogger, LogLevel, JobQueueService } =
+            projectRequire(path.join(resolvePackageRootDir('@vendure/core', serverRoot), 'dist', 'index'));
+        const { config } = projectRequire(configFile);
+        const assetsDir = path.join(__dirname, '../assets');
+        superAdminCredentials = config.authOptions.superadminCredentials;
+        const initialDataPath = path.join(assetsDir, 'initial-data.json');
+        const vendureLogLevel =
+            logLevel === 'info' || logLevel === 'silent'
+                ? LogLevel.Error
+                : logLevel === 'verbose'
+                  ? LogLevel.Verbose
+                  : LogLevel.Info;
+
+        // Generate an initial "baseline" migration and run it, so that a fresh project ships with a
+        // schema-creating migration from day one. This lets the very first remote deploy build its
+        // schema via migrations instead of relying on `synchronize`, which is unsafe in production.
+        //
+        // `fromEmpty` diffs against a temporary empty database, so a complete baseline is produced
+        // even if the configured database is not pristine (e.g. a re-run pointing at a database left
+        // populated by an earlier attempt) - avoiding a silently-empty migrations directory.
+        // VENDURE_RUNNING_IN_CLI makes generateMigration/runMigrations throw on failure rather than
+        // logging and continuing, so any error surfaces to the catch below instead of letting the
+        // scaffold proceed against a broken schema.
+        await checkDbConnection(config.dbConnectionOptions, serverRoot);
+        const migrationsGlob = Array.isArray(config.dbConnectionOptions.migrations)
+            ? config.dbConnectionOptions.migrations[0]
+            : undefined;
+        const migrationsDir =
+            typeof migrationsGlob === 'string'
+                ? path.dirname(migrationsGlob)
+                : path.join(serverRoot, 'src', 'migrations');
+        process.env.VENDURE_RUNNING_IN_CLI = 'true';
+        try {
+            const migrationFile = await generateMigration(config, {
+                name: 'init',
+                outputDir: migrationsDir,
+                fromEmpty: true,
+            });
+            if (!migrationFile) {
+                throw new Error('Failed to generate the initial database migration.');
+            }
+            await runMigrations(config);
+        } finally {
+            delete process.env.VENDURE_RUNNING_IN_CLI;
+        }
+
+        const bootstrapFn = async () => {
+            const _app = await bootstrap({
+                ...config,
+                apiOptions: {
+                    ...(config.apiOptions ?? {}),
+                    port,
+                },
+                dbConnectionOptions: {
+                    ...config.dbConnectionOptions,
+                    synchronize: false,
+                },
+                logger: new DefaultLogger({ level: vendureLogLevel }),
+                importExportOptions: {
+                    importAssetsDir: path.join(assetsDir, 'images'),
+                },
+            });
+            await _app.get(JobQueueService).start();
+            return _app;
+        };
+
+        const app = await populate(
+            bootstrapFn,
+            initialDataPath,
+            populateProducts ? path.join(assetsDir, 'products.csv') : undefined,
+        );
+
+        // Pause to ensure the worker jobs have time to complete.
+        if (isCi) {
+            log('[CI] Pausing before close...');
+        }
+        await sleep(isCi ? CI_PAUSE_BEFORE_CLOSE_MS : NORMAL_PAUSE_BEFORE_CLOSE_MS);
+        await app.close();
+        if (isCi) {
+            log('[CI] Pausing after close...');
+            await sleep(CI_PAUSE_AFTER_CLOSE_MS);
+        }
+        populateSpinner.stop(`Server successfully initialized${populateProducts ? ' and populated' : ''}`);
+        clearTimeout(timer);
+        /**
+         * This is currently disabled because I am running into issues actually getting the server
+         * to quite properly in response to a SIGINT.
+         * This means that the server runs, but cannot be ended, without forcefully
+         * killing the process.
+         *
+         * Once this has been resolved, the following code can be re-enabled by
+         * setting `autoRunServer` to `true`.
+         */
+        const autoRunServer = false;
+        if (mode === 'quick' && autoRunServer) {
+            // In quick-start mode, we want to now run the server and open up
+            // a browser window to the Dashboard.
+            try {
+                const dashboardUrl = `http://localhost:${port}/dashboard`;
+                const quickStartInstructions = [
+                    'Use the following credentials to log in to the Dashboard:',
+                    `Username: ${pc.green(config.authOptions.superadminCredentials?.identifier)}`,
+                    `Password: ${pc.green(config.authOptions.superadminCredentials?.password)}`,
+                    `Open your browser and navigate to: ${pc.green(dashboardUrl)}`,
+                    '',
+                ];
+                note(quickStartInstructions.join('\n'));
+
+                // Run `dev` via the detected package manager. On Windows the npm/yarn/pnpm
+                // binaries are `.cmd` shims (bun ships a real `bun.exe`).
+                const pmCommand =
+                    os.platform() === 'win32' && pmInfo.name !== 'bun' ? `${pmInfo.name}.cmd` : pmInfo.name;
+                let quickStartProcess: ChildProcess | undefined;
+                try {
+                    quickStartProcess = spawn(pmCommand, ['run', 'dev'], {
+                        cwd: root,
+                        stdio: 'inherit',
+                    });
+                } catch (e: any) {
+                    /* empty */
+                }
+
+                // process.stdin.resume();
+                process.on('SIGINT', function () {
+                    displayOutro({
+                        root,
+                        name,
+                        packageManager,
+                        superAdminCredentials,
+                        storefront,
+                        serverPort: port,
+                        storefrontPort,
+                    });
+                    quickStartProcess?.kill('SIGINT');
+                    process.exit(0);
+                });
+
+                // Give enough time for the server to get up and running
+                // before opening the window.
+                await sleep(AUTO_RUN_DELAY_MS);
+                try {
+                    // `open` is ESM-only. Requiring an ESM package at module scope throws
+                    // ERR_VM_MODULE_LINK_FAILURE under Plug'n'Play on Node 22 and kills the
+                    // CLI before it prints anything, so it is imported at the point of use.
+                    const { default: open } = await import('open');
+                    await open(dashboardUrl, {
+                        newInstance: true,
+                    });
+                } catch (e: any) {
+                    /* empty */
+                }
+            } catch (e: any) {
+                log(pc.red(`Failed to start the server: ${e.message as string}`), {
+                    newline: 'after',
+                    level: 'verbose',
+                });
+            }
+        } else {
+            clearTimeout(timer);
+            await offerPlatformTrial(serverRoot, isCi);
+            displayOutro({
+                root,
+                name,
+                packageManager,
+                superAdminCredentials,
+                storefront,
+                serverPort: port,
+                storefrontPort,
+            });
+            process.exit(0);
+        }
+    } catch (e: any) {
+        log(e.toString());
+        outro(pc.red(`Failed to initialize server. Please try again.`));
+        process.exit(1);
+    }
+}
+
+interface InstallDependenciesOptions {
+    dependencies: string[];
+    isDevDependencies?: boolean;
+    packageManager: PackageManager;
+    logLevel: CliLogLevel;
+    cwd: string;
+    spinnerMessage: string;
+    successMessage: string;
+    failureMessage: string;
+    warnOnFailure?: boolean;
+}
+
+/**
+ * Installs dependencies with a spinner, handling success/failure messaging.
+ * Returns true if installation succeeded, false otherwise.
+ */
+async function installDependenciesWithSpinner(installOptions: InstallDependenciesOptions): Promise<boolean> {
+    const {
+        dependencies,
+        isDevDependencies = false,
+        packageManager,
+        logLevel,
+        cwd,
+        spinnerMessage,
+        successMessage,
+        failureMessage,
+        warnOnFailure = false,
+    } = installOptions;
+
+    const installSpinner = spinner();
+    installSpinner.start(spinnerMessage);
+
+    try {
+        await installPackages({ dependencies, isDevDependencies, packageManager, logLevel, cwd });
+        installSpinner.stop(successMessage);
+        return true;
+    } catch (e) {
+        const detail = e instanceof Error ? e.message : String(e);
+        if (warnOnFailure) {
+            installSpinner.stop(pc.yellow(`Warning: ${failureMessage}`));
+            log(detail);
+            return false;
+        } else {
+            installSpinner.stop(pc.red(failureMessage));
+            log(detail);
+            outro(pc.red(failureMessage));
+            process.exit(1);
+        }
+    }
+}
+
+interface OutroOptions {
+    root: string;
+    name: string;
+    packageManager: PackageManager;
+    superAdminCredentials?: { identifier: string; password: string };
+    storefront?: StorefrontStarter;
+    serverPort?: number;
+    storefrontPort?: number;
+}
+
+// eslint-disable-next-line @typescript-eslint/no-shadow
+function displayOutro(outroOptions: OutroOptions) {
+    const {
+        root,
+        name,
+        packageManager,
+        superAdminCredentials,
+        storefront,
+        serverPort = SERVER_PORT,
+        storefrontPort = STOREFRONT_PORT,
+    } = outroOptions;
+    const startCommand = `${getPackageManagerInfo(packageManager).runScript} dev`;
+    const identifier = superAdminCredentials?.identifier ?? SUPER_ADMIN_USER_IDENTIFIER;
+    const password = superAdminCredentials?.password ?? SUPER_ADMIN_USER_PASSWORD;
+
+    // Common footer for both modes
+    const commonFooter = [
+        `\n`,
+        `Use the following credentials to log in:`,
+        `Username: ${pc.green(identifier)}`,
+        `Password: ${pc.green(password)}`,
+        '\n',
+        '➡️ Docs: https://docs.vendure.io',
+        '➡️ Discord community: https://vendure.io/community',
+        '➡️ Star us on GitHub:',
+        '   https://github.com/vendurehq/vendure',
+    ];
+
+    let nextSteps: string[];
+
+    if (storefront) {
+        nextSteps = [
+            `Your new Vendure project was created!`,
+            pc.gray(root),
+            `\n`,
+            `This is a monorepo with the following apps:`,
+            `  ${pc.cyan('apps/server')}     - Vendure backend`,
+            `  ${pc.cyan('apps/storefront')} - ${storefront.frameworkName} frontend`,
+            `\n`,
+            `Next, run:`,
+            pc.gray('$ ') + pc.blue(pc.bold(`cd ${name}`)),
+            pc.gray('$ ') + pc.blue(pc.bold(`${startCommand}`)),
+            `\n`,
+            `This will start the server, dashboard & storefront.`,
+            `\n`,
+            `Access points:`,
+            `  Dashboard:  ${pc.green(`http://localhost:${serverPort}/dashboard`)}`,
+            `  Storefront: ${pc.green(`http://localhost:${storefrontPort}`)}`,
+            ...commonFooter,
+        ];
+    } else {
+        nextSteps = [
+            `Your new Vendure server was created!`,
+            pc.gray(root),
+            `\n`,
+            `Next, run:`,
+            pc.gray('$ ') + pc.blue(pc.bold(`cd ${name}`)),
+            pc.gray('$ ') + pc.blue(pc.bold(`${startCommand}`)),
+            `\n`,
+            `This will start the server & dashboard in development mode.`,
+            `\n`,
+            `To access the Dashboard, open your browser and navigate to:`,
+            pc.green(`http://localhost:${serverPort}/dashboard`),
+            ...commonFooter,
+        ];
+    }
+
+    note(nextSteps.join('\n'), pc.green('Setup complete!'));
+    showConsoleHint();
+    outro(`Happy hacking!`);
 }
 
 /**
  * Run some initial checks to ensure that it is okay to proceed with creating
  * a new Vendure project in the given location.
  */
-function runPreChecks(name: string | undefined, useNpm: boolean): name is string {
+function runPreChecks(name: string | undefined): name is string {
     if (typeof name === 'undefined') {
-        console.error('Please specify the project directory:');
-        console.log(`  ${chalk.cyan(program.name())} ${chalk.green('<project-directory>')}`);
-        console.log();
-        console.log('For example:');
-        console.log(`  ${chalk.cyan(program.name())} ${chalk.green('my-vendure-app')}`);
+        log(pc.red(`Please specify the project directory:`));
+        log(`  ${pc.cyan(program.name())} ${pc.green('<project-directory>')}`, { newline: 'after' });
+        log('For example:');
+        log(`  ${pc.cyan(program.name())} ${pc.green('my-vendure-app')}`);
         process.exit(1);
         return false;
     }
 
     const root = path.resolve(name);
-    fs.ensureDirSync(name);
+    try {
+        fs.ensureDirSync(name);
+    } catch (e: any) {
+        log(pc.red(`Could not create project directory ${name}: ${e.message as string}`));
+        return false;
+    }
     if (!isSafeToCreateProjectIn(root, name)) {
         process.exit(1);
     }
@@ -318,10 +888,20 @@ async function createDirectoryStructure(root: string) {
  * Copy the email templates into the app
  */
 async function copyEmailTemplates(root: string) {
-    const templateDir = path.join(root, 'node_modules/@vendure/email-plugin/templates');
+    const emailPackageDirname = resolvePackageRootDir('@vendure/email-plugin', root);
+    const templateDir = path.join(emailPackageDirname, 'templates');
     try {
         await fs.copy(templateDir, path.join(root, 'static', 'email', 'templates'));
-    } catch (err) {
-        console.error(chalk.red(`Failed to copy email templates.`));
+    } catch (err: any) {
+        log(pc.red('Failed to copy email templates.'));
+        log(err);
+        process.exit(1);
     }
+}
+
+async function writeFileIfMissing(filePath: string, contents: string) {
+    if (await fs.pathExists(filePath)) {
+        return;
+    }
+    await fs.outputFile(filePath, contents);
 }

@@ -1,13 +1,10 @@
-import { JobState } from '@vendure/common/lib/generated-types';
-import { Subject, Subscription } from 'rxjs';
-import { throttleTime } from 'rxjs/operators';
-
+import { Instrument } from '../common';
 import { JobQueueStrategy } from '../config';
-import { Logger } from '../config/logger/vendure-logger';
 
 import { Job } from './job';
+import { JobBufferService } from './job-buffer/job-buffer.service';
 import { SubscribableJob } from './subscribable-job';
-import { CreateQueueOptions, JobConfig, JobData } from './types';
+import { CreateQueueOptions, JobData, JobOptions } from './types';
 
 /**
  * @description
@@ -21,7 +18,8 @@ import { CreateQueueOptions, JobConfig, JobData } from './types';
  *
  * @docsCategory JobQueue
  */
-export class JobQueue<Data extends JobData<Data> = {}> {
+@Instrument()
+export class JobQueue<Data extends JobData<Data> = object> {
     private running = false;
 
     get name(): string {
@@ -32,7 +30,11 @@ export class JobQueue<Data extends JobData<Data> = {}> {
         return this.running;
     }
 
-    constructor(private options: CreateQueueOptions<Data>, private jobQueueStrategy: JobQueueStrategy) {}
+    constructor(
+        private options: CreateQueueOptions<Data>,
+        private jobQueueStrategy: JobQueueStrategy,
+        private jobBufferService: JobBufferService,
+    ) {}
 
     /** @internal */
     async start() {
@@ -58,7 +60,7 @@ export class JobQueue<Data extends JobData<Data> = {}> {
      * calling code to subscribe to updates to the Job:
      *
      * @example
-     * ```TypeScript
+     * ```ts
      * const job = await this.myQueue.add({ intervalMs, shouldFail }, { retries: 2 });
      * return job.updates().pipe(
      *   map(update => {
@@ -78,20 +80,31 @@ export class JobQueue<Data extends JobData<Data> = {}> {
      * `progress` changes, you can convert to a Promise like this:
      *
      * @example
-     * ```TypeScript
+     * ```ts
      * const job = await this.myQueue.add({ intervalMs, shouldFail }, { retries: 2 });
      * return job.updates().toPromise()
      *   .then(update => update.result),
      *   .catch(err => err.message);
      * ```
      */
-    async add(data: Data, options?: Pick<JobConfig<Data>, 'retries'>): Promise<SubscribableJob<Data>> {
+    async add(data: Data, options?: JobOptions<Data>): Promise<SubscribableJob<Data>> {
         const job = new Job<any>({
             data,
             queueName: this.options.name,
             retries: options?.retries ?? 0,
         });
-        const addedJob = await this.jobQueueStrategy.add(job);
-        return new SubscribableJob(addedJob, this.jobQueueStrategy);
+
+        const isBuffered = await this.jobBufferService.add(job);
+        if (!isBuffered) {
+            const addedJob = await this.jobQueueStrategy.add(job, options);
+            return new SubscribableJob(addedJob, this.jobQueueStrategy);
+        } else {
+            const bufferedJob = new Job({
+                ...job,
+                data: job.data,
+                id: 'buffered',
+            });
+            return new SubscribableJob(bufferedJob, this.jobQueueStrategy);
+        }
     }
 }

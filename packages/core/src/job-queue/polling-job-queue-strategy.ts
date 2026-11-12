@@ -1,8 +1,7 @@
 import { JobState } from '@vendure/common/lib/generated-types';
 import { ID } from '@vendure/common/lib/shared-types';
 import { isObject } from '@vendure/common/lib/shared-utils';
-import { interval, race, Subject, Subscription } from 'rxjs';
-import { fromPromise } from 'rxjs/internal-compatibility';
+import { from, interval, race, Subject, Subscription } from 'rxjs';
 import { filter, switchMap, take, throttleTime } from 'rxjs/operators';
 
 import { Logger } from '../config/logger/vendure-logger';
@@ -23,66 +22,166 @@ import { JobData } from './types';
 export type BackoffStrategy = (queueName: string, attemptsMade: number, job: Job) => number;
 
 export interface PollingJobQueueStrategyConfig {
-    concurrency?: number;
+    /**
+     * @description
+     * How many jobs from a given queue to process concurrently.
+     *
+     * Can be set to a function which receives the queue name and returns
+     * the concurrency limit. This is useful for limiting concurrency on
+     * queues which have resource-intensive jobs.
+     *
+     * @example
+     * ```ts
+     * concurrency: (queueName) => {
+     *   if (queueName === 'apply-collection-filters') {
+     *     return 1;
+     *   }
+     *   return 3;
+     * }
+     * ```
+     *
+     * @default 1
+     */
+    concurrency?: number | ((queueName: string) => number);
+    /**
+     * @description
+     * The interval in ms between polling the database for new jobs.
+     *
+     * @description 200
+     */
     pollInterval?: number | ((queueName: string) => number);
+    /**
+     * @description
+     * When a job is added to the JobQueue using `JobQueue.add()`, the calling
+     * code may specify the number of retries in case of failure. This option allows
+     * you to override that number and specify your own number of retries based on
+     * the job being added.
+     */
+    setRetries?: (queueName: string, job: Job) => number;
+    /**
+     * @description
+     * The strategy used to decide how long to wait before retrying a failed job.
+     *
+     * @default () => 1000
+     */
     backoffStrategy?: BackoffStrategy;
+    /**
+     * @description
+     * The timeout in ms which the queue will use when attempting a graceful shutdown.
+     * That means, when the server is shut down but a job is running, the job queue will
+     * wait for the job to complete before allowing the server to shut down. If the job
+     * does not complete within this timeout window, the job will be forced to stop
+     * and the server will shut down anyway.
+     *
+     * @since 2.2.0
+     * @default 20_000
+     */
+    gracefulShutdownTimeout?: number;
 }
 
 const STOP_SIGNAL = Symbol('STOP_SIGNAL');
 
-class ActiveQueue<Data extends JobData<Data> = {}> {
+class ActiveQueue<Data extends JobData<Data> = object> {
     private timer: any;
     private running = false;
     private activeJobs: Array<Job<Data>> = [];
+    private claimingNext = false;
+    private forceStopped = false;
 
     private errorNotifier$ = new Subject<[string, string]>();
     private queueStopped$ = new Subject<typeof STOP_SIGNAL>();
     private subscription: Subscription;
     private readonly pollInterval: number;
+    private readonly concurrency: number;
 
     constructor(
         private readonly queueName: string,
         private readonly process: (job: Job<Data>) => Promise<any>,
         private readonly jobQueueStrategy: PollingJobQueueStrategy,
     ) {
-        this.subscription = this.errorNotifier$.pipe(throttleTime(3000)).subscribe(([message, stack]) => {
-            Logger.error(message);
-            Logger.debug(stack);
-        });
         this.pollInterval =
             typeof this.jobQueueStrategy.pollInterval === 'function'
                 ? this.jobQueueStrategy.pollInterval(queueName)
                 : this.jobQueueStrategy.pollInterval;
+        this.concurrency =
+            typeof this.jobQueueStrategy.concurrency === 'function'
+                ? this.jobQueueStrategy.concurrency(queueName)
+                : this.jobQueueStrategy.concurrency;
     }
 
     start() {
         Logger.debug(`Starting JobQueue "${this.queueName}"`);
+        this.subscription = this.errorNotifier$.pipe(throttleTime(3000)).subscribe(([message, stack]) => {
+            Logger.error(message);
+            Logger.debug(stack);
+        });
         this.running = true;
+        this.forceStopped = false;
         const runNextJobs = async () => {
             try {
                 const runningJobsCount = this.activeJobs.length;
-                for (let i = runningJobsCount; i < this.jobQueueStrategy.concurrency; i++) {
-                    const nextJob = await this.jobQueueStrategy.next(this.queueName);
+                for (let i = runningJobsCount; i < this.concurrency; i++) {
+                    // Don't claim further jobs once stop() has been called, otherwise
+                    // shutdown would have to wait for each of them as well.
+                    if (!this.running) {
+                        break;
+                    }
+                    // next() may already mark the job as RUNNING in the store (the SQL strategy
+                    // does), so shutdown must also wait for an in-flight claim. Otherwise it can
+                    // close the connection and leave the job RUNNING with no worker.
+                    this.claimingNext = true;
+                    let nextJob: Job<Data> | undefined;
+                    try {
+                        nextJob = await this.jobQueueStrategy.next(this.queueName);
+                    } finally {
+                        this.claimingNext = false;
+                    }
                     if (nextJob) {
+                        // Track the job as active before awaiting the initial status update,
+                        // so it stays visible to awaitRunningJobsOrTimeout() during a shutdown
+                        // that races this update. If the update throws, remove it again so the
+                        // concurrency slot isn't wedged.
                         this.activeJobs.push(nextJob);
-                        await this.jobQueueStrategy.update(nextJob);
+                        if (this.forceStopped) {
+                            await this.deferForceStoppedJob(nextJob);
+                            break;
+                        }
+                        try {
+                            await this.jobQueueStrategy.update(nextJob);
+                        } catch (err) {
+                            this.removeJobFromActive(nextJob);
+                            throw err;
+                        }
+                        // Check synchronously, with no await between here and subscribing to
+                        // queueStopped$ below, so a forced stop cannot slip in between the two.
+                        if (this.forceStopped) {
+                            await this.deferForceStoppedJob(nextJob);
+                            break;
+                        }
                         const onProgress = (job: Job) => this.jobQueueStrategy.update(job);
                         nextJob.on('progress', onProgress);
-                        const cancellationSignal$ = interval(this.pollInterval * 5).pipe(
-                            // tslint:disable-next-line:no-non-null-assertion
-                            switchMap(() => this.jobQueueStrategy.findOne(nextJob.id!)),
-                            filter(job => job?.state === JobState.CANCELLED),
-                            take(1),
-                        );
+                        const cancellationSub = interval(this.pollInterval * 5)
+                            .pipe(
+                                // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
+                                switchMap(() => this.jobQueueStrategy.findOne(nextJob.id!)),
+                                filter(job => job?.state === JobState.CANCELLED),
+                                take(1),
+                            )
+                            .subscribe(() => {
+                                nextJob.cancel();
+                            });
                         const stopSignal$ = this.queueStopped$.pipe(take(1));
 
-                        race(fromPromise(this.process(nextJob)), cancellationSignal$, stopSignal$)
+                        race(from(this.process(nextJob)), stopSignal$)
                             .toPromise()
                             .then(
                                 result => {
                                     if (result === STOP_SIGNAL) {
                                         nextJob.defer();
-                                    } else if (result instanceof Job && result.state === JobState.CANCELLED) {
+                                    } else if (
+                                        nextJob.state === JobState.CANCELLED ||
+                                        (result instanceof Job && result.state === JobState.CANCELLED)
+                                    ) {
                                         nextJob.cancel();
                                     } else {
                                         nextJob.complete(result);
@@ -93,20 +192,24 @@ class ActiveQueue<Data extends JobData<Data> = {}> {
                                 },
                             )
                             .finally(() => {
-                                if (!this.running && nextJob.state !== JobState.PENDING) {
-                                    return;
-                                }
+                                // if (!this.running && nextJob.state !== JobState.PENDING) {
+                                //     return;
+                                // }
                                 nextJob.off('progress', onProgress);
+                                cancellationSub.unsubscribe();
                                 return this.onFailOrComplete(nextJob);
                             })
-                            .catch(err => {
-                                Logger.warn(`Error updating job info: ${err}`);
+                            .catch((err: any) => {
+                                Logger.warn(`Error updating job info: ${err?.message}`);
+                                Logger.debug(err?.stack);
                             });
                     }
                 }
-            } catch (e) {
+            } catch (e: any) {
                 this.errorNotifier$.next([
-                    `Job queue "${this.queueName}" encountered an error (set log level to Debug for trace): ${e.message}`,
+                    `Job queue "${
+                        this.queueName
+                    }" encountered an error (set log level to Debug for trace): ${JSON.stringify(e.message)}`,
                     e.stack,
                 ]);
             }
@@ -115,40 +218,89 @@ class ActiveQueue<Data extends JobData<Data> = {}> {
             }
         };
 
-        runNextJobs();
+        void runNextJobs();
     }
 
-    stop(): Promise<void> {
+    async stop(stopActiveQueueTimeout = 20_000): Promise<void> {
         this.running = false;
-        this.queueStopped$.next(STOP_SIGNAL);
         clearTimeout(this.timer);
+        await this.awaitRunningJobsOrTimeout(stopActiveQueueTimeout);
+        Logger.info(`Stopped queue: ${this.queueName}`);
+        this.subscription.unsubscribe();
+        // Allow any job status changes to be persisted
+        // before we permit the application shutdown to continue.
+        // Otherwise, the DB connection will close before our
+        // changes are persisted.
+        await new Promise(resolve => setTimeout(resolve, 1000));
+    }
 
+    private awaitRunningJobsOrTimeout(stopActiveQueueTimeout = 20_000): Promise<void> {
         const start = +new Date();
-        // Wait for 2 seconds to allow running jobs to complete
-        const maxTimeout = 2000;
-        let pollTimer: any;
+        let timeout: ReturnType<typeof setTimeout>;
         return new Promise(resolve => {
-            const pollActiveJobs = async () => {
-                const timedOut = +new Date() - start > maxTimeout;
-                if (this.activeJobs.length === 0 || timedOut) {
-                    clearTimeout(pollTimer);
+            let lastStatusUpdate = +new Date();
+            const pollActiveJobs = () => {
+                const now = +new Date();
+                const timedOut =
+                    stopActiveQueueTimeout === undefined ? false : now - start > stopActiveQueueTimeout;
+
+                if (this.activeJobs.length === 0 && !this.claimingNext) {
+                    clearTimeout(timeout);
                     resolve();
-                } else {
-                    pollTimer = setTimeout(pollActiveJobs, 50);
+                    return;
                 }
+
+                if (timedOut) {
+                    Logger.warn(
+                        `Timed out (${stopActiveQueueTimeout}ms) waiting for ` +
+                            `${this.activeJobs.length} active jobs ` +
+                            `${this.claimingNext ? '(and a job being claimed) ' : ''}` +
+                            `in queue "${this.queueName}" to complete. Forcing stop...`,
+                    );
+                    this.forceStopped = true;
+                    this.queueStopped$.next(STOP_SIGNAL);
+                    clearTimeout(timeout);
+                    resolve();
+                    return;
+                }
+
+                if (this.activeJobs.length > 0) {
+                    if (now - lastStatusUpdate > 2000) {
+                        Logger.info(
+                            `Stopping queue: ${this.queueName} - waiting for ${this.activeJobs.length} active jobs to complete...`,
+                        );
+                        lastStatusUpdate = now;
+                    }
+                }
+
+                timeout = setTimeout(pollActiveJobs, 200);
             };
-            pollActiveJobs();
+            void pollActiveJobs();
         });
     }
 
+    /**
+     * A job whose claim or initial update was still in flight when the graceful shutdown
+     * timed out has missed STOP_SIGNAL, so it must not be started. Return it to PENDING instead.
+     */
+    private async deferForceStoppedJob(job: Job<Data>): Promise<void> {
+        job.defer();
+        await this.onFailOrComplete(job);
+    }
+
     private async onFailOrComplete(job: Job<Data>) {
-        await this.jobQueueStrategy.update(job);
-        this.removeJobFromActive(job);
+        try {
+            await this.jobQueueStrategy.update(job);
+        } finally {
+            this.removeJobFromActive(job);
+        }
     }
 
     private removeJobFromActive(job: Job<Data>) {
         const index = this.activeJobs.indexOf(job);
-        this.activeJobs.splice(index, 1);
+        if (index !== -1) {
+            this.activeJobs.splice(index, 1);
+        }
     }
 }
 
@@ -163,11 +315,13 @@ class ActiveQueue<Data extends JobData<Data> = {}> {
  * @docsCategory JobQueue
  */
 export abstract class PollingJobQueueStrategy extends InjectableJobQueueStrategy {
-    public concurrency: number;
+    public concurrency: number | ((queueName: string) => number);
     public pollInterval: number | ((queueName: string) => number);
+    public setRetries: (queueName: string, job: Job) => number;
     public backOffStrategy?: BackoffStrategy;
+    public gracefulShutdownTimeout: number;
 
-    private activeQueues = new QueueNameProcessStorage<ActiveQueue<any>>();
+    protected activeQueues = new QueueNameProcessStorage<ActiveQueue<any>>();
 
     constructor(config?: PollingJobQueueStrategyConfig);
     constructor(concurrency?: number, pollInterval?: number);
@@ -177,14 +331,18 @@ export abstract class PollingJobQueueStrategy extends InjectableJobQueueStrategy
         if (concurrencyOrConfig && isObject(concurrencyOrConfig)) {
             this.concurrency = concurrencyOrConfig.concurrency ?? 1;
             this.pollInterval = concurrencyOrConfig.pollInterval ?? 200;
-            this.backOffStrategy = concurrencyOrConfig.backoffStrategy;
+            this.backOffStrategy = concurrencyOrConfig.backoffStrategy ?? (() => 1000);
+            this.setRetries = concurrencyOrConfig.setRetries ?? ((_, job) => job.retries);
+            this.gracefulShutdownTimeout = concurrencyOrConfig.gracefulShutdownTimeout ?? 20_000;
         } else {
             this.concurrency = concurrencyOrConfig ?? 1;
             this.pollInterval = maybePollInterval ?? 200;
+            this.setRetries = (_, job) => job.retries;
+            this.gracefulShutdownTimeout = 20_000;
         }
     }
 
-    async start<Data extends JobData<Data> = {}>(
+    async start<Data extends JobData<Data> = object>(
         queueName: string,
         process: (job: Job<Data>) => Promise<any>,
     ) {
@@ -200,7 +358,7 @@ export abstract class PollingJobQueueStrategy extends InjectableJobQueueStrategy
         this.activeQueues.set(queueName, process, active);
     }
 
-    async stop<Data extends JobData<Data> = {}>(
+    async stop<Data extends JobData<Data> = object>(
         queueName: string,
         process: (job: Job<Data>) => Promise<any>,
     ) {
@@ -208,7 +366,7 @@ export abstract class PollingJobQueueStrategy extends InjectableJobQueueStrategy
         if (!active) {
             return;
         }
-        await active.stop();
+        await active.stop(this.gracefulShutdownTimeout);
     }
 
     async cancelJob(jobId: ID): Promise<Job | undefined> {

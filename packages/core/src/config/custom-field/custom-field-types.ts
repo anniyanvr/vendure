@@ -1,38 +1,143 @@
 import {
-    BooleanCustomFieldConfig as GraphQLBooleanCustomFieldConfig,
     CustomField,
+    BooleanCustomFieldConfig as GraphQLBooleanCustomFieldConfig,
+    BooleanStructFieldConfig as GraphQLBooleanStructFieldConfig,
     DateTimeCustomFieldConfig as GraphQLDateTimeCustomFieldConfig,
+    DateTimeStructFieldConfig as GraphQLDateTimeStructFieldConfig,
     FloatCustomFieldConfig as GraphQLFloatCustomFieldConfig,
+    FloatStructFieldConfig as GraphQLFloatStructFieldConfig,
     IntCustomFieldConfig as GraphQLIntCustomFieldConfig,
+    IntStructFieldConfig as GraphQLIntStructFieldConfig,
     LocaleStringCustomFieldConfig as GraphQLLocaleStringCustomFieldConfig,
-    LocalizedString,
+    LocaleTextCustomFieldConfig as GraphQLLocaleTextCustomFieldConfig,
     RelationCustomFieldConfig as GraphQLRelationCustomFieldConfig,
     StringCustomFieldConfig as GraphQLStringCustomFieldConfig,
+    StringStructFieldConfig as GraphQLStringStructFieldConfig,
+    StructCustomFieldConfig as GraphQLStructCustomFieldConfig,
+    StructField as GraphQLStructField,
+    TextCustomFieldConfig as GraphQLTextCustomFieldConfig,
+    TextStructFieldConfig as GraphQLTextStructFieldConfig,
+    LocalizedString,
+    Permission,
 } from '@vendure/common/lib/generated-types';
-import { CustomFieldsObject, CustomFieldType, Type } from '@vendure/common/lib/shared-types';
+import {
+    CustomFieldsObject,
+    CustomFieldType,
+    DefaultFormComponentId,
+    StructFieldType,
+    Type,
+    UiComponentConfig,
+} from '@vendure/common/lib/shared-types';
+import { RelationOptions } from 'typeorm';
 
+import { RequestContext } from '../../api/common/request-context';
 import { Injector } from '../../common/injector';
 import { VendureEntity } from '../../entity/base/base.entity';
 
+/**
+ * The suffix of every generated GraphQL input type that carries an entity's custom fields, e.g.
+ * `UpdateProductCustomFieldsInput`. It is the single source of this naming convention, shared by the
+ * schema generation (which produces these types) and the custom-field processing interceptor (which
+ * discovers them). If this changes, both sides change together.
+ */
+export const CUSTOM_FIELDS_INPUT_TYPE_SUFFIX = 'CustomFieldsInput';
+
+/**
+ * @description
+ * Returns `true` if the given custom field type is a localized type, i.e. one whose values are
+ * stored on the entity's translation entity rather than on the entity itself.
+ *
+ * @docsCategory custom-fields
+ * @since 3.7.4
+ */
+export function isLocalizedCustomFieldType(type: CustomFieldType | undefined): boolean {
+    return type === 'localeString' || type === 'localeText';
+}
+
 // prettier-ignore
-export type DefaultValueType<T extends CustomFieldType> =
-    T extends 'string' | 'localeString' ? string :
-        T extends 'int' | 'float' ? number :
-            T extends 'boolean' ? boolean :
-                T extends 'datetime' ? Date : never;
+export type DefaultValueType<T extends CustomFieldType | StructFieldType> =
+    T extends 'string' | 'localeString' | 'text' | 'localeText' ? string :
+    T extends 'int' | 'float' ? number :
+    T extends 'boolean' ? boolean :
+    T extends 'datetime' ? Date :
+    T extends 'relation' ? any : never;
 
 export type BaseTypedCustomFieldConfig<T extends CustomFieldType, C extends CustomField> = Omit<
     C,
-    '__typename' | 'list'
+    '__typename' | 'list' | 'requiresPermission'
 > & {
     type: T;
     /**
      * @description
-     * Whether or not the custom field is available via the Shop API.
+     * Whether the custom field is available via the Shop API.
      * @default true
      */
     public?: boolean;
     nullable?: boolean;
+    unique?: boolean;
+    /**
+     * @description
+     * Creates a database index for this custom field. Use this for custom fields
+     * which are frequently used to filter or sort large data sets.
+     *
+     * Indexes are only supported for non-list, non-struct, non-secret fields. MySQL and
+     * MariaDB also do not support indexes on `text` or `localeText` custom fields
+     * because those values are stored as `longtext` without an index prefix length.
+     * Invalid combinations are rejected during bootstrap.
+     *
+     * @since 3.8.0
+     */
+    index?: boolean;
+    /**
+     * @description
+     * If set to `true`, the value of this field is encrypted at rest using the configured
+     * {@link EncryptionStrategy}, and is only returned in decrypted form via the API to users
+     * permitted by the {@link SecretAccessStrategy} (by default, those with the `ReadSecret`
+     * permission). Other users receive a redaction placeholder.
+     *
+     * Only supported on `string` and `text` fields, and cannot be combined with `unique` or an
+     * explicit `length`.
+     *
+     * @since 3.8.0
+     * @default false
+     */
+    secret?: boolean;
+    /**
+     * @description
+     * The permission(s) required to read or write to this field.
+     * If the user has at least one of these permissions, they will be
+     * able to access the field.
+     *
+     * @since 2.2.0
+     */
+    requiresPermission?: Array<Permission | string> | Permission | string;
+    /**
+     * @description
+     * Marks the custom field as deprecated. When set to `true` or a string,
+     * the field will be marked as deprecated in the GraphQL schema.
+     * If a string is provided, it will be used as the deprecation reason.
+     *
+     * @since 3.4.0
+     */
+    deprecated?: boolean | string;
+    /**
+     * @description
+     * Configuration for the UI component used to render this custom field.
+     *
+     * The `dashboard` property can be set to `false` to hide this custom field
+     * from the Dashboard (React admin UI). The field will be excluded from the
+     * Dashboard's auto-generated queries, mutations, and form controls, but will
+     * remain available in the Admin and Shop GraphQL APIs.
+     *
+     * This is useful for fields that are set programmatically by plugins and should
+     * not be displayed to admin users.
+     *
+     * @example
+     * ```ts
+     * ui: { dashboard: false }
+     * ```
+     */
+    ui?: UiComponentConfig<DefaultFormComponentId | string> | { dashboard?: boolean };
 };
 
 /**
@@ -43,35 +148,46 @@ export type BaseTypedCustomFieldConfig<T extends CustomFieldType, C extends Cust
  */
 export type TypedCustomSingleFieldConfig<
     T extends CustomFieldType,
-    C extends CustomField
+    C extends CustomField,
 > = BaseTypedCustomFieldConfig<T, C> & {
     list?: false;
     defaultValue?: DefaultValueType<T>;
     validate?: (
         value: DefaultValueType<T>,
         injector: Injector,
+        ctx: RequestContext,
     ) => string | LocalizedString[] | void | Promise<string | LocalizedString[] | void>;
 };
 
 export type TypedCustomListFieldConfig<
     T extends CustomFieldType,
-    C extends CustomField
+    C extends CustomField,
 > = BaseTypedCustomFieldConfig<T, C> & {
-    list?: true;
+    list: true;
     defaultValue?: Array<DefaultValueType<T>>;
-    validate?: (value: Array<DefaultValueType<T>>) => string | LocalizedString[] | void;
+    validate?: (
+        value: Array<DefaultValueType<T>>,
+        injector: Injector,
+        ctx: RequestContext,
+    ) => string | LocalizedString[] | void | Promise<string | LocalizedString[] | void>;
 };
 
 export type TypedCustomFieldConfig<
     T extends CustomFieldType,
-    C extends CustomField
+    C extends CustomField,
 > = BaseTypedCustomFieldConfig<T, C> &
     (TypedCustomSingleFieldConfig<T, C> | TypedCustomListFieldConfig<T, C>);
 
+// Type-safe custom field type definitions
 export type StringCustomFieldConfig = TypedCustomFieldConfig<'string', GraphQLStringCustomFieldConfig>;
 export type LocaleStringCustomFieldConfig = TypedCustomFieldConfig<
     'localeString',
     GraphQLLocaleStringCustomFieldConfig
+>;
+export type TextCustomFieldConfig = TypedCustomFieldConfig<'text', GraphQLTextCustomFieldConfig>;
+export type LocaleTextCustomFieldConfig = TypedCustomFieldConfig<
+    'localeText',
+    GraphQLLocaleTextCustomFieldConfig
 >;
 export type IntCustomFieldConfig = TypedCustomFieldConfig<'int', GraphQLIntCustomFieldConfig>;
 export type FloatCustomFieldConfig = TypedCustomFieldConfig<'float', GraphQLFloatCustomFieldConfig>;
@@ -80,7 +196,132 @@ export type DateTimeCustomFieldConfig = TypedCustomFieldConfig<'datetime', Graph
 export type RelationCustomFieldConfig = TypedCustomFieldConfig<
     'relation',
     Omit<GraphQLRelationCustomFieldConfig, 'entity' | 'scalarFields'>
-> & { entity: Type<VendureEntity>; graphQLType?: string; eager?: boolean };
+> & {
+    entity: Type<VendureEntity>;
+    graphQLType?: string;
+    inverseSide?: string | ((object: any) => any);
+    /**
+     * @description
+     * The TypeORM [cascade options](https://typeorm.io/docs/relations/relations#cascade-options) for the relation.
+     * Cascaded operations act on the related entity when the owning entity is saved or removed.
+     *
+     * @since 3.7.0
+     */
+    cascade?: RelationOptions['cascade'];
+    /**
+     * @description
+     * The foreign key `ON DELETE` action for the relation. If not set, the database default (`NO ACTION`) applies.
+     *
+     * @since 3.7.0
+     */
+    onDelete?: RelationOptions['onDelete'];
+    /**
+     * @description
+     * The foreign key `ON UPDATE` action for the relation. If not set, the database default (`NO ACTION`) applies.
+     *
+     * @since 3.7.0
+     */
+    onUpdate?: RelationOptions['onUpdate'];
+    /**
+     * @description
+     * Whether the relation is always loaded together with the owning entity.
+     */
+    eager?: RelationOptions['eager'];
+};
+
+// Struct field definitions
+export type BaseTypedStructFieldConfig<T extends StructFieldType, C extends GraphQLStructField> = Omit<
+    C,
+    '__typename' | 'list'
+> & {
+    type: T;
+    ui?: UiComponentConfig<DefaultFormComponentId | string>;
+};
+export type TypedStructSingleFieldConfig<
+    T extends StructFieldType,
+    C extends GraphQLStructField,
+> = BaseTypedStructFieldConfig<T, C> & {
+    list?: false;
+    validate?: (
+        value: DefaultValueType<T>,
+        injector: Injector,
+        ctx: RequestContext,
+    ) => string | LocalizedString[] | void | Promise<string | LocalizedString[] | void>;
+};
+
+export type TypedStructListFieldConfig<
+    T extends StructFieldType,
+    C extends GraphQLStructField,
+> = BaseTypedStructFieldConfig<T, C> & {
+    list: true;
+    validate?: (
+        value: Array<DefaultValueType<T>>,
+        injector: Injector,
+        ctx: RequestContext,
+    ) => string | LocalizedString[] | void | Promise<string | LocalizedString[] | void>;
+};
+
+export type TypedStructFieldConfig<
+    T extends StructFieldType,
+    C extends GraphQLStructField,
+> = BaseTypedStructFieldConfig<T, C> &
+    (TypedStructSingleFieldConfig<T, C> | TypedStructListFieldConfig<T, C>);
+
+export type StringStructFieldConfig = TypedStructFieldConfig<'string', GraphQLStringStructFieldConfig>;
+export type TextStructFieldConfig = TypedStructFieldConfig<'text', GraphQLTextStructFieldConfig>;
+export type IntStructFieldConfig = TypedStructFieldConfig<'int', GraphQLIntStructFieldConfig>;
+export type FloatStructFieldConfig = TypedStructFieldConfig<'float', GraphQLFloatStructFieldConfig>;
+export type BooleanStructFieldConfig = TypedStructFieldConfig<'boolean', GraphQLBooleanStructFieldConfig>;
+export type DateTimeStructFieldConfig = TypedStructFieldConfig<'datetime', GraphQLDateTimeStructFieldConfig>;
+
+/**
+ * @description
+ * Configures an individual field of a "struct" custom field. The individual fields share
+ * the same API as the top-level custom fields, with the exception that they do not support the
+ * `readonly`, `internal`, `nullable`, `unique` and `requiresPermission` options.
+ *
+ * @example
+ * ```ts
+ * const customFields: CustomFields = {
+ *   Product: [
+ *     {
+ *       name: 'specifications',
+ *       type: 'struct',
+ *       fields: [
+ *         { name: 'processor', type: 'string' },
+ *         { name: 'ram', type: 'string' },
+ *         { name: 'screenSize', type: 'float' },
+ *       ],
+ *     },
+ *   ],
+ * };
+ * ```
+ *
+ *
+ * @docsCategory custom-fields
+ * @since 3.1.0
+ */
+export type StructFieldConfig =
+    | StringStructFieldConfig
+    | TextStructFieldConfig
+    | IntStructFieldConfig
+    | FloatStructFieldConfig
+    | BooleanStructFieldConfig
+    | DateTimeStructFieldConfig;
+
+/**
+ * @description
+ * Configures a "struct" custom field.
+ *
+ * @docsCategory custom-fields
+ * @since 3.1.0
+ */
+export type StructCustomFieldConfig = TypedCustomFieldConfig<
+    'struct',
+    Omit<GraphQLStructCustomFieldConfig, 'fields'>
+> & {
+    fields: StructFieldConfig[];
+};
 
 /**
  * @description
@@ -91,80 +332,22 @@ export type RelationCustomFieldConfig = TypedCustomFieldConfig<
 export type CustomFieldConfig =
     | StringCustomFieldConfig
     | LocaleStringCustomFieldConfig
+    | TextCustomFieldConfig
+    | LocaleTextCustomFieldConfig
     | IntCustomFieldConfig
     | FloatCustomFieldConfig
     | BooleanCustomFieldConfig
     | DateTimeCustomFieldConfig
-    | RelationCustomFieldConfig;
+    | RelationCustomFieldConfig
+    | StructCustomFieldConfig;
 
 /**
  * @description
  * Most entities can have additional fields added to them by defining an array of {@link CustomFieldConfig}
  * objects on against the corresponding key.
  *
- * ### Configuration options
- *
- * All custom fields share some common properties:
- *
- * * `name: string`: The name of the field
- * * `type: string`: A string of type {@link CustomFieldType}
- * * `list: boolean`: If set to `true`, then the field will be an array of the specified type
- * * `label?: LocalizedString[]`: An array of localized labels for the field.
- * * `description?: LocalizedString[]`: An array of localized descriptions for the field.
- * * `public?: boolean`: Whether or not the custom field is available via the Shop API. Defaults to `true`
- * * `readonly?: boolean`: Whether or not the custom field can be updated via the GraphQL APIs. Defaults to `false`
- * * `internal?: boolean`: Whether or not the custom field is exposed at all via the GraphQL APIs. Defaults to `false`
- * * `defaultValue?: any`: The default value when an Entity is created with this field.
- * * `nullable?: boolean`: Whether the field is nullable in the database. If set to `false`, then a `defaultValue` should be provided.
- * * `validate?: (value: any) => string | LocalizedString[] | void`: A custom validation function. If the value is valid, then
- *     the function should not return a value. If a string or LocalizedString array is returned, this is interpreted as an error message.
- *
- * The `LocalizedString` type looks like this:
- *
- * ```TypeScript
- * type LocalizedString = {
- *   languageCode: LanguageCode;
- *   value: string;
- * };
- * ```
- *
- * In addition to the common properties, the following field types have some type-specific properties:
- *
- * #### `string` type
- *
- * * `pattern?: string`: A regex pattern which the field value must match
- * * `options?: { value: string; label?: LocalizedString[]; };`: An array of pre-defined options for the field.
- * * `length?: number`: The max length of the varchar created in the database. Defaults to 255. Maximum is 65,535.
- *
- * #### `localeString` type
- *
- * * `pattern?: string`: A regex pattern which the field value must match
- * * `length?: number`: The max length of the varchar created in the database. Defaults to 255. Maximum is 65,535.
- *
- * #### `int` & `float` type
- *
- * * `min?: number`: The minimum permitted value
- * * `max?: number`: The maximum permitted value
- * * `step?: number`: The step value
- *
- * #### `datetime` type
- *
- * The min, max & step properties for datetime fields are intended to be used as described in
- * [the datetime-local docs](https://developer.mozilla.org/en-US/docs/Web/HTML/Element/input/datetime-local#Additional_attributes)
- *
- * * `min?: string`: The earliest permitted date
- * * `max?: string`: The latest permitted date
- * * `step?: string`: The step value
- *
- * #### `relation` type
- *
- * * `entity: VendureEntity`: The entity which this custom field is referencing
- * * `eager?: boolean`: Whether to [eagerly load](https://typeorm.io/#/eager-and-lazy-relations) the relation. Defaults to false.
- * * `graphQLType?: string`: The name of the GraphQL type that corresponds to the entity.
- *     Can be omitted if it is the same, which is usually the case.
- *
  * @example
- * ```TypeScript
+ * ```ts
  * bootstrap({
  *     // ...
  *     customFields: {
@@ -182,26 +365,45 @@ export type CustomFieldConfig =
  *
  * @docsCategory custom-fields
  */
-export interface CustomFields {
+export type CustomFields = {
     Address?: CustomFieldConfig[];
     Administrator?: CustomFieldConfig[];
+    ApiKey?: CustomFieldConfig[];
     Asset?: CustomFieldConfig[];
     Channel?: CustomFieldConfig[];
     Collection?: CustomFieldConfig[];
     Customer?: CustomFieldConfig[];
+    CustomerGroup?: CustomFieldConfig[];
     Facet?: CustomFieldConfig[];
     FacetValue?: CustomFieldConfig[];
     Fulfillment?: CustomFieldConfig[];
     GlobalSettings?: CustomFieldConfig[];
+    HistoryEntry?: CustomFieldConfig[];
     Order?: CustomFieldConfig[];
     OrderLine?: CustomFieldConfig[];
+    Payment?: CustomFieldConfig[];
+    PaymentMethod?: CustomFieldConfig[];
     Product?: CustomFieldConfig[];
     ProductOption?: CustomFieldConfig[];
     ProductOptionGroup?: CustomFieldConfig[];
     ProductVariant?: CustomFieldConfig[];
-    User?: CustomFieldConfig[];
+    ProductVariantPrice?: CustomFieldConfig[];
+    Promotion?: CustomFieldConfig[];
+    Refund?: CustomFieldConfig[];
+    Region?: CustomFieldConfig[];
+    Role?: CustomFieldConfig[];
+    Seller?: CustomFieldConfig[];
+    Session?: CustomFieldConfig[];
+    ShippingLine?: CustomFieldConfig[];
     ShippingMethod?: CustomFieldConfig[];
-}
+    StockLevel?: CustomFieldConfig[];
+    StockLocation?: CustomFieldConfig[];
+    StockMovement?: CustomFieldConfig[];
+    TaxCategory?: CustomFieldConfig[];
+    TaxRate?: CustomFieldConfig[];
+    User?: CustomFieldConfig[];
+    Zone?: CustomFieldConfig[];
+} & { [entity: string]: CustomFieldConfig[] };
 
 /**
  * This interface should be implemented by any entity which can be extended
@@ -209,4 +411,12 @@ export interface CustomFields {
  */
 export interface HasCustomFields {
     customFields: CustomFieldsObject;
+}
+
+/**
+ * Returns true for non-list relation custom fields, i.e. those which also expose a
+ * `<name>Id` property on the entity and in the GraphQL APIs.
+ */
+export function isNonListRelationCustomField(config: CustomFieldConfig): config is RelationCustomFieldConfig {
+    return config.type === 'relation' && config.list !== true;
 }

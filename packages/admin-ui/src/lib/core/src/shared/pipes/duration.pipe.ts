@@ -4,11 +4,20 @@ import { marker as _ } from '@biesbjerg/ngx-translate-extract-marker';
 import { I18nService } from '../../providers/i18n/i18n.service';
 
 /**
+ * @description
  * Displays a number of milliseconds in a more human-readable format,
  * e.g. "12ms", "33s", "2:03m"
+ *
+ * @example
+ * ```ts
+ * {{ timeInMs | duration }}
+ * ```
+ *
+ * @docsCategory pipes
  */
 @Pipe({
     name: 'duration',
+    standalone: false,
 })
 export class DurationPipe implements PipeTransform {
     constructor(private i18nService: I18nService) {}

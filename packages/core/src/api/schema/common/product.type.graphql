@@ -6,9 +6,13 @@ type Product implements Node {
     name: String!
     slug: String!
     description: String!
+    enabled: Boolean!
     featuredAsset: Asset
     assets: [Asset!]!
+    "Returns all ProductVariants"
     variants: [ProductVariant!]!
+    "Returns a paginated, sortable, filterable list of ProductVariants"
+    variantList(options: ProductVariantListOptions): ProductVariantList!
     optionGroups: [ProductOptionGroup!]!
     facetValues: [FacetValue!]!
     translations: [ProductTranslation!]!
@@ -46,10 +50,9 @@ type ProductVariant implements Node {
     name: String!
     featuredAsset: Asset
     assets: [Asset!]!
-    price: Int!
+    price: Money!
     currencyCode: CurrencyCode!
-    priceIncludesTax: Boolean! @deprecated(reason: "price now always excludes tax")
-    priceWithTax: Int!
+    priceWithTax: Money!
     stockLevel: String!
     taxRateApplied: TaxRate!
     taxCategory: TaxCategory!

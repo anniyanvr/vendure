@@ -7,12 +7,13 @@ import {
     TestShippingMethodQuote,
     TestShippingMethodResult,
 } from '@vendure/common/lib/generated-types';
+import { ID } from '@vendure/common/lib/shared-types';
 
-import { ID } from '../../../../common/lib/shared-types';
 import { RequestContext } from '../../api/common/request-context';
+import { Instrument } from '../../common/instrument-decorator';
 import { grossPriceOf, netPriceOf } from '../../common/tax-utils';
 import { ConfigService } from '../../config/config.service';
-import { OrderItem } from '../../entity/order-item/order-item.entity';
+import { TransactionalConnection } from '../../connection/transactional-connection';
 import { OrderLine } from '../../entity/order-line/order-line.entity';
 import { Order } from '../../entity/order/order.entity';
 import { ProductVariant } from '../../entity/product-variant/product-variant.entity';
@@ -20,17 +21,19 @@ import { ShippingLine } from '../../entity/shipping-line/shipping-line.entity';
 import { ShippingMethod } from '../../entity/shipping-method/shipping-method.entity';
 import { ConfigArgService } from '../helpers/config-arg/config-arg.service';
 import { OrderCalculator } from '../helpers/order-calculator/order-calculator';
+import { ProductPriceApplicator } from '../helpers/product-price-applicator/product-price-applicator';
 import { ShippingCalculator } from '../helpers/shipping-calculator/shipping-calculator';
-import { translateDeep } from '../helpers/utils/translate-entity';
-import { TransactionalConnection } from '../transaction/transactional-connection';
-
-import { ProductVariantService } from './product-variant.service';
+import { TranslatorService } from '../helpers/translator/translator.service';
 
 /**
+ * @description
  * This service is responsible for creating temporary mock Orders against which tests can be run, such as
  * testing a ShippingMethod or Promotion.
+ *
+ * @docsCategory services
  */
 @Injectable()
+@Instrument()
 export class OrderTestingService {
     constructor(
         private connection: TransactionalConnection,
@@ -38,10 +41,12 @@ export class OrderTestingService {
         private shippingCalculator: ShippingCalculator,
         private configArgService: ConfigArgService,
         private configService: ConfigService,
-        private productVariantService: ProductVariantService,
+        private productPriceApplicator: ProductPriceApplicator,
+        private translator: TranslatorService,
     ) {}
 
     /**
+     * @description
      * Runs a given ShippingMethod configuration against a mock Order to test for eligibility and resulting
      * price.
      */
@@ -50,8 +55,8 @@ export class OrderTestingService {
         input: TestShippingMethodInput,
     ): Promise<TestShippingMethodResult> {
         const shippingMethod = new ShippingMethod({
-            checker: this.configArgService.parseInput('ShippingEligibilityChecker', input.checker),
-            calculator: this.configArgService.parseInput('ShippingCalculator', input.calculator),
+            checker: this.configArgService.parseInputForExecution('ShippingEligibilityChecker', input.checker),
+            calculator: this.configArgService.parseInputForExecution('ShippingCalculator', input.calculator),
         });
         const mockOrder = await this.buildMockOrder(ctx, input.shippingAddress, input.lines);
         const eligible = await shippingMethod.test(ctx, mockOrder);
@@ -72,7 +77,8 @@ export class OrderTestingService {
     }
 
     /**
-     * Tests all available ShippingMethods against a mock Order and return those whic hare eligible. This
+     * @description
+     * Tests all available ShippingMethods against a mock Order and return those which are eligible. This
      * is intended to simulate a call to the `eligibleShippingMethods` query of the Shop API.
      */
     async testEligibleShippingMethods(
@@ -83,7 +89,7 @@ export class OrderTestingService {
         const eligibleMethods = await this.shippingCalculator.getEligibleShippingMethods(ctx, mockOrder);
         return eligibleMethods
             .map(result => {
-                translateDeep(result.method, ctx.languageCode);
+                this.translator.translate(result.method, ctx);
                 return result;
             })
             .map(result => {
@@ -119,11 +125,14 @@ export class OrderTestingService {
                 line.productVariantId,
                 { relations: ['taxCategory'] },
             );
-            await this.productVariantService.applyChannelPriceAndTax(productVariant, ctx);
+            await this.productPriceApplicator.applyChannelPriceAndTax(productVariant, ctx, mockOrder);
             const orderLine = new OrderLine({
                 productVariant,
-                items: [],
+                adjustments: [],
+                taxLines: [],
+                quantity: line.quantity,
                 taxCategory: productVariant.taxCategory,
+                taxCategoryId: productVariant.taxCategoryId,
             });
             mockOrder.lines.push(orderLine);
 
@@ -131,19 +140,12 @@ export class OrderTestingService {
                 ctx,
                 productVariant,
                 orderLine.customFields || {},
+                mockOrder,
+                orderLine.quantity,
             );
             const taxRate = productVariant.taxRateApplied;
-            const unitPrice = priceIncludesTax ? taxRate.netPriceOf(price) : price;
-
-            for (let i = 0; i < line.quantity; i++) {
-                const orderItem = new OrderItem({
-                    listPrice: price,
-                    listPriceIncludesTax: priceIncludesTax,
-                    adjustments: [],
-                    taxLines: [],
-                });
-                orderLine.items.push(orderItem);
-            }
+            orderLine.listPrice = price;
+            orderLine.listPriceIncludesTax = priceIncludesTax;
         }
         mockOrder.shippingLines = [
             new ShippingLine({

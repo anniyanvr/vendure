@@ -1,4 +1,4 @@
-declare function fail(error?: any): never;
+import { fail } from 'assert';
 
 /**
  * @description
@@ -9,7 +9,7 @@ declare function fail(error?: any): never;
  * type inference to work as expected:
  *
  * @example
- * ```TypeScript
+ * ```ts
  * const orderResultGuard: ErrorResultGuard<AddItemToOrderResult>
  *   = createErrorResultGuard(order => !!order.lines);
  * ```
@@ -28,7 +28,7 @@ export function createErrorResultGuard<T>(testFn: (input: T) => boolean): ErrorR
  * 2. narrow the type so that TypeScript can correctly infer the properties of the result.
  *
  * @example
- * ```TypeScript
+ * ```ts
  * const orderResultGuard: ErrorResultGuard<AddItemToOrderResult>
  *   = createErrorResultGuard(order => !!order.lines);
  *
@@ -76,7 +76,7 @@ export class ErrorResultGuard<T> {
      */
     assertErrorResult<R>(input: T | R): asserts input is R {
         if (this.isSuccess(input)) {
-            fail(`Should have errored`);
+            fail('Should have errored');
         }
     }
 }

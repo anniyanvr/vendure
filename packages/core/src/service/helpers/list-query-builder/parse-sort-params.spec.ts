@@ -1,14 +1,36 @@
 import { Type } from '@vendure/common/lib/shared-types';
+import { fail } from 'assert';
 import { DefaultNamingStrategy } from 'typeorm';
 import { ColumnMetadata } from 'typeorm/metadata/ColumnMetadata';
 import { RelationMetadata } from 'typeorm/metadata/RelationMetadata';
+import { describe, expect, it } from 'vitest';
 
+import { Calculated } from '../../../common/calculated-decorator';
 import { SortParameter } from '../../../common/types/common-types';
+import { CustomFieldConfig } from '../../../config/custom-field/custom-field-types';
 import { ProductTranslation } from '../../../entity/product/product-translation.entity';
 import { Product } from '../../../entity/product/product.entity';
 import { I18nError } from '../../../i18n/i18n-error';
 
 import { parseSortParams } from './parse-sort-params';
+
+class EntityWithCalculatedProperty {
+    @Calculated({
+        relations: ['productVariantPrices'],
+        expression: 'productVariantPrices.price',
+    })
+    get price(): number {
+        return 0;
+    }
+
+    @Calculated({
+        relations: ['productVariantPrices'],
+        expression: 'ROUND(productVariantPrices.price * 1.2)',
+    })
+    get priceWithTax(): number {
+        return 0;
+    }
+}
 
 describe('parseSortParams()', () => {
     it('works with no params', () => {
@@ -71,7 +93,53 @@ describe('parseSortParams()', () => {
         const result = parseSortParams(connection as any, Product, sortParams);
         expect(result).toEqual({
             'product.id': 'ASC',
-            'product_translations.name': 'DESC',
+            'product__translations.name': 'DESC',
+        });
+    });
+
+    it('works with localized fields and a camelCase entity alias', () => {
+        const connection = new MockConnection();
+        connection.setColumns(Product, [{ propertyName: 'id' }, { propertyName: 'image' }]);
+        connection.setRelations(Product, [{ propertyName: 'translations', type: ProductTranslation }]);
+        connection.setColumns(ProductTranslation, [
+            { propertyName: 'id' },
+            { propertyName: 'name' },
+            { propertyName: 'base', relationMetadata: {} as any },
+        ]);
+
+        const sortParams: SortParameter<Product> = {
+            id: 'ASC',
+            name: 'DESC',
+        };
+
+        const result = parseSortParams(connection as any, Product, sortParams, undefined, 'productVariant');
+        expect(result).toEqual({
+            'productVariant.id': 'ASC',
+            'productVariant__translations.name': 'DESC',
+        });
+    });
+
+    it('leaves a simple property-path expression of a calculated column unescaped', () => {
+        const connection = new MockConnection();
+        connection.setColumns(EntityWithCalculatedProperty, [{ propertyName: 'id' }]);
+
+        const result = parseSortParams(connection as any, EntityWithCalculatedProperty, {
+            price: 'ASC',
+        } as any);
+        expect(result).toEqual({
+            'productVariantPrices.price': 'ASC',
+        });
+    });
+
+    it('escapes identifiers in a complex expression of a calculated column', () => {
+        const connection = new MockConnection();
+        connection.setColumns(EntityWithCalculatedProperty, [{ propertyName: 'id' }]);
+
+        const result = parseSortParams(connection as any, EntityWithCalculatedProperty, {
+            priceWithTax: 'ASC',
+        } as any);
+        expect(result).toEqual({
+            'ROUND("productVariantPrices".price * 1.2)': 'ASC',
         });
     });
 
@@ -98,10 +166,43 @@ describe('parseSortParams()', () => {
         const sortParams: SortParameter<Product & { shortName: any }> = {
             shortName: 'ASC',
         };
+        const productCustomFields: CustomFieldConfig[] = [{ name: 'shortName', type: 'localeString' }];
 
-        const result = parseSortParams(connection as any, Product, sortParams);
+        const result = parseSortParams(
+            connection as any,
+            Product,
+            sortParams,
+            {},
+            undefined,
+            productCustomFields,
+        );
         expect(result).toEqual({
-            'product_translations.shortName': 'ASC',
+            'product__translations.customFields.shortName': 'ASC',
+        });
+    });
+
+    // #5199 — a localeText custom field must resolve to the same customFields path as localeString
+    it('works with localeText custom fields', () => {
+        const connection = new MockConnection();
+        connection.setColumns(Product, [{ propertyName: 'id' }]);
+        connection.setRelations(Product, [{ propertyName: 'translations', type: ProductTranslation }]);
+        connection.setColumns(ProductTranslation, [{ propertyName: 'id' }, { propertyName: 'summary' }]);
+
+        const sortParams: SortParameter<Product & { summary: any }> = {
+            summary: 'ASC',
+        };
+        const productCustomFields: CustomFieldConfig[] = [{ name: 'summary', type: 'localeText' }];
+
+        const result = parseSortParams(
+            connection as any,
+            Product,
+            sortParams,
+            {},
+            undefined,
+            productCustomFields,
+        );
+        expect(result).toEqual({
+            'product__translations.customFields.summary': 'ASC',
         });
     });
 
@@ -122,7 +223,7 @@ describe('parseSortParams()', () => {
         try {
             parseSortParams(connection as any, Product, sortParams);
             fail('should not get here');
-        } catch (e) {
+        } catch (e: any) {
             expect(e instanceof I18nError).toBe(true);
             expect(e.message).toBe('error.invalid-sort-field');
             expect(e.variables.fieldName).toBe('invalid');
@@ -149,6 +250,7 @@ export class MockConnection {
         };
     };
     namingStrategy = new DefaultNamingStrategy();
+    driver = { escape: (name: string) => `"${name}"` };
     readonly options = {
         type: 'sqljs',
     };

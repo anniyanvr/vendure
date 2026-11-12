@@ -1,0 +1,59 @@
+---
+title: "Role"
+generated: true
+---
+<GenerationInfo sourceFile="packages/core/src/entity/role/role.entity.ts" sourceLine="18" packageName="@vendure/core" />
+
+A Role represents a collection of permissions which determine the authorization
+level of a [User](/reference/typescript-api/entities/user#user) on a given set of [Channel](/reference/typescript-api/entities/channel#channel)s.
+
+```ts title="Signature"
+class Role extends VendureEntity implements ChannelAware, HasCustomFields {
+    constructor(input?: DeepPartial<Role>)
+    @Column() code: string;
+    @Column() description: string;
+    @Column('simple-array') permissions: Permission[];
+    @Column(type => CustomRoleFields)
+    customFields: CustomRoleFields;
+    @ManyToMany(type => Channel, channel => channel.roles)
+    @JoinTable()
+    channels: Channel[];
+}
+```
+* Extends: [`VendureEntity`](/reference/typescript-api/entities/vendure-entity#vendureentity)
+
+
+* Implements: [`ChannelAware`](/reference/typescript-api/entities/interfaces#channelaware), HasCustomFields
+
+
+
+<div className="members-wrapper">
+
+### code
+
+<MemberInfo kind="property" type={`string`}   />
+
+
+### description
+
+<MemberInfo kind="property" type={`string`}   />
+
+
+### permissions
+
+<MemberInfo kind="property" type={`<a href='/reference/typescript-api/common/permission#permission'>Permission</a>[]`}   />
+
+
+### customFields
+
+<MemberInfo kind="property" type={`CustomRoleFields`}   />
+
+
+### channels
+
+<MemberInfo kind="property" type={`<a href='/reference/typescript-api/entities/channel#channel'>Channel</a>[]`}   />
+
+
+
+
+</div>

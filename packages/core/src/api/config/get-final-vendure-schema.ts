@@ -1,0 +1,190 @@
+import { GraphQLTypesLoader } from '@nestjs/graphql';
+import { notNullOrUndefined } from '@vendure/common/lib/shared-utils';
+import { buildSchema, concatAST, extendSchema, GraphQLSchema, printSchema } from 'graphql/index';
+import path from 'path';
+
+import {
+    AutoIncrementIdStrategy,
+    EntityIdStrategy,
+    RuntimeVendureConfig,
+    UuidIdStrategy,
+} from '../../config/index';
+import { getPluginAPIExtensions } from '../../plugin/plugin-metadata';
+
+import { generateActiveOrderTypes } from './generate-active-order-types';
+import { generateAuthenticationTypes } from './generate-auth-types';
+import { generateErrorCodeEnum } from './generate-error-code-enum';
+import { generateListOptions } from './generate-list-options';
+import { generatePermissionEnum } from './generate-permissions';
+import {
+    addActiveAdministratorCustomFields,
+    addGraphQLCustomFields,
+    addModifyOrderCustomFields,
+    addOrderLineCustomFieldsInput,
+    addPaymentMethodQuoteCustomFields,
+    addRegisterCustomerCustomFieldsInput,
+    addServerConfigCustomFields,
+    addShippingMethodQuoteCustomFields,
+} from './graphql-custom-fields';
+
+type GetSchemaOptions = {
+    config: RuntimeVendureConfig;
+    typePaths: string[];
+    typesLoader: GraphQLTypesLoader;
+    apiType: 'shop' | 'admin';
+};
+type GetSchemaAsSDLOptions = GetSchemaOptions & { output: 'sdl' };
+
+/**
+ * @description
+ * Build the full Vendure GraphQL schema, including any custom fields, API extensions,
+ * custom scalars etc. defined in plugins.
+ *
+ * By setting the `output` option to `'sdl'`, the schema can be output as an SDL string.
+ * This is safe to use in scenarios where there might be multiple versions of
+ * the `graphql` package installed, where otherwise passing around the actual
+ * `GraphQLSchema` object might lead to conflicts.
+ *
+ * @example
+ * ```ts
+ * import { getFinalVendureSchema, VENDURE_ADMIN_API_TYPE_PATHS } from '\@vendure/core';
+ * import { GraphQLTypesLoader } from '@nestjs/graphql';
+ *
+ * import { config } from './vendure-config';
+ *
+ * const typesLoader = new GraphQLTypesLoader();
+ *
+ * const finalSchema = await getFinalVendureSchema({
+ *     config,
+ *     typePaths: VENDURE_ADMIN_API_TYPE_PATHS,
+ *     typesLoader,
+ *     apiType: 'admin',
+ *     output: 'sdl',
+ * });
+ * ```
+ *
+ * @param options
+ */
+export async function getFinalVendureSchema(options: GetSchemaOptions): Promise<GraphQLSchema>;
+export async function getFinalVendureSchema(options: GetSchemaAsSDLOptions): Promise<string>;
+export async function getFinalVendureSchema(
+    options: GetSchemaOptions & { output?: 'sdl' },
+): Promise<GraphQLSchema | string> {
+    const { config, typePaths, typesLoader, apiType } = options;
+    // Paths must be normalized to use forward-slash separators.
+    // See https://github.com/nestjs/graphql/issues/336
+    const normalizedPaths = typePaths.map(p => p.split(path.sep).join('/'));
+    const typeDefs = await mergeTypesByPathsCached(typesLoader, normalizedPaths);
+    let schema = buildSchema(typeDefs);
+    schema = buildSchemaFromVendureConfig(schema, config, apiType);
+    if (options.output === 'sdl') {
+        return printSchema(schema);
+    } else {
+        return schema;
+    }
+}
+
+/**
+ * Plain code-unit ordering, deliberately not `localeCompare`: the goal is to
+ * reproduce the file ordering of the default `Array.sort()` that
+ * `GraphQLTypesLoader` applies to the globbed file paths, and `localeCompare`
+ * is locale-dependent and would diverge from it.
+ */
+function compareByCodeUnit(a: string, b: string): number {
+    if (a < b) {
+        return -1;
+    }
+    if (a > b) {
+        return 1;
+    }
+    return 0;
+}
+
+/**
+ * Loads and merges type definitions with a per-glob-pattern cache, so that
+ * patterns shared between the shop and admin APIs (the `common` schema files)
+ * are only globbed, read and parsed once per process. Patterns are merged in
+ * sorted order to reproduce the file ordering of a single uncached
+ * `mergeTypesByPaths()` call over all patterns.
+ */
+const typeDefsCache = new Map<string, Promise<string | null>>();
+async function mergeTypesByPathsCached(typesLoader: GraphQLTypesLoader, paths: string[]): Promise<string> {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const { mergeTypeDefs } = require('@graphql-tools/merge');
+    const sortedPaths = [...paths].sort(compareByCodeUnit);
+    const parts = await Promise.all(
+        sortedPaths.map(async p => {
+            let cached = typeDefsCache.get(p);
+            if (!cached) {
+                cached = typesLoader.mergeTypesByPaths([p]);
+                typeDefsCache.set(p, cached);
+            }
+            return cached;
+        }),
+    );
+    // These options mirror the ones GraphQLTypesLoader.mergeTypesByPaths() uses
+    // internally, which is a private implementation detail of @nestjs/graphql.
+    // If an upgrade changes them there, the two merge passes here could diverge
+    // from a single uncached merge — verify with scripts/bootstrap-bench/dump-sdl.js
+    // when bumping @nestjs/graphql.
+    return mergeTypeDefs(parts.filter(notNullOrUndefined), {
+        throwOnConflict: true,
+        commentDescriptions: true,
+        reverseDirectives: true,
+    });
+}
+
+export function buildSchemaFromVendureConfig(
+    schema: GraphQLSchema,
+    config: RuntimeVendureConfig,
+    apiType: 'shop' | 'admin',
+): GraphQLSchema {
+    const authStrategies =
+        apiType === 'shop'
+            ? config.authOptions.shopAuthenticationStrategy
+            : config.authOptions.adminAuthenticationStrategy;
+
+    const customFields = config.customFields;
+
+    schema = extendSchemaWithPluginApiExtensions(schema, config.plugins, apiType);
+    schema = generateListOptions(schema);
+    schema = addGraphQLCustomFields(schema, customFields, apiType === 'shop');
+    schema = addOrderLineCustomFieldsInput(schema, customFields.OrderLine || [], apiType === 'shop');
+    schema = addModifyOrderCustomFields(schema, customFields.Order || []);
+    schema = addShippingMethodQuoteCustomFields(schema, customFields.ShippingMethod || []);
+    schema = addPaymentMethodQuoteCustomFields(schema, customFields.PaymentMethod || []);
+    schema = generateAuthenticationTypes(schema, authStrategies);
+    schema = generateErrorCodeEnum(schema);
+    if (apiType === 'admin') {
+        schema = addServerConfigCustomFields(schema, customFields);
+        schema = addActiveAdministratorCustomFields(schema, customFields.Administrator);
+    }
+    if (apiType === 'shop') {
+        schema = addRegisterCustomerCustomFieldsInput(schema, customFields.Customer || []);
+        schema = generateActiveOrderTypes(schema, config.orderOptions.activeOrderStrategy);
+    }
+    schema = generatePermissionEnum(schema, config.authOptions.customPermissions);
+
+    return schema;
+}
+
+function extendSchemaWithPluginApiExtensions(
+    schema: GraphQLSchema,
+    plugins: RuntimeVendureConfig['plugins'],
+    apiType: 'admin' | 'shop',
+) {
+    // All extension documents are evaluated against the un-extended schema and then
+    // merged into a single extendSchema() pass, since each full-schema rebuild is
+    // costly and would otherwise run once per plugin.
+    const documentNodes = getPluginAPIExtensions(plugins, apiType)
+        .map(e => (typeof e.schema === 'function' ? e.schema(schema) : e.schema))
+        .filter(notNullOrUndefined);
+    return documentNodes.length ? extendSchema(schema, concatAST(documentNodes)) : schema;
+}
+
+export function isUsingDefaultEntityIdStrategy(entityIdStrategy: EntityIdStrategy<any>): boolean {
+    return (
+        entityIdStrategy.constructor === AutoIncrementIdStrategy ||
+        entityIdStrategy.constructor === UuidIdStrategy
+    );
+}

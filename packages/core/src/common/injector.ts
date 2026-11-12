@@ -1,7 +1,5 @@
 import { Type } from '@nestjs/common';
 import { ContextId, ModuleRef } from '@nestjs/core';
-import { getConnectionToken } from '@nestjs/typeorm';
-import { Connection } from 'typeorm';
 
 /**
  * @description
@@ -22,16 +20,6 @@ export class Injector {
      */
     get<T, R = T>(typeOrToken: Type<T> | string | symbol): R {
         return this.moduleRef.get(typeOrToken, { strict: false });
-    }
-
-    /**
-     * @description
-     * (deprecated) Retrieve the TypeORM `Connection` instance.
-     *
-     * @deprecated Use `.get(TransactionalConnection)` instead.
-     */
-    getConnection(): Connection {
-        return this.moduleRef.get(getConnectionToken() as any, { strict: false });
     }
 
     /**

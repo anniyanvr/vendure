@@ -3,6 +3,8 @@ import ms from 'ms';
 
 import { AuthOptions } from '../../config/vendure-config';
 
+import { tokenMethodIncludes } from './token-method-includes';
+
 /**
  * Sets the authToken either as a cookie or as a response header, depending on the
  * config settings.
@@ -15,14 +17,21 @@ export function setSessionToken(options: {
     res: Response;
 }) {
     const { sessionToken, rememberMe, authOptions, req, res } = options;
-    if (authOptions.tokenMethod === 'cookie') {
+    const usingCookie = tokenMethodIncludes(authOptions.tokenMethod, 'cookie');
+    const usingBearer = tokenMethodIncludes(authOptions.tokenMethod, 'bearer');
+
+    if (usingCookie) {
         if (req.session) {
             if (rememberMe) {
                 req.sessionOptions.maxAge = ms('1y');
             }
             req.session.token = sessionToken;
         }
-    } else {
+    }
+    // The response can already be sent when this runs. For example, AuthGuard runs for
+    // sibling root fields in parallel, and another field's non-null error can send the
+    // response before AuthGuard clears an invalid token.
+    if (usingBearer && !res.headersSent) {
         res.set(authOptions.authTokenHeaderKey, sessionToken);
     }
 }

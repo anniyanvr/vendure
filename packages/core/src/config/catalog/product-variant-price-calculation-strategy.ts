@@ -1,14 +1,23 @@
 import { RequestContext } from '../../api/common/request-context';
 import { PriceCalculationResult } from '../../common/types/common-types';
 import { InjectableStrategy } from '../../common/types/injectable-strategy';
-import { TaxCategory, Zone } from '../../entity/index';
-import { TaxRateService } from '../../service/services/tax-rate.service';
+import { ProductVariantPrice } from '../../entity/product-variant/product-variant-price.entity';
+import { ProductVariant } from '../../entity/product-variant/product-variant.entity';
+import { TaxCategory } from '../../entity/tax-category/tax-category.entity';
+import { Zone } from '../../entity/zone/zone.entity';
 
 /**
  * @description
  * Defines how ProductVariant are calculated based on the input price, tax zone and current request context.
  *
- * @docsCategory configuration
+ * :::info
+ *
+ * This is configured via the `catalogOptions.productVariantPriceCalculationStrategy` property of
+ * your VendureConfig.
+ *
+ * :::
+ *
+ * @docsCategory  products & stock
  * @docsPage ProductVariantPriceCalculationStrategy
  */
 export interface ProductVariantPriceCalculationStrategy extends InjectableStrategy {
@@ -17,23 +26,18 @@ export interface ProductVariantPriceCalculationStrategy extends InjectableStrate
 
 /**
  * @description
- * The arguments passed the the `calculate` method of the configured {@link ProductVariantPriceCalculationStrategy}.
+ * The arguments passed the `calculate` method of the configured {@link ProductVariantPriceCalculationStrategy}.
  *
- * @docsCategory configuration
+ * The `productVariant` argument was added in v2.1.0.
+ *
+ * @docsCategory products & stock
  * @docsPage ProductVariantPriceCalculationStrategy
  */
 export interface ProductVariantPriceCalculationArgs {
     inputPrice: number;
+    productVariantPrice?: ProductVariantPrice;
+    productVariant: ProductVariant;
     taxCategory: TaxCategory;
     activeTaxZone: Zone;
     ctx: RequestContext;
 }
-
-/**
- * @description
- * This is an alias of {@link ProductVariantPriceCalculationStrategy} to preserve compatibility when upgrading.
- *
- * @deprecated Use ProductVariantPriceCalculationStrategy
- * @docsCategory tax
- */
-export interface TaxCalculationStrategy extends ProductVariantPriceCalculationStrategy {}

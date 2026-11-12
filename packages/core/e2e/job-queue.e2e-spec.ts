@@ -1,17 +1,19 @@
+import { JobState } from '@vendure/common/lib/generated-types';
 import { DefaultJobQueuePlugin, mergeConfig } from '@vendure/core';
 import { createTestEnvironment } from '@vendure/testing';
-import gql from 'graphql-tag';
 import path from 'path';
+import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 import { initialData } from '../../../e2e-common/e2e-initial-data';
-import { testConfig, TEST_SETUP_TIMEOUT_MS } from '../../../e2e-common/test-config';
+import { TEST_SETUP_TIMEOUT_MS, testConfig } from '../../../e2e-common/test-config';
 
 import { PluginWithJobQueue } from './fixtures/test-plugins/with-job-queue';
-import { CancelJob, GetRunningJobs, JobState } from './graphql/generated-e2e-admin-types';
-import { GET_RUNNING_JOBS } from './graphql/shared-definitions';
+import { cancelJobDocument, getRunningJobsDocument } from './graphql/shared-definitions';
+import { pollUntil } from './utils/poll-until';
 
 describe('JobQueue', () => {
-    if (testConfig.dbConnectionOptions.type === 'sqljs') {
+    const activeConfig = testConfig();
+    if (activeConfig.dbConnectionOptions.type === 'sqljs') {
         it.only('skip JobQueue tests for sqljs', () => {
             // The tests in this suite will fail when running on sqljs because
             // the DB state is not persisted after shutdown. In this case it is
@@ -22,8 +24,14 @@ describe('JobQueue', () => {
     }
 
     const { server, adminClient } = createTestEnvironment(
-        mergeConfig(testConfig, {
-            plugins: [DefaultJobQueuePlugin, PluginWithJobQueue],
+        mergeConfig(activeConfig, {
+            plugins: [
+                DefaultJobQueuePlugin.init({
+                    pollInterval: 50,
+                    gracefulShutdownTimeout: 1_000,
+                }),
+                PluginWithJobQueue,
+            ],
         }),
     );
 
@@ -44,7 +52,7 @@ describe('JobQueue', () => {
 
     function getJobsInTestQueue(state?: JobState) {
         return adminClient
-            .query<GetRunningJobs.Query, GetRunningJobs.Variables>(GET_RUNNING_JOBS, {
+            .query(getRunningJobsDocument, {
                 options: {
                     filter: {
                         queueName: {
@@ -64,7 +72,7 @@ describe('JobQueue', () => {
     let testJobId: string;
 
     it('creates and starts running a job', async () => {
-        const restControllerUrl = `http://localhost:${testConfig.apiOptions.port}/run-job`;
+        const restControllerUrl = `http://localhost:${activeConfig.apiOptions.port}/run-job`;
         await adminClient.fetch(restControllerUrl);
 
         await sleep(300);
@@ -108,7 +116,7 @@ describe('JobQueue', () => {
 
     it('cancels a running job', async () => {
         PluginWithJobQueue.jobHasDoneWork = false;
-        const restControllerUrl = `http://localhost:${testConfig.apiOptions.port}/run-job`;
+        const restControllerUrl = `http://localhost:${activeConfig.apiOptions.port}/run-job`;
         await adminClient.fetch(restControllerUrl);
 
         await sleep(300);
@@ -119,7 +127,7 @@ describe('JobQueue', () => {
         expect(PluginWithJobQueue.jobHasDoneWork).toBe(false);
         const jobId = jobs.items[0].id;
 
-        const { cancelJob } = await adminClient.query<CancelJob.Mutation, CancelJob.Variables>(CANCEL_JOB, {
+        const { cancelJob } = await adminClient.query(cancelJobDocument, {
             id: jobId,
         });
 
@@ -130,29 +138,54 @@ describe('JobQueue', () => {
         const jobs2 = await getJobsInTestQueue(JobState.CANCELLED);
         expect(jobs.items.length).toBe(1);
         expect(jobs.items[0].id).toBe(jobId);
+
+        PluginWithJobQueue.jobSubject.next();
     });
 
     it('subscribe to result of job', async () => {
-        const restControllerUrl = `http://localhost:${testConfig.apiOptions.port}/run-job/subscribe`;
+        const restControllerUrl = `http://localhost:${activeConfig.apiOptions.port}/run-job/subscribe`;
         const result = await adminClient.fetch(restControllerUrl);
 
         expect(await result.text()).toBe('42!');
         const jobs = await getJobsInTestQueue(JobState.RUNNING);
         expect(jobs.items.length).toBe(0);
     });
+
+    it('subscribable that times out', async () => {
+        const restControllerUrl = `http://localhost:${activeConfig.apiOptions.port}/run-job/subscribe-timeout`;
+        const result = await adminClient.fetch(restControllerUrl);
+
+        expect(result.status).toBe(200);
+        expect(await result.text()).toBe('Job subscription timed out. The job may still be running');
+
+        // The subscription timeout (100ms) elapsing does not guarantee the worker has
+        // already picked the job up on a real database, only that it is queued. Poll
+        // rather than assert immediately, or this flakes under CI load (#5371).
+        await pollUntil(async () => (await getJobsInTestQueue(JobState.RUNNING)).items.length === 1);
+        const jobs = await getJobsInTestQueue(JobState.RUNNING);
+        expect(jobs.items.length).toBe(1);
+    });
+
+    it('server still running after timeout', async () => {
+        const jobs = await getJobsInTestQueue(JobState.RUNNING);
+        expect(jobs.items.length).toBe(1);
+    });
+
+    // https://github.com/vendure-ecommerce/vendure/issues/4112
+    it('updates() should emit multiple times until job completes', async () => {
+        const restControllerUrl = `http://localhost:${activeConfig.apiOptions.port}/run-job/subscribe-all-updates`;
+        const response = await adminClient.fetch(restControllerUrl);
+        const result = JSON.parse(await response.text());
+
+        // Job does 4 progress steps (25%, 50%, 75%, 100%), so we should see at least 3 distinct updates
+        expect(result.updateCount).toBeGreaterThanOrEqual(3);
+        // Final state should be COMPLETED
+        expect(result.finalState).toBe(JobState.COMPLETED);
+        // Final result should be what the job returned
+        expect(result.finalResult).toBe('completed');
+    });
 });
 
 function sleep(ms: number): Promise<void> {
     return new Promise(resolve => setTimeout(resolve, ms));
 }
-
-const CANCEL_JOB = gql`
-    mutation CancelJob($id: ID!) {
-        cancelJob(jobId: $id) {
-            id
-            state
-            isSettled
-            settledAt
-        }
-    }
-`;

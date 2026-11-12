@@ -4,25 +4,27 @@ import {
     Injector,
     ProductService,
     ShippingEligibilityChecker,
+    TransactionalConnection,
 } from '@vendure/core';
 import { createTestEnvironment } from '@vendure/testing';
 import path from 'path';
+import { vi } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 import { initialData } from '../../../e2e-common/e2e-initial-data';
-import { TEST_SETUP_TIMEOUT_MS, testConfig } from '../../../e2e-common/test-config';
-import { TransactionalConnection } from '../src/service/transaction/transactional-connection';
+import { testConfig, TEST_SETUP_TIMEOUT_MS } from '../../../e2e-common/test-config';
 
-const strategyInitSpy = jest.fn();
-const strategyDestroySpy = jest.fn();
-const codInitSpy = jest.fn();
-const codDestroySpy = jest.fn();
+const strategyInitSpy = vi.fn();
+const strategyDestroySpy = vi.fn();
+const codInitSpy = vi.fn();
+const codDestroySpy = vi.fn();
 
 class TestIdStrategy extends AutoIncrementIdStrategy {
     async init(injector: Injector) {
         const productService = injector.get(ProductService);
         const connection = injector.get(TransactionalConnection);
         await new Promise(resolve => setTimeout(resolve, 100));
-        strategyInitSpy(productService.constructor.name, connection.rawConnection.name);
+        strategyInitSpy(productService.constructor.name, connection.rawConnection.isInitialized);
     }
 
     async destroy() {
@@ -39,7 +41,7 @@ const testShippingEligChecker = new ShippingEligibilityChecker({
         const productService = injector.get(ProductService);
         const connection = injector.get(TransactionalConnection);
         await new Promise(resolve => setTimeout(resolve, 100));
-        codInitSpy(productService.constructor.name, connection.rawConnection.name);
+        codInitSpy(productService.constructor.name, connection.rawConnection.isInitialized);
     },
     destroy: async () => {
         await new Promise(resolve => setTimeout(resolve, 100));
@@ -52,8 +54,8 @@ const testShippingEligChecker = new ShippingEligibilityChecker({
 
 describe('lifecycle hooks for configurable objects', () => {
     const { server, adminClient } = createTestEnvironment({
-        ...testConfig,
-        entityIdStrategy: new TestIdStrategy(),
+        ...testConfig(),
+        entityOptions: { entityIdStrategy: new TestIdStrategy() },
         shippingOptions: {
             shippingEligibilityCheckers: [defaultShippingEligibilityChecker, testShippingEligChecker],
         },
@@ -72,7 +74,7 @@ describe('lifecycle hooks for configurable objects', () => {
         it('runs init with Injector', () => {
             expect(strategyInitSpy).toHaveBeenCalled();
             expect(strategyInitSpy.mock.calls[0][0]).toEqual('ProductService');
-            expect(strategyInitSpy.mock.calls[0][1]).toBe('default');
+            expect(strategyInitSpy.mock.calls[0][1]).toBe(true);
         });
 
         it('runs destroy', async () => {
@@ -93,7 +95,7 @@ describe('lifecycle hooks for configurable objects', () => {
         it('runs init with Injector', () => {
             expect(codInitSpy).toHaveBeenCalled();
             expect(codInitSpy.mock.calls[0][0]).toEqual('ProductService');
-            expect(codInitSpy.mock.calls[0][1]).toBe('default');
+            expect(codInitSpy.mock.calls[0][1]).toBe(true);
         });
 
         it('runs destroy', async () => {

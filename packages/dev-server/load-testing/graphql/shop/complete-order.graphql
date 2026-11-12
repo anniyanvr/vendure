@@ -1,4 +1,4 @@
-mutation SetShippingMethod($id: ID!) {
+mutation SetShippingMethod($id: [ID!]!) {
     setOrderShippingMethod(shippingMethodId: $id) {
         ...on Order {
             code
@@ -10,7 +10,7 @@ mutation SetShippingMethod($id: ID!) {
         }
     }
     addPaymentToOrder(input: {
-        method: "example-payment-provider",
+        method: "standard-payment",
         metadata: {}
     }) {
         ...on Order {

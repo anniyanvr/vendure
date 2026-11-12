@@ -1,10 +1,9 @@
-import { Module, Provider, Type as NestType } from '@nestjs/common';
+import { DynamicModule, Module, ModuleMetadata, Type as NestType, Provider } from '@nestjs/common';
 import { MODULE_METADATA } from '@nestjs/common/constants';
-import { ModuleMetadata } from '@nestjs/common/interfaces';
 import { APP_FILTER, APP_GUARD, APP_INTERCEPTOR, APP_PIPE } from '@nestjs/core';
 import { pick } from '@vendure/common/lib/pick';
 import { Type } from '@vendure/common/lib/shared-types';
-import { DocumentNode } from 'graphql';
+import { DocumentNode, GraphQLScalarType, GraphQLSchema } from 'graphql';
 
 import { RuntimeVendureConfig } from '../config/vendure-config';
 
@@ -21,6 +20,14 @@ import { PLUGIN_METADATA } from './plugin-metadata';
  * @docsPage VendurePluginMetadata
  */
 export interface VendurePluginMetadata extends ModuleMetadata {
+    /**
+     * @description
+     * Other Vendure plugins that this plugin composes. Vendure registers these plugins before this plugin
+     * and adds them to its NestJS module imports.
+     *
+     * @since 3.8.0
+     */
+    plugins?: Array<Type<any> | DynamicModule>;
     /**
      * @description
      * A function which can modify the {@link VendureConfig} object before the server bootstraps.
@@ -42,7 +49,32 @@ export interface VendurePluginMetadata extends ModuleMetadata {
      * @description
      * The plugin may define custom [TypeORM database entities](https://typeorm.io/#/entities).
      */
-    entities?: Array<Type<any>>;
+    entities?: Array<Type<any>> | (() => Array<Type<any>>);
+    dashboard?: DashboardExtension;
+    /**
+     * @description
+     * The plugin should define a valid [semver version string](https://www.npmjs.com/package/semver) to indicate which versions of
+     * the Vendure Framework it is compatible with. Attempting to use a plugin with an incompatible
+     * version of Vendure will result in an error and the server will be unable to bootstrap.
+     *
+     * If a plugin does not define this property, a message will be logged on bootstrap that the plugin is not
+     * guaranteed to be compatible with the current version of Vendure.
+     *
+     * To effectively disable this check for a plugin, you can use an overly-permissive string such as `>0.0.0`.
+     *
+     * :::note
+     * Since Vendure v3.1.0, it is possible to ignore compatibility errors for specific plugins by
+     * passing the `ignoreCompatibilityErrorsForPlugins` option to the {@link bootstrap} function.
+     * :::
+     *
+     * @example
+     * ```ts
+     * compatibility: '^3.0.0'
+     * ```
+     *
+     * @since 2.0.0
+     */
+    compatibility?: string;
 }
 /**
  * @description
@@ -56,22 +88,32 @@ export interface APIExtensionDefinition {
     /**
      * @description
      * Extensions to the schema.
+     * Passes the current schema as an optional argument, allowing the extension to be based on the existing schema.
      *
      * @example
-     * ```TypeScript
+     * ```ts
      * const schema = gql`extend type SearchReindexResponse {
      *     timeTaken: Int!
      *     indexedItemCount: Int!
      * }`;
      * ```
      */
-    schema?: DocumentNode | (() => DocumentNode);
+    schema?: DocumentNode | ((schema?: GraphQLSchema) => DocumentNode | undefined);
     /**
      * @description
      * An array of resolvers for the schema extensions. Should be defined as [Nestjs GraphQL resolver](https://docs.nestjs.com/graphql/resolvers-map)
      * classes, i.e. using the Nest `\@Resolver()` decorator etc.
      */
-    resolvers: Array<Type<any>> | (() => Array<Type<any>>);
+    resolvers?: Array<Type<any>> | (() => Array<Type<any>>);
+    /**
+     * @description
+     * A map of GraphQL scalar types which should correspond to any custom scalars defined in your schema.
+     * Read more about defining custom scalars in the
+     * [Apollo Server Custom Scalars docs](https://www.apollographql.com/docs/apollo-server/schema/custom-scalars)
+     *
+     * @since 1.7.0
+     */
+    scalars?: Record<string, GraphQLScalarType> | (() => Record<string, GraphQLScalarType>);
 }
 
 /**
@@ -85,6 +127,12 @@ export type PluginConfigurationFn = (
     config: RuntimeVendureConfig,
 ) => RuntimeVendureConfig | Promise<RuntimeVendureConfig>;
 
+export type DashboardExtension =
+    | string
+    | {
+          location: string;
+      };
+
 /**
  * @description
  * The VendurePlugin decorator is a means of configuring and/or extending the functionality of the Vendure server. A Vendure plugin is
@@ -95,7 +143,7 @@ export type PluginConfigurationFn = (
  * entirely new types. Database entities and resolvers can also be defined to handle the extended GraphQL types.
  *
  * @example
- * ```TypeScript
+ * ```ts
  * import { Controller, Get } from '\@nestjs/common';
  * import { Ctx, PluginCommonModule, ProductService, RequestContext, VendurePlugin } from '\@vendure/core';
  *
@@ -121,7 +169,7 @@ export type PluginConfigurationFn = (
  * @docsCategory plugin
  */
 export function VendurePlugin(pluginMetadata: VendurePluginMetadata): ClassDecorator {
-    // tslint:disable-next-line:ban-types
+    // eslint-disable-next-line @typescript-eslint/no-unsafe-function-type
     return (target: Function) => {
         for (const metadataProperty of Object.values(PLUGIN_METADATA)) {
             const property = metadataProperty as keyof VendurePluginMetadata;
@@ -130,12 +178,16 @@ export function VendurePlugin(pluginMetadata: VendurePluginMetadata): ClassDecor
             }
         }
         const nestModuleMetadata = pick(pluginMetadata, Object.values(MODULE_METADATA) as any);
+        nestModuleMetadata.imports = [
+            ...(nestModuleMetadata.imports ?? []),
+            ...(pluginMetadata.plugins ?? []),
+        ];
         // Automatically add any of the Plugin's "providers" to the "exports" array. This is done
         // because when a plugin defines GraphQL resolvers, these resolvers are used to dynamically
         // created a new Module in the ApiModule, and if those resolvers depend on any providers,
         // the must be exported. See the function {@link createDynamicGraphQlModulesForPlugins}
         // for the implementation.
-        // However, we must omit any global providers (https://github.com/vendure-ecommerce/vendure/issues/837)
+        // However, we must omit any global providers (https://github.com/vendurehq/vendure/issues/837)
         const nestGlobalProviderTokens = [APP_INTERCEPTOR, APP_FILTER, APP_GUARD, APP_PIPE];
         const exportedProviders = (nestModuleMetadata.providers || []).filter(provider => {
             if (isNamedProvider(provider)) {

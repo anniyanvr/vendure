@@ -1,0 +1,115 @@
+---
+title: "RoleService"
+generated: true
+---
+<GenerationInfo sourceFile="packages/core/src/service/services/role.service.ts" sourceLine="57" packageName="@vendure/core" />
+
+Contains methods relating to [Role](/reference/typescript-api/entities/role#role) entities.
+
+```ts title="Signature"
+class RoleService {
+    constructor(connection: TransactionalConnection, channelService: ChannelService, listQueryBuilder: ListQueryBuilder, configService: ConfigService, eventBus: EventBus, requestContextCache: RequestContextCacheService, cacheService: CacheService, customFieldRelationService: CustomFieldRelationService)
+    initRoles() => ;
+    findAll(ctx: RequestContext, options?: ListQueryOptions<Role>, relations?: RelationPaths<Role>) => Promise<PaginatedList<Role>>;
+    findOne(ctx: RequestContext, roleId: ID, relations?: RelationPaths<Role>) => Promise<Role | undefined>;
+    activeUserHasPermissionsOfRoles(ctx: RequestContext, roleIds: ID[]) => Promise<boolean>;
+    getChannelsForRole(ctx: RequestContext, roleId: ID) => Promise<Channel[]>;
+    getSuperAdminRole(ctx?: RequestContext) => Promise<Role>;
+    getCustomerRole(ctx?: RequestContext) => Promise<Role>;
+    getAllPermissions() => string[];
+    userHasPermissionOnChannel(ctx: RequestContext, channelId: ID, permission: Permission) => Promise<boolean>;
+    userHasAnyPermissionsOnChannel(ctx: RequestContext, channelId: ID, permissions: Permission[]) => Promise<boolean>;
+    userHasAllPermissionsOnChannel(ctx: RequestContext, channelId: ID, permissions: Permission[]) => Promise<boolean>;
+    create(ctx: RequestContext, input: CreateRoleInput) => Promise<Role>;
+    update(ctx: RequestContext, input: UpdateRoleInput) => Promise<Role>;
+    delete(ctx: RequestContext, id: ID) => Promise<DeletionResponse>;
+    assignRoleToChannel(ctx: RequestContext, roleId: ID, channelId: ID) => ;
+}
+```
+
+<div className="members-wrapper">
+
+### initRoles
+
+<MemberInfo kind="method" type={`() => `}   />
+
+
+### findAll
+
+<MemberInfo kind="method" type={`(ctx: <a href='/reference/typescript-api/request/request-context#requestcontext'>RequestContext</a>, options?: ListQueryOptions<<a href='/reference/typescript-api/entities/role#role'>Role</a>>, relations?: RelationPaths<<a href='/reference/typescript-api/entities/role#role'>Role</a>>) => Promise<<a href='/reference/typescript-api/common/paginated-list#paginatedlist'>PaginatedList</a><<a href='/reference/typescript-api/entities/role#role'>Role</a>>>`}   />
+
+
+### findOne
+
+<MemberInfo kind="method" type={`(ctx: <a href='/reference/typescript-api/request/request-context#requestcontext'>RequestContext</a>, roleId: <a href='/reference/typescript-api/common/id#id'>ID</a>, relations?: RelationPaths<<a href='/reference/typescript-api/entities/role#role'>Role</a>>) => Promise<<a href='/reference/typescript-api/entities/role#role'>Role</a> | undefined>`}   />
+
+
+### activeUserHasPermissionsOfRoles
+
+<MemberInfo kind="method" type={`(ctx: <a href='/reference/typescript-api/request/request-context#requestcontext'>RequestContext</a>, roleIds: <a href='/reference/typescript-api/common/id#id'>ID</a>[]) => Promise<boolean>`}  since="3.7.3"  />
+
+Returns `true` if the active user holds every Permission granted by the given Roles, on every
+Channel to which those Roles are assigned. This is the one rule which decides whether the active
+user may read a Role, grant it to an Administrator, or see an Administrator who holds it.
+
+The Roles are always read from the database, never from the Role cache. The answer authorises
+writes, and a Role missing from a stale cache would be treated as granting nothing, which is
+the wrong direction to fail in.
+### getChannelsForRole
+
+<MemberInfo kind="method" type={`(ctx: <a href='/reference/typescript-api/request/request-context#requestcontext'>RequestContext</a>, roleId: <a href='/reference/typescript-api/common/id#id'>ID</a>) => Promise<<a href='/reference/typescript-api/entities/channel#channel'>Channel</a>[]>`}   />
+
+
+### getSuperAdminRole
+
+<MemberInfo kind="method" type={`(ctx?: <a href='/reference/typescript-api/request/request-context#requestcontext'>RequestContext</a>) => Promise<<a href='/reference/typescript-api/entities/role#role'>Role</a>>`}   />
+
+Returns the special SuperAdmin Role, which always exists in Vendure.
+### getCustomerRole
+
+<MemberInfo kind="method" type={`(ctx?: <a href='/reference/typescript-api/request/request-context#requestcontext'>RequestContext</a>) => Promise<<a href='/reference/typescript-api/entities/role#role'>Role</a>>`}   />
+
+Returns the special Customer Role, which always exists in Vendure.
+### getAllPermissions
+
+<MemberInfo kind="method" type={`() => string[]`}   />
+
+Returns all the valid Permission values
+### userHasPermissionOnChannel
+
+<MemberInfo kind="method" type={`(ctx: <a href='/reference/typescript-api/request/request-context#requestcontext'>RequestContext</a>, channelId: <a href='/reference/typescript-api/common/id#id'>ID</a>, permission: <a href='/reference/typescript-api/common/permission#permission'>Permission</a>) => Promise<boolean>`}   />
+
+Returns true if the User has the specified permission on that Channel
+### userHasAnyPermissionsOnChannel
+
+<MemberInfo kind="method" type={`(ctx: <a href='/reference/typescript-api/request/request-context#requestcontext'>RequestContext</a>, channelId: <a href='/reference/typescript-api/common/id#id'>ID</a>, permissions: <a href='/reference/typescript-api/common/permission#permission'>Permission</a>[]) => Promise<boolean>`}   />
+
+Returns true if the User has any of the specified permissions on that Channel
+### userHasAllPermissionsOnChannel
+
+<MemberInfo kind="method" type={`(ctx: <a href='/reference/typescript-api/request/request-context#requestcontext'>RequestContext</a>, channelId: <a href='/reference/typescript-api/common/id#id'>ID</a>, permissions: <a href='/reference/typescript-api/common/permission#permission'>Permission</a>[]) => Promise<boolean>`}   />
+
+Returns true if the User has all the specified permissions on that Channel
+### create
+
+<MemberInfo kind="method" type={`(ctx: <a href='/reference/typescript-api/request/request-context#requestcontext'>RequestContext</a>, input: CreateRoleInput) => Promise<<a href='/reference/typescript-api/entities/role#role'>Role</a>>`}   />
+
+
+### update
+
+<MemberInfo kind="method" type={`(ctx: <a href='/reference/typescript-api/request/request-context#requestcontext'>RequestContext</a>, input: UpdateRoleInput) => Promise<<a href='/reference/typescript-api/entities/role#role'>Role</a>>`}   />
+
+
+### delete
+
+<MemberInfo kind="method" type={`(ctx: <a href='/reference/typescript-api/request/request-context#requestcontext'>RequestContext</a>, id: <a href='/reference/typescript-api/common/id#id'>ID</a>) => Promise<DeletionResponse>`}   />
+
+
+### assignRoleToChannel
+
+<MemberInfo kind="method" type={`(ctx: <a href='/reference/typescript-api/request/request-context#requestcontext'>RequestContext</a>, roleId: <a href='/reference/typescript-api/common/id#id'>ID</a>, channelId: <a href='/reference/typescript-api/common/id#id'>ID</a>) => `}   />
+
+
+
+
+</div>

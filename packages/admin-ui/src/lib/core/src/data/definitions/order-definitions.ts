@@ -12,6 +12,17 @@ export const DISCOUNT_FRAGMENT = gql`
     }
 `;
 
+export const PAYMENT_FRAGMENT = gql`
+    fragment Payment on Payment {
+        id
+        transactionId
+        amount
+        method
+        state
+        metadata
+    }
+`;
+
 export const REFUND_FRAGMENT = gql`
     fragment Refund on Refund {
         id
@@ -44,11 +55,13 @@ export const ORDER_FRAGMENT = gql`
         id
         createdAt
         updatedAt
+        type
         orderPlacedAt
         code
         state
         nextStates
         total
+        totalWithTax
         currencyCode
         customer {
             id
@@ -71,16 +84,50 @@ export const FULFILLMENT_FRAGMENT = gql`
         createdAt
         updatedAt
         method
-        orderItems {
-            id
+        lines {
+            orderLineId
+            quantity
         }
         trackingCode
+    }
+`;
+
+export const PAYMENT_WITH_REFUNDS_FRAGMENT = gql`
+    fragment PaymentWithRefunds on Payment {
+        id
+        createdAt
+        transactionId
+        amount
+        method
+        state
+        nextStates
+        errorMessage
+        metadata
+        refunds {
+            id
+            createdAt
+            state
+            items
+            adjustment
+            total
+            paymentId
+            reason
+            transactionId
+            method
+            metadata
+            lines {
+                orderLineId
+                quantity
+            }
+        }
     }
 `;
 
 export const ORDER_LINE_FRAGMENT = gql`
     fragment OrderLine on OrderLine {
         id
+        createdAt
+        updatedAt
         featuredAsset {
             preview
         }
@@ -90,26 +137,24 @@ export const ORDER_LINE_FRAGMENT = gql`
             sku
             trackInventory
             stockOnHand
+            product {
+                id
+                name
+            }
         }
         discounts {
             ...Discount
+        }
+        fulfillmentLines {
+            fulfillmentId
+            quantity
         }
         unitPrice
         unitPriceWithTax
         proratedUnitPrice
         proratedUnitPriceWithTax
         quantity
-        items {
-            id
-            unitPrice
-            unitPriceWithTax
-            taxRate
-            refundId
-            cancelled
-            fulfillment {
-                ...Fulfillment
-            }
-        }
+        orderPlacedQuantity
         linePrice
         lineTax
         linePriceWithTax
@@ -123,10 +168,24 @@ export const ORDER_DETAIL_FRAGMENT = gql`
         id
         createdAt
         updatedAt
+        type
+        aggregateOrder {
+            id
+            code
+        }
+        sellerOrders {
+            id
+            code
+            channels {
+                id
+                code
+            }
+        }
         code
         state
         nextStates
         active
+        couponCodes
         customer {
             id
             firstName
@@ -158,6 +217,8 @@ export const ORDER_DETAIL_FRAGMENT = gql`
         shipping
         shippingWithTax
         shippingLines {
+            id
+            discountedPriceWithTax
             shippingMethod {
                 id
                 code
@@ -179,31 +240,7 @@ export const ORDER_DETAIL_FRAGMENT = gql`
             ...OrderAddress
         }
         payments {
-            id
-            createdAt
-            transactionId
-            amount
-            method
-            state
-            nextStates
-            errorMessage
-            metadata
-            refunds {
-                id
-                createdAt
-                state
-                items
-                adjustment
-                total
-                paymentId
-                reason
-                transactionId
-                method
-                metadata
-                orderItems {
-                    id
-                }
-            }
+            ...PaymentWithRefunds
         }
         fulfillments {
             ...Fulfillment
@@ -218,8 +255,9 @@ export const ORDER_DETAIL_FRAGMENT = gql`
                 id
                 amount
             }
-            orderItems {
-                id
+            lines {
+                orderLineId
+                quantity
             }
             refund {
                 id
@@ -235,6 +273,7 @@ export const ORDER_DETAIL_FRAGMENT = gql`
     ${ORDER_ADDRESS_FRAGMENT}
     ${FULFILLMENT_FRAGMENT}
     ${ORDER_LINE_FRAGMENT}
+    ${PAYMENT_WITH_REFUNDS_FRAGMENT}
 `;
 
 export const GET_ORDERS_LIST = gql`
@@ -261,14 +300,7 @@ export const GET_ORDER = gql`
 export const SETTLE_PAYMENT = gql`
     mutation SettlePayment($id: ID!) {
         settlePayment(id: $id) {
-            ... on Payment {
-                id
-                transactionId
-                amount
-                method
-                state
-                metadata
-            }
+            ...Payment
             ...ErrorResult
             ... on SettlePaymentError {
                 paymentErrorMessage
@@ -282,25 +314,37 @@ export const SETTLE_PAYMENT = gql`
         }
     }
     ${ERROR_RESULT_FRAGMENT}
+    ${PAYMENT_FRAGMENT}
+`;
+
+export const CANCEL_PAYMENT = gql`
+    mutation CancelPayment($id: ID!) {
+        cancelPayment(id: $id) {
+            ...Payment
+            ...ErrorResult
+            ... on CancelPaymentError {
+                paymentErrorMessage
+            }
+            ... on PaymentStateTransitionError {
+                transitionError
+            }
+        }
+    }
+    ${ERROR_RESULT_FRAGMENT}
+    ${PAYMENT_FRAGMENT}
 `;
 
 export const TRANSITION_PAYMENT_TO_STATE = gql`
     mutation TransitionPaymentToState($id: ID!, $state: String!) {
         transitionPaymentToState(id: $id, state: $state) {
-            ... on Payment {
-                id
-                transactionId
-                amount
-                method
-                state
-                metadata
-            }
+            ...Payment
             ...ErrorResult
             ... on PaymentStateTransitionError {
                 transitionError
             }
         }
     }
+    ${PAYMENT_FRAGMENT}
     ${ERROR_RESULT_FRAGMENT}
 `;
 
@@ -308,6 +352,16 @@ export const CREATE_FULFILLMENT = gql`
     mutation CreateFulfillment($input: FulfillOrderInput!) {
         addFulfillmentToOrder(input: $input) {
             ...Fulfillment
+            ... on CreateFulfillmentError {
+                errorCode
+                message
+                fulfillmentHandlerError
+            }
+            ... on FulfillmentStateTransitionError {
+                errorCode
+                message
+                transitionError
+            }
             ...ErrorResult
         }
     }
@@ -435,19 +489,6 @@ export const TRANSITION_FULFILLMENT_TO_STATE = gql`
     ${ERROR_RESULT_FRAGMENT}
 `;
 
-export const GET_ORDER_SUMMARY = gql`
-    query GetOrderSummary($start: DateTime!, $end: DateTime!) {
-        orders(options: { filter: { orderPlacedAt: { between: { start: $start, end: $end } } } }) {
-            totalItems
-            items {
-                id
-                total
-                currencyCode
-            }
-        }
-    }
-`;
-
 export const MODIFY_ORDER = gql`
     mutation ModifyOrder($input: ModifyOrderInput!) {
         modifyOrder(input: $input) {
@@ -462,6 +503,149 @@ export const MODIFY_ORDER = gql`
 export const ADD_MANUAL_PAYMENT_TO_ORDER = gql`
     mutation AddManualPayment($input: ManualPaymentInput!) {
         addManualPaymentToOrder(input: $input) {
+            ...OrderDetail
+            ...ErrorResult
+        }
+    }
+    ${ORDER_DETAIL_FRAGMENT}
+    ${ERROR_RESULT_FRAGMENT}
+`;
+
+export const CREATE_DRAFT_ORDER = gql`
+    mutation CreateDraftOrder {
+        createDraftOrder {
+            ...OrderDetail
+        }
+    }
+    ${ORDER_DETAIL_FRAGMENT}
+`;
+
+export const DELETE_DRAFT_ORDER = gql`
+    mutation DeleteDraftOrder($orderId: ID!) {
+        deleteDraftOrder(orderId: $orderId) {
+            result
+            message
+        }
+    }
+`;
+
+export const ADD_ITEM_TO_DRAFT_ORDER = gql`
+    mutation AddItemToDraftOrder($orderId: ID!, $input: AddItemToDraftOrderInput!) {
+        addItemToDraftOrder(orderId: $orderId, input: $input) {
+            ...OrderDetail
+            ...ErrorResult
+        }
+    }
+    ${ORDER_DETAIL_FRAGMENT}
+    ${ERROR_RESULT_FRAGMENT}
+`;
+
+export const ADJUST_DRAFT_ORDER_LINE = gql`
+    mutation AdjustDraftOrderLine($orderId: ID!, $input: AdjustDraftOrderLineInput!) {
+        adjustDraftOrderLine(orderId: $orderId, input: $input) {
+            ...OrderDetail
+            ...ErrorResult
+        }
+    }
+    ${ORDER_DETAIL_FRAGMENT}
+    ${ERROR_RESULT_FRAGMENT}
+`;
+
+export const REMOVE_DRAFT_ORDER_LINE = gql`
+    mutation RemoveDraftOrderLine($orderId: ID!, $orderLineId: ID!) {
+        removeDraftOrderLine(orderId: $orderId, orderLineId: $orderLineId) {
+            ...OrderDetail
+            ...ErrorResult
+        }
+    }
+    ${ORDER_DETAIL_FRAGMENT}
+    ${ERROR_RESULT_FRAGMENT}
+`;
+
+export const SET_CUSTOMER_FOR_DRAFT_ORDER = gql`
+    mutation SetCustomerForDraftOrder($orderId: ID!, $customerId: ID, $input: CreateCustomerInput) {
+        setCustomerForDraftOrder(orderId: $orderId, customerId: $customerId, input: $input) {
+            ...OrderDetail
+            ...ErrorResult
+        }
+    }
+    ${ORDER_DETAIL_FRAGMENT}
+    ${ERROR_RESULT_FRAGMENT}
+`;
+
+export const SET_SHIPPING_ADDRESS_FOR_DRAFT_ORDER = gql`
+    mutation SetDraftOrderShippingAddress($orderId: ID!, $input: CreateAddressInput!) {
+        setDraftOrderShippingAddress(orderId: $orderId, input: $input) {
+            ...OrderDetail
+        }
+    }
+    ${ORDER_DETAIL_FRAGMENT}
+`;
+
+export const SET_BILLING_ADDRESS_FOR_DRAFT_ORDER = gql`
+    mutation SetDraftOrderBillingAddress($orderId: ID!, $input: CreateAddressInput!) {
+        setDraftOrderBillingAddress(orderId: $orderId, input: $input) {
+            ...OrderDetail
+        }
+    }
+    ${ORDER_DETAIL_FRAGMENT}
+`;
+
+export const UNSET_SHIPPING_ADDRESS_FOR_DRAFT_ORDER = gql`
+    mutation UnsetDraftOrderShippingAddress($orderId: ID!) {
+        unsetDraftOrderShippingAddress(orderId: $orderId) {
+            ...OrderDetail
+        }
+    }
+    ${ORDER_DETAIL_FRAGMENT}
+`;
+
+export const UNSET_BILLING_ADDRESS_FOR_DRAFT_ORDER = gql`
+    mutation UnsetDraftOrderBillingAddress($orderId: ID!) {
+        unsetDraftOrderBillingAddress(orderId: $orderId) {
+            ...OrderDetail
+        }
+    }
+    ${ORDER_DETAIL_FRAGMENT}
+`;
+
+export const APPLY_COUPON_CODE_TO_DRAFT_ORDER = gql`
+    mutation ApplyCouponCodeToDraftOrder($orderId: ID!, $couponCode: String!) {
+        applyCouponCodeToDraftOrder(orderId: $orderId, couponCode: $couponCode) {
+            ...OrderDetail
+            ...ErrorResult
+        }
+    }
+    ${ORDER_DETAIL_FRAGMENT}
+    ${ERROR_RESULT_FRAGMENT}
+`;
+
+export const REMOVE_COUPON_CODE_FROM_DRAFT_ORDER = gql`
+    mutation RemoveCouponCodeFromDraftOrder($orderId: ID!, $couponCode: String!) {
+        removeCouponCodeFromDraftOrder(orderId: $orderId, couponCode: $couponCode) {
+            ...OrderDetail
+        }
+    }
+    ${ORDER_DETAIL_FRAGMENT}
+`;
+
+export const DRAFT_ORDER_ELIGIBLE_SHIPPING_METHODS = gql`
+    query DraftOrderEligibleShippingMethods($orderId: ID!) {
+        eligibleShippingMethodsForDraftOrder(orderId: $orderId) {
+            id
+            name
+            code
+            description
+            price
+            priceWithTax
+            metadata
+        }
+    }
+`;
+
+export const SET_DRAFT_ORDER_SHIPPING_METHOD = gql`
+    mutation SetDraftOrderShippingMethod($orderId: ID!, $shippingMethodId: ID!) {
+        setDraftOrderShippingMethod(orderId: $orderId, shippingMethodId: $shippingMethodId) {
             ...OrderDetail
             ...ErrorResult
         }

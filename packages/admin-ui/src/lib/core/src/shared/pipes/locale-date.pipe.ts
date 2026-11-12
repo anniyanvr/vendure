@@ -8,10 +8,18 @@ import { LocaleBasePipe } from './locale-base.pipe';
  * @description
  * A replacement of the Angular DatePipe which makes use of the Intl API
  * to format dates according to the selected UI language.
+ *
+ * @example
+ * ```HTML
+ * {{ order.orderPlacedAt | localeDate }}
+ * ```
+ *
+ * @docsCategory pipes
  */
 @Pipe({
     name: 'localeDate',
     pure: false,
+    standalone: false,
 })
 export class LocaleDatePipe extends LocaleBasePipe implements PipeTransform {
     constructor(@Optional() dataService?: DataService, @Optional() changeDetectorRef?: ChangeDetectorRef) {
@@ -20,7 +28,7 @@ export class LocaleDatePipe extends LocaleBasePipe implements PipeTransform {
     transform(value: unknown, ...args: unknown[]): unknown {
         const [format, locale] = args;
         if (this.locale || typeof locale === 'string') {
-            const activeLocale = typeof locale === 'string' ? locale : this.locale;
+            const activeLocale = this.getActiveLocale(locale);
             const date =
                 value instanceof Date ? value : typeof value === 'string' ? new Date(value) : undefined;
             if (date) {
@@ -40,20 +48,24 @@ export class LocaleDatePipe extends LocaleBasePipe implements PipeTransform {
                     hour: 'numeric',
                     minute: 'numeric',
                     second: 'numeric',
-                    hour12: true,
                 };
             case 'mediumTime':
                 return {
                     hour: 'numeric',
                     minute: 'numeric',
                     second: 'numeric',
-                    hour12: true,
                 };
             case 'longDate':
                 return {
                     year: 'numeric',
                     month: 'long',
                     day: 'numeric',
+                };
+            case 'shortDate':
+                return {
+                    day: 'numeric',
+                    month: 'numeric',
+                    year: '2-digit',
                 };
             case 'short':
                 return {
@@ -62,7 +74,6 @@ export class LocaleDatePipe extends LocaleBasePipe implements PipeTransform {
                     year: '2-digit',
                     hour: 'numeric',
                     minute: 'numeric',
-                    hour12: true,
                 };
             default:
                 return;

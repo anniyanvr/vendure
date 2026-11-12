@@ -1,20 +1,14 @@
-import {
-    ChangeDetectorRef,
-    Directive,
-    EmbeddedViewRef,
-    Input,
-    TemplateRef,
-    ViewContainerRef,
-} from '@angular/core';
+import { ChangeDetectorRef, Directive, Input, TemplateRef, ViewContainerRef } from '@angular/core';
 import { of } from 'rxjs';
-import { tap } from 'rxjs/operators';
+import { map, tap } from 'rxjs/operators';
 
 import { Permission } from '../../common/generated-types';
-import { DataService } from '../../data/providers/data.service';
+import { PermissionsService } from '../../providers/permissions/permissions.service';
 
 import { IfDirectiveBase } from './if-directive-base';
 
 /**
+ * @description
  * Conditionally shows/hides templates based on the current active user having the specified permission.
  * Based on the ngIf source. Also support "else" templates:
  *
@@ -26,9 +20,12 @@ import { IfDirectiveBase } from './if-directive-base';
  *
  * The permission can be a single string, or an array. If an array is passed, then _all_ of the permissions
  * must match (logical AND)
+ *
+ * @docsCategory directives
  */
 @Directive({
     selector: '[vdrIfPermissions]',
+    standalone: false,
 })
 export class IfPermissionsDirective extends IfDirectiveBase<Array<Permission[] | null>> {
     private permissionToCheck: string[] | null = ['__initial_value__'];
@@ -36,8 +33,8 @@ export class IfPermissionsDirective extends IfDirectiveBase<Array<Permission[] |
     constructor(
         _viewContainer: ViewContainerRef,
         templateRef: TemplateRef<any>,
-        private dataService: DataService,
         private changeDetectorRef: ChangeDetectorRef,
+        private permissionsService: PermissionsService,
     ) {
         super(_viewContainer, templateRef, permissions => {
             if (permissions == null) {
@@ -45,17 +42,10 @@ export class IfPermissionsDirective extends IfDirectiveBase<Array<Permission[] |
             } else if (!permissions) {
                 return of(false);
             }
-            return this.dataService.client
-                .userStatus()
-                .mapStream(({ userStatus }) => {
-                    for (const permission of permissions) {
-                        if (!userStatus.permissions.includes(permission)) {
-                            return false;
-                        }
-                    }
-                    return true;
-                })
-                .pipe(tap(() => this.changeDetectorRef.markForCheck()));
+            return this.permissionsService.currentUserPermissions$.pipe(
+                map(() => this.permissionsService.userHasPermissions(permissions)),
+                tap(() => this.changeDetectorRef.markForCheck()),
+            );
         });
     }
 

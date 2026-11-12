@@ -1,61 +1,91 @@
+import { DeletionResult, ErrorCode, LanguageCode, SortOrder } from '@vendure/common/lib/generated-types';
 import { omit } from '@vendure/common/lib/omit';
 import { pick } from '@vendure/common/lib/pick';
 import { notNullOrUndefined } from '@vendure/common/lib/shared-utils';
 import { createErrorResultGuard, createTestEnvironment, ErrorResultGuard } from '@vendure/testing';
-import gql from 'graphql-tag';
 import path from 'path';
+import { Logger as TypeOrmLogger } from 'typeorm';
+import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import type {
+    productVariantFragment,
+    productWithOptionsFragment,
+    productWithVariantsFragment,
+} from './graphql/fragments-admin';
+import type { ResultOf, VariablesOf } from './graphql/graphql-admin';
 
 import { initialData } from '../../../e2e-common/e2e-initial-data';
-import { testConfig, TEST_SETUP_TIMEOUT_MS } from '../../../e2e-common/test-config';
+import { TEST_SETUP_TIMEOUT_MS, testConfig } from '../../../e2e-common/test-config';
 
-import { PRODUCT_WITH_OPTIONS_FRAGMENT } from './graphql/fragments';
+import { graphql } from './graphql/graphql-admin';
 import {
-    AddOptionGroupToProduct,
-    CreateProduct,
-    CreateProductVariants,
-    DeleteProduct,
-    DeleteProductVariant,
-    DeletionResult,
-    ErrorCode,
-    GetAssetList,
-    GetOptionGroup,
-    GetProductList,
-    GetProductSimple,
-    GetProductVariant,
-    GetProductVariantList,
-    GetProductWithVariants,
-    LanguageCode,
-    ProductVariantFragment,
-    ProductWithOptionsFragment,
-    ProductWithVariants,
-    RemoveOptionGroupFromProduct,
-    SortOrder,
-    UpdateProduct,
-    UpdateProductVariants,
-} from './graphql/generated-e2e-admin-types';
-import {
-    ADD_OPTION_GROUP_TO_PRODUCT,
-    CREATE_PRODUCT,
-    CREATE_PRODUCT_VARIANTS,
-    DELETE_PRODUCT,
-    DELETE_PRODUCT_VARIANT,
-    GET_ASSET_LIST,
-    GET_PRODUCT_LIST,
-    GET_PRODUCT_SIMPLE,
-    GET_PRODUCT_WITH_VARIANTS,
-    UPDATE_PRODUCT,
-    UPDATE_PRODUCT_VARIANTS,
+    addOptionGroupToProductDocument,
+    createProductDocument,
+    createProductOptionGroupDocument,
+    createProductVariantsDocument,
+    deleteProductDocument,
+    deleteProductVariantDocument,
+    getAssetListDocument,
+    getOptionGroupDocument,
+    getProductListDocument,
+    getProductSimpleDocument,
+    getProductVariantDocument,
+    getProductVariantListDocument,
+    getProductWithVariantListDocument,
+    getProductWithVariantsDocument,
+    removeOptionGroupFromProductDocument,
+    updateChannelDocument,
+    updateGlobalSettingsDocument,
+    updateProductDocument,
+    updateProductVariantsDocument,
 } from './graphql/shared-definitions';
 import { assertThrowsWithMessage } from './utils/assert-throws-with-message';
 
-// tslint:disable:no-non-null-assertion
+/* eslint-disable @typescript-eslint/no-non-null-assertion */
 
 describe('Product resolver', () => {
-    const { server, adminClient, shopClient } = createTestEnvironment(testConfig);
+    /** The number of SQL queries run since it was last reset to 0. */
+    let sqlQueryCount = 0;
+    const countingLogger: TypeOrmLogger = {
+        logQuery: () => {
+            sqlQueryCount++;
+        },
+        logQueryError: () => undefined,
+        logQuerySlow: () => undefined,
+        logSchemaBuild: () => undefined,
+        logMigration: () => undefined,
+        log: () => undefined,
+    };
+    const config = testConfig();
+    const { server, adminClient, shopClient } = createTestEnvironment({
+        ...config,
+        dbConnectionOptions: {
+            ...config.dbConnectionOptions,
+            logging: ['query'],
+            logger: countingLogger,
+        },
+    });
 
-    const removeOptionGuard: ErrorResultGuard<ProductWithOptionsFragment> = createErrorResultGuard(
-        input => !!input.optionGroups,
-    );
+    const removeOptionGuard: ErrorResultGuard<ResultOf<typeof productWithOptionsFragment>> =
+        createErrorResultGuard(input => !!input && 'optionGroups' in input);
+
+    const updateChannelGuard: ErrorResultGuard<ResultOf<typeof updateChannelDocument>['updateChannel']> =
+        createErrorResultGuard(input => !!input && 'id' in input);
+
+    const productGuard: ErrorResultGuard<
+        NonNullable<ResultOf<typeof getProductWithVariantsDocument>['product']>
+    > = createErrorResultGuard(input => !!input && 'id' in input);
+
+    const variantGuard: ErrorResultGuard<
+        NonNullable<ResultOf<typeof createProductVariantsDocument>['createProductVariants'][number]>
+    > = createErrorResultGuard(input => !!input && 'id' in input);
+
+    const productQueryGuard: ErrorResultGuard<
+        NonNullable<ResultOf<typeof getProductSimpleDocument>['product']>
+    > = createErrorResultGuard(input => !!input && 'id' in input);
+
+    const updateVariantGuard: ErrorResultGuard<
+        NonNullable<ResultOf<typeof updateProductVariantsDocument>['updateProductVariants'][number]>
+    > = createErrorResultGuard(input => !!input && 'id' in input);
 
     beforeAll(async () => {
         await server.init({
@@ -72,79 +102,64 @@ describe('Product resolver', () => {
 
     describe('products list query', () => {
         it('returns all products when no options passed', async () => {
-            const result = await adminClient.query<GetProductList.Query, GetProductList.Variables>(
-                GET_PRODUCT_LIST,
-                {},
-            );
+            const result = await adminClient.query(getProductListDocument, {});
 
             expect(result.products.items.length).toBe(20);
             expect(result.products.totalItems).toBe(20);
         });
 
         it('limits result set with skip & take', async () => {
-            const result = await adminClient.query<GetProductList.Query, GetProductList.Variables>(
-                GET_PRODUCT_LIST,
-                {
-                    options: {
-                        skip: 0,
-                        take: 3,
-                    },
+            const result = await adminClient.query(getProductListDocument, {
+                options: {
+                    skip: 0,
+                    take: 3,
                 },
-            );
+            });
 
             expect(result.products.items.length).toBe(3);
             expect(result.products.totalItems).toBe(20);
         });
 
         it('filters by name admin', async () => {
-            const result = await adminClient.query<GetProductList.Query, GetProductList.Variables>(
-                GET_PRODUCT_LIST,
-                {
-                    options: {
-                        filter: {
-                            name: {
-                                contains: 'skateboard',
-                            },
+            const result = await adminClient.query(getProductListDocument, {
+                options: {
+                    filter: {
+                        name: {
+                            contains: 'skateboard',
                         },
                     },
                 },
-            );
+            });
 
             expect(result.products.items.length).toBe(1);
             expect(result.products.items[0].name).toBe('Cruiser Skateboard');
         });
 
         it('filters multiple admin', async () => {
-            const result = await adminClient.query<GetProductList.Query, GetProductList.Variables>(
-                GET_PRODUCT_LIST,
-                {
-                    options: {
-                        filter: {
-                            name: {
-                                contains: 'camera',
-                            },
-                            slug: {
-                                contains: 'tent',
-                            },
+            const result = await adminClient.query(getProductListDocument, {
+                options: {
+                    filter: {
+                        name: {
+                            contains: 'camera',
+                        },
+                        slug: {
+                            contains: 'tent',
                         },
                     },
                 },
-            );
+            });
 
             expect(result.products.items.length).toBe(0);
         });
 
         it('sorts by name admin', async () => {
-            const result = await adminClient.query<GetProductList.Query, GetProductList.Variables>(
-                GET_PRODUCT_LIST,
-                {
-                    options: {
-                        sort: {
-                            name: SortOrder.ASC,
-                        },
+            const result = await adminClient.query(getProductListDocument, {
+                options: {
+                    sort: {
+                        name: SortOrder.ASC,
                     },
                 },
-            );
+            });
 
             expect(result.products.items.map(p => p.name)).toEqual([
                 'Bonsai Tree',
@@ -171,34 +186,43 @@ describe('Product resolver', () => {
         });
 
         it('filters by name shop', async () => {
-            const result = await shopClient.query<GetProductList.Query, GetProductList.Variables>(
-                GET_PRODUCT_LIST,
-                {
-                    options: {
-                        filter: {
-                            name: {
-                                contains: 'skateboard',
-                            },
+            const result = await shopClient.query(getProductListDocument, {
+                options: {
+                    filter: {
+                        name: {
+                            contains: 'skateboard',
                         },
                     },
                 },
-            );
+            });
 
             expect(result.products.items.length).toBe(1);
             expect(result.products.items[0].name).toBe('Cruiser Skateboard');
         });
 
-        it('sorts by name shop', async () => {
-            const result = await shopClient.query<GetProductList.Query, GetProductList.Variables>(
-                GET_PRODUCT_LIST,
-                {
-                    options: {
-                        sort: {
-                            name: SortOrder.ASC,
+        it('filters by sku admin', async () => {
+            const result = await adminClient.query(getProductListDocument, {
+                options: {
+                    filter: {
+                        sku: {
+                            contains: 'IHD455T1',
                         },
                     },
                 },
-            );
+            });
+
+            expect(result.products.items.length).toBe(1);
+            expect(result.products.items[0].name).toBe('Hard Drive');
+        });
+
+        it('sorts by name shop', async () => {
+            const result = await shopClient.query(getProductListDocument, {
+                options: {
+                    sort: {
+                        name: SortOrder.ASC,
+                    },
+                },
+            });
 
             expect(result.products.items.map(p => p.name)).toEqual([
                 'Bonsai Tree',
@@ -223,128 +247,124 @@ describe('Product resolver', () => {
                 'USB Cable',
             ]);
         });
+
+        // #5537 — Product.facetValues ran several SQL queries per product on a product list
+        it('resolves facetValues with a number of queries independent of the page size', async () => {
+            const countQueries = async (take: number) => {
+                // The first request warms up caches which are not part of the field resolver
+                await adminClient.query(getProductListFacetValuesDocument, { options: { take } });
+                sqlQueryCount = 0;
+                await adminClient.query(getProductListFacetValuesDocument, { options: { take } });
+                return sqlQueryCount;
+            };
+
+            expect(await countQueries(20)).toBe(await countQueries(2));
+        });
+
+        // #5537
+        it('resolves the same facetValues on the list as on a single product, ordered by id', async () => {
+            const { products } = await adminClient.query(getProductListFacetValuesDocument, {
+                options: { take: 20 },
+            });
+            const productsWithFacetValues = products.items.filter(p => p.facetValues.length > 0);
+            // The fixture shares FacetValues between products, which a single batch must give to each
+            expect(productsWithFacetValues.length).toBeGreaterThan(1);
+
+            for (const item of products.items) {
+                const { product } = await adminClient.query(getProductFacetValuesDocument, { id: item.id });
+                const ids = item.facetValues.map(fv => fv.id);
+                expect(ids).toEqual(product?.facetValues.map(fv => fv.id));
+                expect(ids).toEqual([...ids].sort((a, b) => Number(a.slice(2)) - Number(b.slice(2))));
+            }
+        });
     });
 
     describe('product query', () => {
         it('by id', async () => {
-            const { product } = await adminClient.query<GetProductSimple.Query, GetProductSimple.Variables>(
-                GET_PRODUCT_SIMPLE,
-                { id: 'T_2' },
-            );
-
-            if (!product) {
-                fail('Product not found');
-                return;
-            }
+            const { product } = await adminClient.query(getProductSimpleDocument, { id: 'T_2' });
+            productQueryGuard.assertSuccess(product);
             expect(product.id).toBe('T_2');
         });
 
         it('by slug', async () => {
-            const { product } = await adminClient.query<GetProductSimple.Query, GetProductSimple.Variables>(
-                GET_PRODUCT_SIMPLE,
-                { slug: 'curvy-monitor' },
-            );
-
-            if (!product) {
-                fail('Product not found');
-                return;
-            }
+            const { product } = await adminClient.query(getProductSimpleDocument, { slug: 'curvy-monitor' });
+            productQueryGuard.assertSuccess(product);
             expect(product.slug).toBe('curvy-monitor');
         });
 
-        // https://github.com/vendure-ecommerce/vendure/issues/820
+        // https://github.com/vendurehq/vendure/issues/820
         it('by slug with multiple assets', async () => {
-            const { product: product1 } = await adminClient.query<
-                GetProductSimple.Query,
-                GetProductSimple.Variables
-            >(GET_PRODUCT_SIMPLE, { id: 'T_1' });
-            const result = await adminClient.query<UpdateProduct.Mutation, UpdateProduct.Variables>(
-                UPDATE_PRODUCT,
-                {
-                    input: {
-                        id: product1!.id,
-                        assetIds: ['T_1', 'T_2', 'T_3'],
-                    },
+            const { product: product1 } = await adminClient.query(getProductSimpleDocument, { id: 'T_1' });
+            productQueryGuard.assertSuccess(product1);
+            await adminClient.query(updateProductDocument, {
+                input: {
+                    id: product1.id,
+                    assetIds: ['T_1', 'T_2', 'T_3'],
                 },
-            );
-            const { product } = await adminClient.query<
-                GetProductWithVariants.Query,
-                GetProductWithVariants.Variables
-            >(GET_PRODUCT_WITH_VARIANTS, { slug: product1!.slug });
-
-            if (!product) {
-                fail('Product not found');
-                return;
-            }
+            });
+            const { product } = await adminClient.query(getProductWithVariantsDocument, {
+                slug: product1.slug,
+            });
+            productQueryGuard.assertSuccess(product);
             expect(product.assets.map(a => a.id)).toEqual(['T_1', 'T_2', 'T_3']);
         });
 
-        // https://github.com/vendure-ecommerce/vendure/issues/538
+        // https://github.com/vendurehq/vendure/issues/538
         it('falls back to default language slug', async () => {
-            const { product } = await adminClient.query<GetProductSimple.Query, GetProductSimple.Variables>(
-                GET_PRODUCT_SIMPLE,
+            const { product } = await adminClient.query(
+                getProductSimpleDocument,
                 { slug: 'curvy-monitor' },
                 { languageCode: LanguageCode.de },
             );
-
-            if (!product) {
-                fail('Product not found');
-                return;
-            }
+            productQueryGuard.assertSuccess(product);
             expect(product.slug).toBe('curvy-monitor');
+        });
+
+        // GHSA-9pp3-53p2-ww9v
+        it('does not allow SQL injection via languageCode query parameter', async () => {
+            // A single quote in the languageCode breaks the SQL when interpolated
+            // directly via a template literal. With parameterized queries, it is
+            // safely bound as a value and the query executes normally.
+            const { product } = await shopClient.query(
+                getProductSimpleDocument,
+                { slug: 'laptop' },
+                { languageCode: "en' OR 1=1 --" },
+            );
+            expect(product).not.toBeNull();
         });
 
         it(
             'throws if neither id nor slug provided',
             assertThrowsWithMessage(async () => {
-                await adminClient.query<GetProductSimple.Query, GetProductSimple.Variables>(
-                    GET_PRODUCT_SIMPLE,
-                    {},
-                );
+                await adminClient.query(getProductSimpleDocument, {});
             }, 'Either the Product id or slug must be provided'),
         );
 
         it(
             'throws if id and slug do not refer to the same Product',
             assertThrowsWithMessage(async () => {
-                await adminClient.query<GetProductSimple.Query, GetProductSimple.Variables>(
-                    GET_PRODUCT_SIMPLE,
-                    {
-                        id: 'T_2',
-                        slug: 'laptop',
-                    },
-                );
+                await adminClient.query(getProductSimpleDocument, {
+                    id: 'T_2',
+                    slug: 'laptop',
+                });
             }, 'The provided id and slug refer to different Products'),
         );
 
         it('returns expected properties', async () => {
-            const { product } = await adminClient.query<
-                GetProductWithVariants.Query,
-                GetProductWithVariants.Variables
-            >(GET_PRODUCT_WITH_VARIANTS, {
+            const { product } = await adminClient.query(getProductWithVariantsDocument, {
                 id: 'T_2',
             });
 
-            if (!product) {
-                fail('Product not found');
-                return;
-            }
+            productGuard.assertSuccess(product);
             expect(omit(product, ['variants'])).toMatchSnapshot();
             expect(product.variants.length).toBe(2);
         });
 
         it('ProductVariant price properties are correct', async () => {
-            const result = await adminClient.query<
-                GetProductWithVariants.Query,
-                GetProductWithVariants.Variables
-            >(GET_PRODUCT_WITH_VARIANTS, {
+            const result = await adminClient.query(getProductWithVariantsDocument, {
                 id: 'T_2',
             });
-
-            if (!result.product) {
-                fail('Product not found');
-                return;
-            }
+            productGuard.assertSuccess(result.product);
             expect(result.product.variants[0].price).toBe(14374);
             expect(result.product.variants[0].taxCategory).toEqual({
                 id: 'T_1',
@@ -353,10 +373,7 @@ describe('Product resolver', () => {
         });
 
         it('returns null when id not found', async () => {
-            const result = await adminClient.query<
-                GetProductWithVariants.Query,
-                GetProductWithVariants.Variables
-            >(GET_PRODUCT_WITH_VARIANTS, {
+            const result = await adminClient.query(getProductWithVariantsDocument, {
                 id: 'bad_id',
             });
 
@@ -364,10 +381,7 @@ describe('Product resolver', () => {
         });
 
         it('returns null when slug not found', async () => {
-            const result = await adminClient.query<
-                GetProductWithVariants.Query,
-                GetProductWithVariants.Variables
-            >(GET_PRODUCT_WITH_VARIANTS, {
+            const result = await adminClient.query(getProductWithVariantsDocument, {
                 slug: 'bad_slug',
             });
 
@@ -375,140 +389,233 @@ describe('Product resolver', () => {
         });
 
         describe('product query with translations', () => {
-            let translatedProduct: ProductWithVariants.Fragment;
-            let en_translation: ProductWithVariants.Translations;
-            let de_translation: ProductWithVariants.Translations;
+            let translatedProduct: ResultOf<typeof productWithVariantsFragment>;
+            let en_translation: ResultOf<typeof productWithVariantsFragment>['translations'][number];
+            let de_translation: ResultOf<typeof productWithVariantsFragment>['translations'][number];
 
             beforeAll(async () => {
-                const result = await adminClient.query<CreateProduct.Mutation, CreateProduct.Variables>(
-                    CREATE_PRODUCT,
-                    {
-                        input: {
-                            translations: [
-                                {
-                                    languageCode: LanguageCode.en,
-                                    name: 'en Pineapple',
-                                    slug: 'en-pineapple',
-                                    description: 'A delicious pineapple',
-                                },
-                                {
-                                    languageCode: LanguageCode.de,
-                                    name: 'de Ananas',
-                                    slug: 'de-ananas',
-                                    description: 'Eine köstliche Ananas',
-                                },
-                            ],
-                        },
+                const result = await adminClient.query(createProductDocument, {
+                    input: {
+                        translations: [
+                            {
+                                languageCode: LanguageCode.en,
+                                name: 'en Pineapple',
+                                slug: 'en-pineapple',
+                                description: 'A delicious pineapple',
+                            },
+                            {
+                                languageCode: LanguageCode.de,
+                                name: 'de Ananas',
+                                slug: 'de-ananas',
+                                description: 'Eine köstliche Ananas',
+                            },
+                        ],
                     },
-                );
+                });
                 translatedProduct = result.createProduct;
-                en_translation = translatedProduct.translations.find(
-                    t => t.languageCode === LanguageCode.en,
-                )!;
-                de_translation = translatedProduct.translations.find(
-                    t => t.languageCode === LanguageCode.de,
-                )!;
+                const en = translatedProduct.translations.find(t => t.languageCode === LanguageCode.en);
+                const de = translatedProduct.translations.find(t => t.languageCode === LanguageCode.de);
+                expect(en).toBeDefined();
+                expect(de).toBeDefined();
+                en_translation = en as typeof en_translation;
+                de_translation = de as typeof de_translation;
             });
 
             it('en slug without translation arg', async () => {
-                const { product } = await adminClient.query<
-                    GetProductSimple.Query,
-                    GetProductSimple.Variables
-                >(GET_PRODUCT_SIMPLE, { slug: en_translation.slug });
-
-                if (!product) {
-                    fail('Product not found');
-                    return;
-                }
+                const { product } = await adminClient.query(getProductSimpleDocument, {
+                    slug: en_translation.slug,
+                });
+                productQueryGuard.assertSuccess(product);
                 expect(product.slug).toBe(en_translation.slug);
             });
 
             it('de slug without translation arg', async () => {
-                const { product } = await adminClient.query<
-                    GetProductSimple.Query,
-                    GetProductSimple.Variables
-                >(GET_PRODUCT_SIMPLE, { slug: de_translation.slug });
-
-                if (!product) {
-                    fail('Product not found');
-                    return;
-                }
+                const { product } = await adminClient.query(getProductSimpleDocument, {
+                    slug: de_translation.slug,
+                });
+                productQueryGuard.assertSuccess(product);
                 expect(product.slug).toBe(en_translation.slug);
             });
 
             it('en slug with translation en', async () => {
-                const { product } = await adminClient.query<
-                    GetProductSimple.Query,
-                    GetProductSimple.Variables
-                >(GET_PRODUCT_SIMPLE, { slug: en_translation.slug }, { languageCode: LanguageCode.en });
-
-                if (!product) {
-                    fail('Product not found');
-                    return;
-                }
+                const { product } = await adminClient.query(
+                    getProductSimpleDocument,
+                    { slug: en_translation.slug },
+                    { languageCode: LanguageCode.en },
+                );
+                productQueryGuard.assertSuccess(product);
                 expect(product.slug).toBe(en_translation.slug);
             });
 
             it('de slug with translation en', async () => {
-                const { product } = await adminClient.query<
-                    GetProductSimple.Query,
-                    GetProductSimple.Variables
-                >(GET_PRODUCT_SIMPLE, { slug: de_translation.slug }, { languageCode: LanguageCode.en });
-
-                if (!product) {
-                    fail('Product not found');
-                    return;
-                }
+                const { product } = await adminClient.query(
+                    getProductSimpleDocument,
+                    { slug: de_translation.slug },
+                    { languageCode: LanguageCode.en },
+                );
+                productQueryGuard.assertSuccess(product);
                 expect(product.slug).toBe(en_translation.slug);
             });
 
             it('en slug with translation de', async () => {
-                const { product } = await adminClient.query<
-                    GetProductSimple.Query,
-                    GetProductSimple.Variables
-                >(GET_PRODUCT_SIMPLE, { slug: en_translation.slug }, { languageCode: LanguageCode.de });
-
-                if (!product) {
-                    fail('Product not found');
-                    return;
-                }
+                const { product } = await adminClient.query(
+                    getProductSimpleDocument,
+                    { slug: en_translation.slug },
+                    { languageCode: LanguageCode.de },
+                );
+                productQueryGuard.assertSuccess(product);
                 expect(product.slug).toBe(de_translation.slug);
             });
 
             it('de slug with translation de', async () => {
-                const { product } = await adminClient.query<
-                    GetProductSimple.Query,
-                    GetProductSimple.Variables
-                >(GET_PRODUCT_SIMPLE, { slug: de_translation.slug }, { languageCode: LanguageCode.de });
-
-                if (!product) {
-                    fail('Product not found');
-                    return;
-                }
+                const { product } = await adminClient.query(
+                    getProductSimpleDocument,
+                    { slug: de_translation.slug },
+                    { languageCode: LanguageCode.de },
+                );
+                productQueryGuard.assertSuccess(product);
                 expect(product.slug).toBe(de_translation.slug);
             });
 
             it('de slug with translation ru', async () => {
-                const { product } = await adminClient.query<
-                    GetProductSimple.Query,
-                    GetProductSimple.Variables
-                >(GET_PRODUCT_SIMPLE, { slug: de_translation.slug }, { languageCode: LanguageCode.ru });
-
-                if (!product) {
-                    fail('Product not found');
-                    return;
-                }
+                const { product } = await adminClient.query(
+                    getProductSimpleDocument,
+                    { slug: de_translation.slug },
+                    { languageCode: LanguageCode.ru },
+                );
+                productQueryGuard.assertSuccess(product);
                 expect(product.slug).toBe(en_translation.slug);
+            });
+        });
+
+        describe('product.variants', () => {
+            it('returns product variants', async () => {
+                const { product } = await adminClient.query(getProductWithVariantsDocument, {
+                    id: 'T_1',
+                });
+
+                expect(product?.variants.length).toBe(4);
+            });
+
+            it('returns product variants in existing language', async () => {
+                const { product } = await adminClient.query(
+                    getProductWithVariantsDocument,
+                    {
+                        id: 'T_1',
+                    },
+                    { languageCode: LanguageCode.en },
+                );
+
+                expect(product?.variants.length).toBe(4);
+            });
+
+            it('returns product variants in non-existing language', async () => {
+                const { product } = await adminClient.query(
+                    getProductWithVariantsDocument,
+                    {
+                        id: 'T_1',
+                    },
+                    { languageCode: LanguageCode.ru },
+                );
+
+                expect(product?.variants.length).toBe(4);
+            });
+        });
+
+        describe('product.variants', () => {
+            it('returns product variants', async () => {
+                const { product } = await adminClient.query(getProductWithVariantsDocument, {
+                    id: 'T_1',
+                });
+
+                expect(product?.variants.length).toBe(4);
+            });
+
+            it('returns product variants in existing language', async () => {
+                const { product } = await adminClient.query(
+                    getProductWithVariantsDocument,
+                    {
+                        id: 'T_1',
+                    },
+                    { languageCode: LanguageCode.en },
+                );
+
+                expect(product?.variants.length).toBe(4);
+            });
+
+            it('returns product variants in non-existing language', async () => {
+                const { product } = await adminClient.query(
+                    getProductWithVariantsDocument,
+                    {
+                        id: 'T_1',
+                    },
+                    { languageCode: LanguageCode.ru },
+                );
+
+                expect(product?.variants.length).toBe(4);
+            });
+        });
+
+        describe('product.variantList', () => {
+            it('returns product variants', async () => {
+                const { product } = await adminClient.query(getProductWithVariantListDocument, {
+                    id: 'T_1',
+                });
+
+                expect(product?.variantList.items.length).toBe(4);
+                expect(product?.variantList.totalItems).toBe(4);
+            });
+
+            it('returns product variants in existing language', async () => {
+                const { product } = await adminClient.query(
+                    getProductWithVariantListDocument,
+                    {
+                        id: 'T_1',
+                    },
+                    { languageCode: LanguageCode.en },
+                );
+
+                expect(product?.variantList.items.length).toBe(4);
+            });
+
+            it('returns product variants in non-existing language', async () => {
+                const { product } = await adminClient.query(
+                    getProductWithVariantListDocument,
+                    {
+                        id: 'T_1',
+                    },
+                    { languageCode: LanguageCode.ru },
+                );
+
+                expect(product?.variantList.items.length).toBe(4);
+            });
+
+            it('filter & sort', async () => {
+                const { product } = await adminClient.query(getProductWithVariantListDocument, {
+                    id: 'T_1',
+                    variantListOptions: {
+                        filter: {
+                            name: {
+                                contains: '15',
+                            },
+                        },
+                        sort: {
+                            price: SortOrder.DESC,
+                        },
+                    },
+                });
+
+                expect(product?.variantList.items.map(i => i.name)).toEqual([
+                    'Laptop 15 inch 16GB',
+                    'Laptop 15 inch 8GB',
+                ]);
             });
         });
     });
 
     describe('productVariants list query', () => {
         it('returns list', async () => {
-            const { productVariants } = await adminClient.query<
-                GetProductVariantList.Query,
-                GetProductVariantList.Variables
-            >(GET_PRODUCT_VARIANT_LIST, {
+            const { productVariants } = await adminClient.query(getProductVariantListDocument, {
                 options: {
                     take: 3,
                     sort: {
@@ -517,7 +624,9 @@ describe('Product resolver', () => {
                 },
             });
 
-            expect(productVariants.items).toEqual([
+            expect(
+                productVariants.items.map(i => pick(i, ['id', 'name', 'price', 'priceWithTax', 'sku'])),
+            ).toEqual([
                 {
                     id: 'T_34',
                     name: 'Bonsai Tree',
@@ -543,10 +652,7 @@ describe('Product resolver', () => {
         });
 
         it('sort by price', async () => {
-            const { productVariants } = await adminClient.query<
-                GetProductVariantList.Query,
-                GetProductVariantList.Variables
-            >(GET_PRODUCT_VARIANT_LIST, {
+            const { productVariants } = await adminClient.query(getProductVariantListDocument, {
                 options: {
                     take: 3,
                     sort: {
@@ -555,7 +661,9 @@ describe('Product resolver', () => {
                 },
             });
 
-            expect(productVariants.items).toEqual([
+            expect(
+                productVariants.items.map(i => pick(i, ['id', 'name', 'price', 'priceWithTax', 'sku'])),
+            ).toEqual([
                 {
                     id: 'T_23',
                     name: 'Skipping Rope',
@@ -581,10 +689,7 @@ describe('Product resolver', () => {
         });
 
         it('sort by priceWithTax', async () => {
-            const { productVariants } = await adminClient.query<
-                GetProductVariantList.Query,
-                GetProductVariantList.Variables
-            >(GET_PRODUCT_VARIANT_LIST, {
+            const { productVariants } = await adminClient.query(getProductVariantListDocument, {
                 options: {
                     take: 3,
                     sort: {
@@ -593,7 +698,9 @@ describe('Product resolver', () => {
                 },
             });
 
-            expect(productVariants.items).toEqual([
+            expect(
+                productVariants.items.map(i => pick(i, ['id', 'name', 'price', 'priceWithTax', 'sku'])),
+            ).toEqual([
                 {
                     id: 'T_23',
                     name: 'Skipping Rope',
@@ -619,10 +726,7 @@ describe('Product resolver', () => {
         });
 
         it('filter by price', async () => {
-            const { productVariants } = await adminClient.query<
-                GetProductVariantList.Query,
-                GetProductVariantList.Variables
-            >(GET_PRODUCT_VARIANT_LIST, {
+            const { productVariants } = await adminClient.query(getProductVariantListDocument, {
                 options: {
                     take: 3,
                     filter: {
@@ -636,7 +740,9 @@ describe('Product resolver', () => {
                 },
             });
 
-            expect(productVariants.items).toEqual([
+            expect(
+                productVariants.items.map(i => pick(i, ['id', 'name', 'price', 'priceWithTax', 'sku'])),
+            ).toEqual([
                 {
                     id: 'T_20',
                     name: 'Tripod',
@@ -648,10 +754,7 @@ describe('Product resolver', () => {
         });
 
         it('filter by priceWithTax', async () => {
-            const { productVariants } = await adminClient.query<
-                GetProductVariantList.Query,
-                GetProductVariantList.Variables
-            >(GET_PRODUCT_VARIANT_LIST, {
+            const { productVariants } = await adminClient.query(getProductVariantListDocument, {
                 options: {
                     take: 3,
                     filter: {
@@ -667,7 +770,9 @@ describe('Product resolver', () => {
 
             // Note the results are incorrect. This is a design trade-off. See the
             // commend on the ProductVariant.priceWithTax annotation for explanation.
-            expect(productVariants.items).toEqual([
+            expect(
+                productVariants.items.map(i => pick(i, ['id', 'name', 'price', 'priceWithTax', 'sku'])),
+            ).toEqual([
                 {
                     id: 'T_20',
                     name: 'Tripod',
@@ -679,10 +784,7 @@ describe('Product resolver', () => {
         });
 
         it('returns variants for particular product by id', async () => {
-            const { productVariants } = await adminClient.query<
-                GetProductVariantList.Query,
-                GetProductVariantList.Variables
-            >(GET_PRODUCT_VARIANT_LIST, {
+            const { productVariants } = await adminClient.query(getProductVariantListDocument, {
                 options: {
                     take: 3,
                     sort: {
@@ -692,7 +794,9 @@ describe('Product resolver', () => {
                 productId: 'T_1',
             });
 
-            expect(productVariants.items).toEqual([
+            expect(
+                productVariants.items.map(i => pick(i, ['id', 'name', 'price', 'priceWithTax', 'sku'])),
+            ).toEqual([
                 {
                     id: 'T_1',
                     name: 'Laptop 13 inch 8GB',
@@ -720,10 +824,7 @@ describe('Product resolver', () => {
 
     describe('productVariant query', () => {
         it('by id', async () => {
-            const { productVariant } = await adminClient.query<
-                GetProductVariant.Query,
-                GetProductVariant.Variables
-            >(GET_PRODUCT_VARIANT, {
+            const { productVariant } = await adminClient.query(getProductVariantDocument, {
                 id: 'T_1',
             });
 
@@ -731,10 +832,7 @@ describe('Product resolver', () => {
             expect(productVariant?.name).toBe('Laptop 13 inch 8GB');
         });
         it('returns null when id not found', async () => {
-            const { productVariant } = await adminClient.query<
-                GetProductVariant.Query,
-                GetProductVariant.Variables
-            >(GET_PRODUCT_VARIANT, {
+            const { productVariant } = await adminClient.query(getProductVariantDocument, {
                 id: 'T_999',
             });
 
@@ -743,32 +841,29 @@ describe('Product resolver', () => {
     });
 
     describe('product mutation', () => {
-        let newTranslatedProduct: ProductWithVariants.Fragment;
-        let newProduct: ProductWithVariants.Fragment;
-        let newProductWithAssets: ProductWithVariants.Fragment;
+        let newTranslatedProduct: ResultOf<typeof productWithVariantsFragment>;
+        let newProduct: ResultOf<typeof productWithVariantsFragment>;
+        let newProductWithAssets: ResultOf<typeof productWithVariantsFragment>;
 
         it('createProduct creates a new Product', async () => {
-            const result = await adminClient.query<CreateProduct.Mutation, CreateProduct.Variables>(
-                CREATE_PRODUCT,
-                {
-                    input: {
-                        translations: [
-                            {
-                                languageCode: LanguageCode.en,
-                                name: 'en Baked Potato',
-                                slug: 'en Baked Potato',
-                                description: 'A baked potato',
-                            },
-                            {
-                                languageCode: LanguageCode.de,
-                                name: 'de Baked Potato',
-                                slug: 'de-baked-potato',
-                                description: 'Eine baked Erdapfel',
-                            },
-                        ],
-                    },
+            const result = await adminClient.query(createProductDocument, {
+                input: {
+                    translations: [
+                        {
+                            languageCode: LanguageCode.en,
+                            name: 'en Baked Potato',
+                            slug: 'en Baked Potato',
+                            description: 'A baked potato',
+                        },
+                        {
+                            languageCode: LanguageCode.de,
+                            name: 'de Baked Potato',
+                            slug: 'de-baked-potato',
+                            description: 'Eine baked Erdapfel',
+                        },
+                    ],
                 },
-            );
+            });
             expect(omit(result.createProduct, ['translations'])).toMatchSnapshot();
             expect(result.createProduct.translations.map(t => t.description).sort()).toEqual([
                 'A baked potato',
@@ -778,78 +873,68 @@ describe('Product resolver', () => {
         });
 
         it('createProduct creates a new Product with assets', async () => {
-            const assetsResult = await adminClient.query<GetAssetList.Query, GetAssetList.Variables>(
-                GET_ASSET_LIST,
-            );
+            const assetsResult = await adminClient.query(getAssetListDocument);
             const assetIds = assetsResult.assets.items.slice(0, 2).map(a => a.id);
             const featuredAssetId = assetsResult.assets.items[0].id;
 
-            const result = await adminClient.query<CreateProduct.Mutation, CreateProduct.Variables>(
-                CREATE_PRODUCT,
-                {
-                    input: {
-                        assetIds,
-                        featuredAssetId,
-                        translations: [
-                            {
-                                languageCode: LanguageCode.en,
-                                name: 'en Has Assets',
-                                slug: 'en-has-assets',
-                                description: 'A product with assets',
-                            },
-                        ],
-                    },
+            const result = await adminClient.query(createProductDocument, {
+                input: {
+                    assetIds,
+                    featuredAssetId,
+                    translations: [
+                        {
+                            languageCode: LanguageCode.en,
+                            name: 'en Has Assets',
+                            slug: 'en-has-assets',
+                            description: 'A product with assets',
+                        },
+                    ],
                 },
-            );
+            });
             expect(result.createProduct.assets.map(a => a.id)).toEqual(assetIds);
-            expect(result.createProduct.featuredAsset!.id).toBe(featuredAssetId);
+            expect(result.createProduct.featuredAsset).toBeDefined();
+            expect(result.createProduct.featuredAsset?.id).toBe(featuredAssetId);
             newProductWithAssets = result.createProduct;
         });
 
         it('createProduct creates a disabled Product', async () => {
-            const result = await adminClient.query<CreateProduct.Mutation, CreateProduct.Variables>(
-                CREATE_PRODUCT,
-                {
-                    input: {
-                        enabled: false,
-                        translations: [
-                            {
-                                languageCode: LanguageCode.en,
-                                name: 'en Small apple',
-                                slug: 'en-small-apple',
-                                description: 'A small apple',
-                            },
-                        ],
-                    },
+            const result = await adminClient.query(createProductDocument, {
+                input: {
+                    enabled: false,
+                    translations: [
+                        {
+                            languageCode: LanguageCode.en,
+                            name: 'en Small apple',
+                            slug: 'en-small-apple',
+                            description: 'A small apple',
+                        },
+                    ],
                 },
-            );
+            });
             expect(result.createProduct.enabled).toBe(false);
             newProduct = result.createProduct;
         });
 
         it('updateProduct updates a Product', async () => {
-            const result = await adminClient.query<UpdateProduct.Mutation, UpdateProduct.Variables>(
-                UPDATE_PRODUCT,
-                {
-                    input: {
-                        id: newProduct.id,
-                        translations: [
-                            {
-                                languageCode: LanguageCode.en,
-                                name: 'en Mashed Potato',
-                                slug: 'en-mashed-potato',
-                                description: 'A blob of mashed potato',
-                            },
-                            {
-                                languageCode: LanguageCode.de,
-                                name: 'de Mashed Potato',
-                                slug: 'de-mashed-potato',
-                                description: 'Eine blob von gemashed Erdapfel',
-                            },
-                        ],
-                    },
+            const result = await adminClient.query(updateProductDocument, {
+                input: {
+                    id: newProduct.id,
+                    translations: [
+                        {
+                            languageCode: LanguageCode.en,
+                            name: 'en Mashed Potato',
+                            slug: 'en-mashed-potato',
+                            description: 'A blob of mashed potato',
+                        },
+                        {
+                            languageCode: LanguageCode.de,
+                            name: 'de Mashed Potato',
+                            slug: 'de-mashed-potato',
+                            description: 'Eine blob von gemashed Erdapfel',
+                        },
+                    ],
                 },
-            );
+            });
             expect(result.updateProduct.translations.map(t => t.description).sort()).toEqual([
                 'A blob of mashed potato',
                 'Eine blob von gemashed Erdapfel',
@@ -857,175 +942,148 @@ describe('Product resolver', () => {
         });
 
         it('slug is normalized to be url-safe', async () => {
-            const result = await adminClient.query<UpdateProduct.Mutation, UpdateProduct.Variables>(
-                UPDATE_PRODUCT,
-                {
-                    input: {
-                        id: newProduct.id,
-                        translations: [
-                            {
-                                languageCode: LanguageCode.en,
-                                name: 'en Mashed Potato',
-                                slug: 'A (very) nice potato!!',
-                                description: 'A blob of mashed potato',
-                            },
-                        ],
-                    },
+            const result = await adminClient.query(updateProductDocument, {
+                input: {
+                    id: newProduct.id,
+                    translations: [
+                        {
+                            languageCode: LanguageCode.en,
+                            name: 'en Mashed Potato',
+                            slug: 'A (very) nice potato!!',
+                            description: 'A blob of mashed potato',
+                        },
+                    ],
                 },
-            );
+            });
             expect(result.updateProduct.slug).toBe('a-very-nice-potato');
         });
 
         it('create with duplicate slug is renamed to be unique', async () => {
-            const result = await adminClient.query<CreateProduct.Mutation, CreateProduct.Variables>(
-                CREATE_PRODUCT,
-                {
-                    input: {
-                        translations: [
-                            {
-                                languageCode: LanguageCode.en,
-                                name: 'Another baked potato',
-                                slug: 'a-very-nice-potato',
-                                description: 'Another baked potato but a bit different',
-                            },
-                        ],
-                    },
+            const result = await adminClient.query(createProductDocument, {
+                input: {
+                    translations: [
+                        {
+                            languageCode: LanguageCode.en,
+                            name: 'Another baked potato',
+                            slug: 'a-very-nice-potato',
+                            description: 'Another baked potato but a bit different',
+                        },
+                    ],
                 },
-            );
+            });
             expect(result.createProduct.slug).toBe('a-very-nice-potato-2');
         });
 
         it('update with duplicate slug is renamed to be unique', async () => {
-            const result = await adminClient.query<UpdateProduct.Mutation, UpdateProduct.Variables>(
-                UPDATE_PRODUCT,
-                {
-                    input: {
-                        id: newProduct.id,
-                        translations: [
-                            {
-                                languageCode: LanguageCode.en,
-                                name: 'Yet another baked potato',
-                                slug: 'a-very-nice-potato-2',
-                                description: 'Possibly the final baked potato',
-                            },
-                        ],
-                    },
+            const result = await adminClient.query(updateProductDocument, {
+                input: {
+                    id: newProduct.id,
+                    translations: [
+                        {
+                            languageCode: LanguageCode.en,
+                            name: 'Yet another baked potato',
+                            slug: 'a-very-nice-potato-2',
+                            description: 'Possibly the final baked potato',
+                        },
+                    ],
                 },
-            );
+            });
             expect(result.updateProduct.slug).toBe('a-very-nice-potato-3');
         });
 
         it('slug duplicate check does not include self', async () => {
-            const result = await adminClient.query<UpdateProduct.Mutation, UpdateProduct.Variables>(
-                UPDATE_PRODUCT,
-                {
-                    input: {
-                        id: newProduct.id,
-                        translations: [
-                            {
-                                languageCode: LanguageCode.en,
-                                slug: 'a-very-nice-potato-3',
-                            },
-                        ],
-                    },
+            const result = await adminClient.query(updateProductDocument, {
+                input: {
+                    id: newProduct.id,
+                    translations: [
+                        {
+                            languageCode: LanguageCode.en,
+                            slug: 'a-very-nice-potato-3',
+                        },
+                    ],
                 },
-            );
+            });
             expect(result.updateProduct.slug).toBe('a-very-nice-potato-3');
         });
 
         it('updateProduct accepts partial input', async () => {
-            const result = await adminClient.query<UpdateProduct.Mutation, UpdateProduct.Variables>(
-                UPDATE_PRODUCT,
-                {
-                    input: {
-                        id: newProduct.id,
-                        translations: [
-                            {
-                                languageCode: LanguageCode.en,
-                                name: 'en Very Mashed Potato',
-                            },
-                        ],
-                    },
+            const result = await adminClient.query(updateProductDocument, {
+                input: {
+                    id: newProduct.id,
+                    translations: [
+                        {
+                            languageCode: LanguageCode.en,
+                            name: 'en Very Mashed Potato',
+                        },
+                    ],
                 },
-            );
+            });
             expect(result.updateProduct.translations.length).toBe(2);
-            expect(
-                result.updateProduct.translations.find(t => t.languageCode === LanguageCode.de)!.name,
-            ).toBe('de Mashed Potato');
-            expect(
-                result.updateProduct.translations.find(t => t.languageCode === LanguageCode.en)!.name,
-            ).toBe('en Very Mashed Potato');
-            expect(
-                result.updateProduct.translations.find(t => t.languageCode === LanguageCode.en)!.description,
-            ).toBe('Possibly the final baked potato');
+            const deTranslation = result.updateProduct.translations.find(
+                t => t.languageCode === LanguageCode.de,
+            );
+            const enTranslation = result.updateProduct.translations.find(
+                t => t.languageCode === LanguageCode.en,
+            );
+            expect(deTranslation).toBeDefined();
+            expect(enTranslation).toBeDefined();
+            expect(deTranslation?.name).toBe('de Mashed Potato');
+            expect(enTranslation?.name).toBe('en Very Mashed Potato');
+            expect(enTranslation?.description).toBe('Possibly the final baked potato');
         });
 
         it('updateProduct adds Assets to a product and sets featured asset', async () => {
-            const assetsResult = await adminClient.query<GetAssetList.Query, GetAssetList.Variables>(
-                GET_ASSET_LIST,
-            );
+            const assetsResult = await adminClient.query(getAssetListDocument);
             const assetIds = assetsResult.assets.items.map(a => a.id);
             const featuredAssetId = assetsResult.assets.items[2].id;
 
-            const result = await adminClient.query<UpdateProduct.Mutation, UpdateProduct.Variables>(
-                UPDATE_PRODUCT,
-                {
-                    input: {
-                        id: newProduct.id,
-                        assetIds,
-                        featuredAssetId,
-                    },
+            const result = await adminClient.query(updateProductDocument, {
+                input: {
+                    id: newProduct.id,
+                    assetIds,
+                    featuredAssetId,
                 },
-            );
+            });
             expect(result.updateProduct.assets.map(a => a.id)).toEqual(assetIds);
-            expect(result.updateProduct.featuredAsset!.id).toBe(featuredAssetId);
+            expect(result.updateProduct.featuredAsset).toBeDefined();
+            expect(result.updateProduct.featuredAsset?.id).toBe(featuredAssetId);
         });
 
         it('updateProduct sets a featured asset', async () => {
-            const productResult = await adminClient.query<
-                GetProductWithVariants.Query,
-                GetProductWithVariants.Variables
-            >(GET_PRODUCT_WITH_VARIANTS, {
+            const productResult = await adminClient.query(getProductWithVariantsDocument, {
                 id: newProduct.id,
             });
-            const assets = productResult.product!.assets;
+            productGuard.assertSuccess(productResult.product);
+            const assets = productResult.product.assets;
 
-            const result = await adminClient.query<UpdateProduct.Mutation, UpdateProduct.Variables>(
-                UPDATE_PRODUCT,
-                {
-                    input: {
-                        id: newProduct.id,
-                        featuredAssetId: assets[0].id,
-                    },
+            const result = await adminClient.query(updateProductDocument, {
+                input: {
+                    id: newProduct.id,
+                    featuredAssetId: assets[0].id,
                 },
-            );
-            expect(result.updateProduct.featuredAsset!.id).toBe(assets[0].id);
+            });
+            expect(result.updateProduct.featuredAsset).toBeDefined();
+            expect(result.updateProduct.featuredAsset?.id).toBe(assets[0].id);
         });
 
         it('updateProduct updates assets', async () => {
-            const result = await adminClient.query<UpdateProduct.Mutation, UpdateProduct.Variables>(
-                UPDATE_PRODUCT,
-                {
-                    input: {
-                        id: newProduct.id,
-                        featuredAssetId: 'T_1',
-                        assetIds: ['T_1', 'T_2'],
-                    },
+            const result = await adminClient.query(updateProductDocument, {
+                input: {
+                    id: newProduct.id,
+                    featuredAssetId: 'T_1',
+                    assetIds: ['T_1', 'T_2'],
                 },
-            );
+            });
             expect(result.updateProduct.assets.map(a => a.id)).toEqual(['T_1', 'T_2']);
         });
 
         it('updateProduct updates FacetValues', async () => {
-            const result = await adminClient.query<UpdateProduct.Mutation, UpdateProduct.Variables>(
-                UPDATE_PRODUCT,
-                {
-                    input: {
-                        id: newProduct.id,
-                        facetValueIds: ['T_1'],
-                    },
+            const result = await adminClient.query(updateProductDocument, {
+                input: {
+                    id: newProduct.id,
+                    facetValueIds: ['T_1'],
                 },
-            );
+            });
             expect(result.updateProduct.facetValues.length).toEqual(1);
         });
 
@@ -1033,7 +1091,7 @@ describe('Product resolver', () => {
             'updateProduct errors with an invalid productId',
             assertThrowsWithMessage(
                 () =>
-                    adminClient.query<UpdateProduct.Mutation, UpdateProduct.Variables>(UPDATE_PRODUCT, {
+                    adminClient.query(updateProductDocument, {
                         input: {
                             id: '999',
                             translations: [
@@ -1052,105 +1110,213 @@ describe('Product resolver', () => {
                             ],
                         },
                     }),
-                `No Product with the id '999' could be found`,
+                'No Product with the id "999" could be found',
             ),
         );
 
+        // #4884 — concurrent updates adding the same not-yet-existing language must not
+        // create two translation rows for that (product, languageCode) pair
+        it('concurrent updates adding the same new language do not create duplicate translations', async () => {
+            const { createProduct } = await adminClient.query(createProductDocument, {
+                input: {
+                    translations: [
+                        {
+                            languageCode: LanguageCode.en,
+                            name: 'en Concurrent Potato',
+                            slug: 'en-concurrent-potato',
+                            description: 'A potato',
+                        },
+                    ],
+                },
+            });
+
+            const input = {
+                id: createProduct.id,
+                translations: [
+                    {
+                        languageCode: LanguageCode.de,
+                        name: 'de Concurrent Potato',
+                        slug: 'de-concurrent-potato',
+                        description: 'Ein Erdapfel',
+                    },
+                ],
+            };
+
+            // On MariaDB >= 11.6.2 (innodb_snapshot_isolation=ON by default) the losing
+            // request can be rejected with "Record has changed since last read" when both
+            // transactions update the same product row — a database-level concurrency
+            // conflict, not the bug under test. The invariant here is not that both
+            // requests succeed, but that no duplicate translation row is created and the
+            // product remains editable afterwards.
+            const results = await Promise.allSettled([
+                adminClient.query(updateProductDocument, { input }),
+                adminClient.query(updateProductDocument, { input }),
+            ]);
+            expect(results.some(result => result.status === 'fulfilled')).toBe(true);
+
+            const { product } = await adminClient.query(getProductWithVariantsDocument, {
+                id: createProduct.id,
+            });
+            productGuard.assertSuccess(product);
+            const deTranslations = product.translations.filter(t => t.languageCode === LanguageCode.de);
+            expect(deTranslations.length).toBe(1);
+
+            // Before the unique constraint, a duplicate pair of rows made the entity
+            // uneditable (#4884) — verify a subsequent update still lands.
+            await adminClient.query(updateProductDocument, {
+                input: {
+                    id: createProduct.id,
+                    translations: [
+                        {
+                            languageCode: LanguageCode.de,
+                            name: 'de Concurrent Potato zwei',
+                            slug: 'de-concurrent-potato',
+                            description: 'Ein Erdapfel',
+                        },
+                    ],
+                },
+            });
+            const { product: productAfter } = await adminClient.query(getProductWithVariantsDocument, {
+                id: createProduct.id,
+            });
+            productGuard.assertSuccess(productAfter);
+            const deAfter = productAfter.translations.filter(t => t.languageCode === LanguageCode.de);
+            expect(deAfter.length).toBe(1);
+            expect(deAfter[0].name).toBe('de Concurrent Potato zwei');
+        });
+
         it('addOptionGroupToProduct adds an option group', async () => {
-            const result = await adminClient.query<
-                AddOptionGroupToProduct.Mutation,
-                AddOptionGroupToProduct.Variables
-            >(ADD_OPTION_GROUP_TO_PRODUCT, {
-                optionGroupId: 'T_2',
+            const optionGroup = await createOptionGroup('Quark-type', ['Charm', 'Strange']);
+            const result = await adminClient.query(addOptionGroupToProductDocument, {
+                optionGroupId: optionGroup.id,
                 productId: newProduct.id,
             });
             expect(result.addOptionGroupToProduct.optionGroups.length).toBe(1);
-            expect(result.addOptionGroupToProduct.optionGroups[0].id).toBe('T_2');
+            expect(result.addOptionGroupToProduct.optionGroups[0].id).toBe(optionGroup.id);
+
+            // not really testing this, but just cleaning up for later tests
+            const { removeOptionGroupFromProduct } = await adminClient.query(
+                removeOptionGroupFromProductDocument,
+                {
+                    optionGroupId: optionGroup.id,
+                    productId: newProduct.id,
+                },
+            );
+            removeOptionGuard.assertSuccess(removeOptionGroupFromProduct);
         });
 
         it(
             'addOptionGroupToProduct errors with an invalid productId',
             assertThrowsWithMessage(
                 () =>
-                    adminClient.query<AddOptionGroupToProduct.Mutation, AddOptionGroupToProduct.Variables>(
-                        ADD_OPTION_GROUP_TO_PRODUCT,
-                        {
-                            optionGroupId: 'T_1',
-                            productId: '999',
-                        },
-                    ),
-                `No Product with the id '999' could be found`,
+                    adminClient.query(addOptionGroupToProductDocument, {
+                        optionGroupId: 'T_1',
+                        productId: 'T_999',
+                    }),
+                'No Product with the id "999" could be found',
             ),
         );
+
+        it('addOptionGroupToProduct allows the same group on multiple products', async () => {
+            const result = await adminClient.query(addOptionGroupToProductDocument, {
+                optionGroupId: 'T_1',
+                productId: 'T_2',
+            });
+            expect(result.addOptionGroupToProduct.optionGroups.map((g: any) => g.id)).toContain('T_1');
+
+            // Clean up: remove the shared group from T_2
+            const { removeOptionGroupFromProduct } = await adminClient.query(
+                removeOptionGroupFromProductDocument,
+                {
+                    optionGroupId: 'T_1',
+                    productId: 'T_2',
+                    force: true,
+                },
+            );
+            removeOptionGuard.assertSuccess(removeOptionGroupFromProduct);
+        });
 
         it(
             'addOptionGroupToProduct errors with an invalid optionGroupId',
             assertThrowsWithMessage(
                 () =>
-                    adminClient.query<AddOptionGroupToProduct.Mutation, AddOptionGroupToProduct.Variables>(
-                        ADD_OPTION_GROUP_TO_PRODUCT,
-                        {
-                            optionGroupId: '999',
-                            productId: newProduct.id,
-                        },
-                    ),
-                `No ProductOptionGroup with the id '999' could be found`,
+                    adminClient.query(addOptionGroupToProductDocument, {
+                        optionGroupId: '999',
+                        productId: newProduct.id,
+                    }),
+                'No ProductOptionGroup with the id "999" could be found',
             ),
         );
 
         it('removeOptionGroupFromProduct removes an option group', async () => {
-            const { addOptionGroupToProduct } = await adminClient.query<
-                AddOptionGroupToProduct.Mutation,
-                AddOptionGroupToProduct.Variables
-            >(ADD_OPTION_GROUP_TO_PRODUCT, {
-                optionGroupId: 'T_1',
+            const optionGroup = await createOptionGroup('Length', ['Short', 'Long']);
+            const { addOptionGroupToProduct } = await adminClient.query(addOptionGroupToProductDocument, {
+                optionGroupId: optionGroup.id,
                 productId: newProductWithAssets.id,
             });
             expect(addOptionGroupToProduct.optionGroups.length).toBe(1);
-
-            const { removeOptionGroupFromProduct } = await adminClient.query<
-                RemoveOptionGroupFromProduct.Mutation,
-                RemoveOptionGroupFromProduct.Variables
-            >(REMOVE_OPTION_GROUP_FROM_PRODUCT, {
-                optionGroupId: 'T_1',
-                productId: newProductWithAssets.id,
-            });
+            const { removeOptionGroupFromProduct } = await adminClient.query(
+                removeOptionGroupFromProductDocument,
+                {
+                    optionGroupId: optionGroup.id,
+                    productId: newProductWithAssets.id,
+                },
+            );
             removeOptionGuard.assertSuccess(removeOptionGroupFromProduct);
 
-            expect(removeOptionGroupFromProduct.id).toBe(newProductWithAssets.id);
-            expect(removeOptionGroupFromProduct.optionGroups.length).toBe(0);
+            expect(removeOptionGroupFromProduct?.id).toBe(newProductWithAssets.id);
+            expect(removeOptionGroupFromProduct?.optionGroups.length).toBe(0);
         });
 
         it('removeOptionGroupFromProduct return error result if the optionGroup is being used by variants', async () => {
-            const { removeOptionGroupFromProduct } = await adminClient.query<
-                RemoveOptionGroupFromProduct.Mutation,
-                RemoveOptionGroupFromProduct.Variables
-            >(REMOVE_OPTION_GROUP_FROM_PRODUCT, {
-                optionGroupId: 'T_3',
-                productId: 'T_2',
-            });
+            const { removeOptionGroupFromProduct } = await adminClient.query(
+                removeOptionGroupFromProductDocument,
+                {
+                    optionGroupId: 'T_3',
+                    productId: 'T_2',
+                },
+            );
             removeOptionGuard.assertErrorResult(removeOptionGroupFromProduct);
 
             expect(removeOptionGroupFromProduct.message).toBe(
-                `Cannot remove ProductOptionGroup "curvy-monitor-monitor-size" as it is used by 2 ProductVariants`,
+                'Cannot remove ProductOptionGroup "curvy-monitor-monitor-size" as it is used by 2 ProductVariants. Use the `force` argument to remove it anyway',
             );
             expect(removeOptionGroupFromProduct.errorCode).toBe(ErrorCode.PRODUCT_OPTION_IN_USE_ERROR);
             expect(removeOptionGroupFromProduct.optionGroupCode).toBe('curvy-monitor-monitor-size');
             expect(removeOptionGroupFromProduct.productVariantCount).toBe(2);
         });
 
+        it('removeOptionGroupFromProduct succeeds if all related ProductVariants are also deleted', async () => {
+            const { product } = await adminClient.query(getProductWithVariantsDocument, { id: 'T_2' });
+            productGuard.assertSuccess(product);
+
+            // Delete all variants for that product
+            for (const variant of product.variants) {
+                await adminClient.query(deleteProductVariantDocument, {
+                    id: variant.id,
+                });
+            }
+
+            const { removeOptionGroupFromProduct } = await adminClient.query(
+                removeOptionGroupFromProductDocument,
+                {
+                    optionGroupId: product.optionGroups[0].id,
+                    productId: product.id,
+                },
+            );
+
+            removeOptionGuard.assertSuccess(removeOptionGroupFromProduct);
+        });
+
         it(
             'removeOptionGroupFromProduct errors with an invalid productId',
             assertThrowsWithMessage(
                 () =>
-                    adminClient.query<
-                        RemoveOptionGroupFromProduct.Mutation,
-                        RemoveOptionGroupFromProduct.Variables
-                    >(REMOVE_OPTION_GROUP_FROM_PRODUCT, {
+                    adminClient.query(removeOptionGroupFromProductDocument, {
                         optionGroupId: '1',
                         productId: '999',
                     }),
-                `No Product with the id '999' could be found`,
+                'No Product with the id "999" could be found',
             ),
         );
 
@@ -1158,85 +1324,66 @@ describe('Product resolver', () => {
             'removeOptionGroupFromProduct errors with an invalid optionGroupId',
             assertThrowsWithMessage(
                 () =>
-                    adminClient.query<
-                        RemoveOptionGroupFromProduct.Mutation,
-                        RemoveOptionGroupFromProduct.Variables
-                    >(REMOVE_OPTION_GROUP_FROM_PRODUCT, {
+                    adminClient.query(removeOptionGroupFromProductDocument, {
                         optionGroupId: '999',
                         productId: newProduct.id,
                     }),
-                `No ProductOptionGroup with the id '999' could be found`,
+                'No ProductOptionGroup with the id "999" could be found',
             ),
         );
 
         describe('variants', () => {
-            let variants: CreateProductVariants.CreateProductVariants[];
-            let optionGroup2: GetOptionGroup.ProductOptionGroup;
-            let optionGroup3: GetOptionGroup.ProductOptionGroup;
+            let variants: ResultOf<typeof createProductVariantsDocument>['createProductVariants'];
+            let optionGroup2: NonNullable<ResultOf<typeof getOptionGroupDocument>['productOptionGroup']>;
+            let optionGroup3: NonNullable<ResultOf<typeof getOptionGroupDocument>['productOptionGroup']>;
 
             beforeAll(async () => {
-                await adminClient.query<AddOptionGroupToProduct.Mutation, AddOptionGroupToProduct.Variables>(
-                    ADD_OPTION_GROUP_TO_PRODUCT,
-                    {
-                        optionGroupId: 'T_3',
-                        productId: newProduct.id,
-                    },
-                );
-                const result1 = await adminClient.query<GetOptionGroup.Query, GetOptionGroup.Variables>(
-                    GET_OPTION_GROUP,
-                    { id: 'T_2' },
-                );
-                const result2 = await adminClient.query<GetOptionGroup.Query, GetOptionGroup.Variables>(
-                    GET_OPTION_GROUP,
-                    { id: 'T_3' },
-                );
-                optionGroup2 = result1.productOptionGroup!;
-                optionGroup3 = result2.productOptionGroup!;
+                optionGroup2 = await createOptionGroup('group-2', ['group2-option-1', 'group2-option-2']);
+                optionGroup3 = await createOptionGroup('group-3', ['group3-option-1', 'group3-option-2']);
+                await adminClient.query(addOptionGroupToProductDocument, {
+                    optionGroupId: optionGroup2.id,
+                    productId: newProduct.id,
+                });
+                await adminClient.query(addOptionGroupToProductDocument, {
+                    optionGroupId: optionGroup3.id,
+                    productId: newProduct.id,
+                });
             });
 
             it(
                 'createProductVariants throws if optionIds not compatible with product',
                 assertThrowsWithMessage(async () => {
-                    await adminClient.query<CreateProductVariants.Mutation, CreateProductVariants.Variables>(
-                        CREATE_PRODUCT_VARIANTS,
-                        {
-                            input: [
-                                {
-                                    productId: newProduct.id,
-                                    sku: 'PV1',
-                                    optionIds: [],
-                                    translations: [{ languageCode: LanguageCode.en, name: 'Variant 1' }],
-                                },
-                            ],
-                        },
-                    );
-                }, 'ProductVariant optionIds must include one optionId from each of the groups: curvy-monitor-monitor-size, laptop-ram'),
+                    await adminClient.query(createProductVariantsDocument, {
+                        input: [
+                            {
+                                productId: newProduct.id,
+                                sku: 'PV1',
+                                optionIds: [],
+                                translations: [{ languageCode: LanguageCode.en, name: 'Variant 1' }],
+                            },
+                        ],
+                    });
+                }, 'ProductVariant optionIds must include one optionId from each of the groups: group-2, group-3'),
             );
 
             it(
                 'createProductVariants throws if optionIds are duplicated',
                 assertThrowsWithMessage(async () => {
-                    await adminClient.query<CreateProductVariants.Mutation, CreateProductVariants.Variables>(
-                        CREATE_PRODUCT_VARIANTS,
-                        {
-                            input: [
-                                {
-                                    productId: newProduct.id,
-                                    sku: 'PV1',
-                                    optionIds: [optionGroup2.options[0].id, optionGroup2.options[1].id],
-                                    translations: [{ languageCode: LanguageCode.en, name: 'Variant 1' }],
-                                },
-                            ],
-                        },
-                    );
-                }, 'ProductVariant optionIds must include one optionId from each of the groups: curvy-monitor-monitor-size, laptop-ram'),
+                    await adminClient.query(createProductVariantsDocument, {
+                        input: [
+                            {
+                                productId: newProduct.id,
+                                sku: 'PV1',
+                                optionIds: [optionGroup2.options[0].id, optionGroup2.options[1].id],
+                                translations: [{ languageCode: LanguageCode.en, name: 'Variant 1' }],
+                            },
+                        ],
+                    });
+                }, 'ProductVariant optionIds must include one optionId from each of the groups: group-2, group-3'),
             );
 
             it('createProductVariants works', async () => {
-                const { createProductVariants } = await adminClient.query<
-                    CreateProductVariants.Mutation,
-                    CreateProductVariants.Variables
-                >(CREATE_PRODUCT_VARIANTS, {
+                const { createProductVariants } = await adminClient.query(createProductVariantsDocument, {
                     input: [
                         {
                             productId: newProduct.id,
@@ -1246,20 +1393,19 @@ describe('Product resolver', () => {
                         },
                     ],
                 });
-                expect(createProductVariants[0]!.name).toBe('Variant 1');
-                expect(createProductVariants[0]!.options.map(pick(['id']))).toContainEqual({
+                const createdVariant = createProductVariants[0];
+                variantGuard.assertSuccess(createdVariant);
+                expect(createdVariant.name).toBe('Variant 1');
+                expect(createdVariant.options.map(pick(['id']))).toContainEqual({
                     id: optionGroup2.options[0].id,
                 });
-                expect(createProductVariants[0]!.options.map(pick(['id']))).toContainEqual({
+                expect(createdVariant.options.map(pick(['id']))).toContainEqual({
                     id: optionGroup3.options[0].id,
                 });
             });
 
             it('createProductVariants adds multiple variants at once', async () => {
-                const { createProductVariants } = await adminClient.query<
-                    CreateProductVariants.Mutation,
-                    CreateProductVariants.Variables
-                >(CREATE_PRODUCT_VARIANTS, {
+                const { createProductVariants } = await adminClient.query(createProductVariantsDocument, {
                     input: [
                         {
                             productId: newProduct.id,
@@ -1275,8 +1421,10 @@ describe('Product resolver', () => {
                         },
                     ],
                 });
-                const variant2 = createProductVariants.find(v => v!.name === 'Variant 2')!;
-                const variant3 = createProductVariants.find(v => v!.name === 'Variant 3')!;
+                const variant2 = createProductVariants.find(v => v?.name === 'Variant 2');
+                const variant3 = createProductVariants.find(v => v?.name === 'Variant 3');
+                variantGuard.assertSuccess(variant2);
+                variantGuard.assertSuccess(variant3);
                 expect(variant2.options.map(pick(['id']))).toContainEqual({ id: optionGroup2.options[1].id });
                 expect(variant2.options.map(pick(['id']))).toContainEqual({ id: optionGroup3.options[0].id });
                 expect(variant3.options.map(pick(['id']))).toContainEqual({ id: optionGroup2.options[1].id });
@@ -1288,28 +1436,23 @@ describe('Product resolver', () => {
             it(
                 'createProductVariants throws if options combination already exists',
                 assertThrowsWithMessage(async () => {
-                    await adminClient.query<CreateProductVariants.Mutation, CreateProductVariants.Variables>(
-                        CREATE_PRODUCT_VARIANTS,
-                        {
-                            input: [
-                                {
-                                    productId: newProduct.id,
-                                    sku: 'PV2',
-                                    optionIds: [optionGroup2.options[0].id, optionGroup3.options[0].id],
-                                    translations: [{ languageCode: LanguageCode.en, name: 'Variant 2' }],
-                                },
-                            ],
-                        },
-                    );
+                    await adminClient.query(createProductVariantsDocument, {
+                        input: [
+                            {
+                                productId: newProduct.id,
+                                sku: 'PV2',
+                                optionIds: [optionGroup2.options[0].id, optionGroup3.options[0].id],
+                                translations: [{ languageCode: LanguageCode.en, name: 'Variant 2' }],
+                            },
+                        ],
+                    });
                 }, 'A ProductVariant with the selected options already exists: Variant 1'),
             );
 
             it('updateProductVariants updates variants', async () => {
                 const firstVariant = variants[0];
-                const { updateProductVariants } = await adminClient.query<
-                    UpdateProductVariants.Mutation,
-                    UpdateProductVariants.Variables
-                >(UPDATE_PRODUCT_VARIANTS, {
+                variantGuard.assertSuccess(firstVariant);
+                const { updateProductVariants } = await adminClient.query(updateProductVariantsDocument, {
                     input: [
                         {
                             id: firstVariant.id,
@@ -1320,20 +1463,40 @@ describe('Product resolver', () => {
                     ],
                 });
                 const updatedVariant = updateProductVariants[0];
-                if (!updatedVariant) {
-                    fail('no updated variant returned.');
-                    return;
-                }
+                updateVariantGuard.assertSuccess(updatedVariant);
                 expect(updatedVariant.sku).toBe('ABC');
                 expect(updatedVariant.price).toBe(432);
             });
 
+            // https://github.com/vendurehq/vendure/issues/1101
+            it('after update, the updatedAt should be modified', async () => {
+                // Pause for a second to ensure the updatedAt date is more than 1s
+                // later than the createdAt date, since sqlite does not seem to store
+                // down to millisecond resolution.
+                await new Promise(resolve => setTimeout(resolve, 1000));
+
+                const firstVariant = variants[0];
+                variantGuard.assertSuccess(firstVariant);
+                const { updateProductVariants } = await adminClient.query(updateProductVariantsDocument, {
+                    input: [
+                        {
+                            id: firstVariant.id,
+                            translations: firstVariant.translations,
+                            sku: 'ABCD',
+                            price: 432,
+                        },
+                    ],
+                });
+
+                const updatedVariant = updateProductVariants.find(v => v?.id === firstVariant.id);
+
+                expect(updatedVariant?.updatedAt).not.toBe(updatedVariant?.createdAt);
+            });
+
             it('updateProductVariants updates assets', async () => {
                 const firstVariant = variants[0];
-                const result = await adminClient.query<
-                    UpdateProductVariants.Mutation,
-                    UpdateProductVariants.Variables
-                >(UPDATE_PRODUCT_VARIANTS, {
+                variantGuard.assertSuccess(firstVariant);
+                const result = await adminClient.query(updateProductVariantsDocument, {
                     input: [
                         {
                             id: firstVariant.id,
@@ -1343,20 +1506,16 @@ describe('Product resolver', () => {
                     ],
                 });
                 const updatedVariant = result.updateProductVariants[0];
-                if (!updatedVariant) {
-                    fail('no updated variant returned.');
-                    return;
-                }
+                updateVariantGuard.assertSuccess(updatedVariant);
                 expect(updatedVariant.assets.map(a => a.id)).toEqual(['T_1', 'T_2']);
-                expect(updatedVariant.featuredAsset!.id).toBe('T_2');
+                expect(updatedVariant.featuredAsset).toBeDefined();
+                expect(updatedVariant.featuredAsset?.id).toBe('T_2');
             });
 
             it('updateProductVariants updates assets again', async () => {
                 const firstVariant = variants[0];
-                const result = await adminClient.query<
-                    UpdateProductVariants.Mutation,
-                    UpdateProductVariants.Variables
-                >(UPDATE_PRODUCT_VARIANTS, {
+                variantGuard.assertSuccess(firstVariant);
+                const result = await adminClient.query(updateProductVariantsDocument, {
                     input: [
                         {
                             id: firstVariant.id,
@@ -1366,20 +1525,16 @@ describe('Product resolver', () => {
                     ],
                 });
                 const updatedVariant = result.updateProductVariants[0];
-                if (!updatedVariant) {
-                    fail('no updated variant returned.');
-                    return;
-                }
+                updateVariantGuard.assertSuccess(updatedVariant);
                 expect(updatedVariant.assets.map(a => a.id)).toEqual(['T_4', 'T_3']);
-                expect(updatedVariant.featuredAsset!.id).toBe('T_4');
+                expect(updatedVariant.featuredAsset).toBeDefined();
+                expect(updatedVariant.featuredAsset?.id).toBe('T_4');
             });
 
             it('updateProductVariants updates taxCategory and price', async () => {
                 const firstVariant = variants[0];
-                const result = await adminClient.query<
-                    UpdateProductVariants.Mutation,
-                    UpdateProductVariants.Variables
-                >(UPDATE_PRODUCT_VARIANTS, {
+                variantGuard.assertSuccess(firstVariant);
+                const result = await adminClient.query(updateProductVariantsDocument, {
                     input: [
                         {
                             id: firstVariant.id,
@@ -1389,20 +1544,15 @@ describe('Product resolver', () => {
                     ],
                 });
                 const updatedVariant = result.updateProductVariants[0];
-                if (!updatedVariant) {
-                    fail('no updated variant returned.');
-                    return;
-                }
+                updateVariantGuard.assertSuccess(updatedVariant);
                 expect(updatedVariant.price).toBe(105);
                 expect(updatedVariant.taxCategory.id).toBe('T_2');
             });
 
             it('updateProductVariants updates facetValues', async () => {
                 const firstVariant = variants[0];
-                const result = await adminClient.query<
-                    UpdateProductVariants.Mutation,
-                    UpdateProductVariants.Variables
-                >(UPDATE_PRODUCT_VARIANTS, {
+                variantGuard.assertSuccess(firstVariant);
+                const result = await adminClient.query(updateProductVariantsDocument, {
                     input: [
                         {
                             id: firstVariant.id,
@@ -1411,73 +1561,191 @@ describe('Product resolver', () => {
                     ],
                 });
                 const updatedVariant = result.updateProductVariants[0];
-                if (!updatedVariant) {
-                    fail('no updated variant returned.');
-                    return;
-                }
+                updateVariantGuard.assertSuccess(updatedVariant);
                 expect(updatedVariant.facetValues.length).toBe(1);
                 expect(updatedVariant.facetValues[0].id).toBe('T_1');
             });
 
-            it(
-                'updateProductVariants throws with an invalid variant id',
-                assertThrowsWithMessage(
-                    () =>
-                        adminClient.query<UpdateProductVariants.Mutation, UpdateProductVariants.Variables>(
-                            UPDATE_PRODUCT_VARIANTS,
+            it('updateProductVariants throws with an invalid variant id', async () => {
+                const firstVariant = variants[0];
+                variantGuard.assertSuccess(firstVariant);
+                await expect(
+                    adminClient.query(updateProductVariantsDocument, {
+                        input: [
                             {
-                                input: [
-                                    {
-                                        id: 'T_999',
-                                        translations: variants[0].translations,
-                                        sku: 'ABC',
-                                        price: 432,
-                                    },
+                                id: 'T_999',
+                                translations: firstVariant.translations,
+                                sku: 'ABC',
+                                price: 432,
+                            },
+                        ],
+                    }),
+                ).rejects.toThrow('No ProductVariant with the id "999" could be found');
+            });
+
+            describe('adding options to existing variants', () => {
+                let variantToModify: NonNullable<
+                    ResultOf<typeof createProductVariantsDocument>['createProductVariants'][number]
+                >;
+                let initialOptionIds: string[];
+                let newOptionGroup: ResultOf<
+                    typeof createProductOptionGroupDocument
+                >['createProductOptionGroup'];
+
+                beforeAll(() => {
+                    const firstVariant = variants[0];
+                    expect(firstVariant).toBeDefined();
+                    variantToModify = firstVariant as typeof variantToModify;
+                    initialOptionIds = variantToModify.options.map(o => o.id);
+                });
+                it('assert initial state', async () => {
+                    expect(variantToModify.options.map(o => o.code)).toEqual([
+                        'group2-option-2',
+                        'group3-option-1',
+                    ]);
+                });
+
+                it(
+                    'passing optionIds from an invalid OptionGroup throws',
+                    assertThrowsWithMessage(async () => {
+                        await adminClient.query(updateProductVariantsDocument, {
+                            input: [
+                                {
+                                    id: variantToModify.id,
+                                    optionIds: [...variantToModify.options.map(o => o.id), 'T_1'],
+                                },
+                            ],
+                        });
+                    }, 'ProductVariant optionIds must include one optionId from each of the groups: group-2, group-3'),
+                );
+
+                it('passing optionIds that match an existing variant should not throw', async () => {
+                    const { updateProductVariants } = await adminClient.query(updateProductVariantsDocument, {
+                        input: [
+                            {
+                                id: variantToModify.id,
+                                optionIds: variantToModify.options.map(o => o.id),
+                                sku: 'ABC',
+                                price: 432,
+                            },
+                        ],
+                    });
+                    const updatedVariant = updateProductVariants[0];
+                    updateVariantGuard.assertSuccess(updatedVariant);
+                    expect(updatedVariant.sku).toBe('ABC');
+                    expect(updatedVariant.price).toBe(432);
+                });
+
+                it('addOptionGroupToProduct and then update existing ProductVariant with a new option', async () => {
+                    const optionGroup4 = await createOptionGroup('group-4', [
+                        'group4-option-1',
+                        'group4-option-2',
+                    ]);
+                    newOptionGroup = optionGroup4;
+                    const result = await adminClient.query(addOptionGroupToProductDocument, {
+                        optionGroupId: optionGroup4.id,
+                        productId: newProduct.id,
+                    });
+                    expect(result.addOptionGroupToProduct.optionGroups.length).toBe(3);
+                    expect(result.addOptionGroupToProduct.optionGroups[2].id).toBe(optionGroup4.id);
+
+                    const { updateProductVariants } = await adminClient.query(updateProductVariantsDocument, {
+                        input: [
+                            {
+                                id: variantToModify.id,
+                                optionIds: [
+                                    ...variantToModify.options.map(o => o.id),
+                                    optionGroup4.options[0].id,
                                 ],
                             },
-                        ),
-                    `No ProductVariant with the id '999' could be found`,
-                ),
-            );
+                        ],
+                    });
 
-            let deletedVariant: ProductVariantFragment;
+                    const updatedVariant = updateProductVariants[0];
+                    updateVariantGuard.assertSuccess(updatedVariant);
+                    expect(updatedVariant.options.map(o => o.code)).toEqual([
+                        'group2-option-2',
+                        'group3-option-1',
+                        'group4-option-1',
+                    ]);
+                });
+
+                it('removeOptionGroup fails because option is in use', async () => {
+                    const { removeOptionGroupFromProduct } = await adminClient.query(
+                        removeOptionGroupFromProductDocument,
+                        {
+                            optionGroupId: newOptionGroup.id,
+                            productId: newProduct.id,
+                        },
+                    );
+                    removeOptionGuard.assertErrorResult(removeOptionGroupFromProduct);
+
+                    expect(removeOptionGroupFromProduct.message).toBe(
+                        'Cannot remove ProductOptionGroup "group-4" as it is used by 3 ProductVariants. Use the `force` argument to remove it anyway',
+                    );
+                });
+
+                it('removeOptionGroup with force argument', async () => {
+                    const { removeOptionGroupFromProduct } = await adminClient.query(
+                        removeOptionGroupFromProductDocument,
+                        {
+                            optionGroupId: newOptionGroup.id,
+                            productId: newProduct.id,
+                            force: true,
+                        },
+                    );
+                    removeOptionGuard.assertSuccess(removeOptionGroupFromProduct);
+
+                    expect(removeOptionGroupFromProduct?.optionGroups.length).toBe(2);
+
+                    const { product } = await adminClient.query(getProductWithVariantsDocument, {
+                        id: newProduct.id,
+                    });
+                    productGuard.assertSuccess(product);
+                    function assertNoOptionGroup(
+                        variant: ResultOf<typeof productVariantFragment>,
+                        optionGroupId: string,
+                    ) {
+                        expect(variant.options.map(o => o.groupId).every(id => id !== optionGroupId)).toBe(
+                            true,
+                        );
+                    }
+                    assertNoOptionGroup(product.variants[0], newOptionGroup.id);
+                    assertNoOptionGroup(product.variants[1], newOptionGroup.id);
+                    assertNoOptionGroup(product.variants[2], newOptionGroup.id);
+                });
+            });
+
+            let deletedVariant: ResultOf<typeof productVariantFragment>;
 
             it('deleteProductVariant', async () => {
-                const result1 = await adminClient.query<
-                    GetProductWithVariants.Query,
-                    GetProductWithVariants.Variables
-                >(GET_PRODUCT_WITH_VARIANTS, {
+                const result1 = await adminClient.query(getProductWithVariantsDocument, {
                     id: newProduct.id,
                 });
-                const sortedVariantIds = result1.product!.variants.map(v => v.id).sort();
+                productGuard.assertSuccess(result1.product);
+                const sortedVariantIds = result1.product.variants.map(v => v.id).sort();
                 expect(sortedVariantIds).toEqual(['T_35', 'T_36', 'T_37']);
 
-                const { deleteProductVariant } = await adminClient.query<
-                    DeleteProductVariant.Mutation,
-                    DeleteProductVariant.Variables
-                >(DELETE_PRODUCT_VARIANT, {
+                const { deleteProductVariant } = await adminClient.query(deleteProductVariantDocument, {
                     id: sortedVariantIds[0],
                 });
 
                 expect(deleteProductVariant.result).toBe(DeletionResult.DELETED);
 
-                const result2 = await adminClient.query<
-                    GetProductWithVariants.Query,
-                    GetProductWithVariants.Variables
-                >(GET_PRODUCT_WITH_VARIANTS, {
+                const result2 = await adminClient.query(getProductWithVariantsDocument, {
                     id: newProduct.id,
                 });
-                expect(result2.product!.variants.map(v => v.id).sort()).toEqual(['T_36', 'T_37']);
+                productGuard.assertSuccess(result2.product);
+                expect(result2.product.variants.map(v => v.id).sort()).toEqual(['T_36', 'T_37']);
 
-                deletedVariant = result1.product?.variants.find(v => v.id === 'T_35')!;
+                const foundVariant = result1.product.variants.find(v => v.id === 'T_35');
+                variantGuard.assertSuccess(foundVariant);
+                deletedVariant = foundVariant;
             });
 
-            /** Testing https://github.com/vendure-ecommerce/vendure/issues/412 **/
+            /** Testing https://github.com/vendurehq/vendure/issues/412 **/
             it('createProductVariants ignores deleted variants when checking for existing combinations', async () => {
-                const { createProductVariants } = await adminClient.query<
-                    CreateProductVariants.Mutation,
-                    CreateProductVariants.Variables
-                >(CREATE_PRODUCT_VARIANTS, {
+                const { createProductVariants } = await adminClient.query(createProductVariantsDocument, {
                     input: [
                         {
                             productId: newProduct.id,
@@ -1489,54 +1757,217 @@ describe('Product resolver', () => {
                 });
 
                 expect(createProductVariants.length).toBe(1);
-                expect(createProductVariants[0]!.options.map(o => o.code).sort()).toEqual(
+                const createdVariant = createProductVariants[0];
+                variantGuard.assertSuccess(createdVariant);
+                expect(createdVariant.options.map(o => o.code).sort()).toEqual(
                     deletedVariant.options.map(o => o.code).sort(),
                 );
+            });
+
+            // https://github.com/vendurehq/vendure/issues/980
+            it('creating variants in a non-default language', async () => {
+                const { createProduct } = await adminClient.query(createProductDocument, {
+                    input: {
+                        translations: [
+                            {
+                                languageCode: LanguageCode.de,
+                                name: 'Ananas',
+                                slug: 'ananas',
+                                description: 'Yummy Ananas',
+                            },
+                        ],
+                    },
+                });
+
+                const { createProductVariants } = await adminClient.query(createProductVariantsDocument, {
+                    input: [
+                        {
+                            productId: createProduct.id,
+                            sku: 'AN1110111',
+                            optionIds: [],
+                            translations: [{ languageCode: LanguageCode.de, name: 'Ananas Klein' }],
+                        },
+                    ],
+                });
+
+                expect(createProductVariants.length).toBe(1);
+                expect(createProductVariants[0]?.name).toBe('Ananas Klein');
+
+                const { product } = await adminClient.query(
+                    getProductWithVariantsDocument,
+                    {
+                        id: createProduct.id,
+                    },
+                    { languageCode: LanguageCode.en },
+                );
+
+                expect(product?.variants.length).toBe(1);
+            });
+
+            // https://github.com/vendurehq/vendure/issues/1631
+            describe('changing the Channel default language', () => {
+                let productId: string;
+
+                function getProductWithVariantsInLanguage(
+                    id: string,
+                    languageCode: LanguageCode,
+                    variantListOptions?: VariablesOf<
+                        typeof getProductWithVariantListDocument
+                    >['variantListOptions'],
+                ) {
+                    return adminClient.query(
+                        getProductWithVariantListDocument,
+                        { id, variantListOptions },
+                        { languageCode },
+                    );
+                }
+
+                beforeAll(async () => {
+                    await adminClient.query(updateGlobalSettingsDocument, {
+                        input: {
+                            availableLanguages: [LanguageCode.en, LanguageCode.de],
+                        },
+                    });
+                    const { createProduct } = await adminClient.query(createProductDocument, {
+                        input: {
+                            translations: [
+                                {
+                                    languageCode: LanguageCode.en,
+                                    name: 'Bottle',
+                                    slug: 'bottle',
+                                    description: 'A container for liquids',
+                                },
+                            ],
+                        },
+                    });
+
+                    productId = createProduct.id;
+                    await adminClient.query(createProductVariantsDocument, {
+                        input: [
+                            {
+                                productId,
+                                sku: 'BOTTLE111',
+                                optionIds: [],
+                                translations: [{ languageCode: LanguageCode.en, name: 'Bottle' }],
+                            },
+                        ],
+                    });
+                });
+
+                afterAll(async () => {
+                    // Restore the default language to English for the subsequent tests
+                    await adminClient.query(updateChannelDocument, {
+                        input: {
+                            id: 'T_1',
+                            defaultLanguageCode: LanguageCode.en,
+                        },
+                    });
+                });
+
+                it('returns all variants', async () => {
+                    const { product: product1 } = await adminClient.query(
+                        getProductWithVariantsDocument,
+                        {
+                            id: productId,
+                        },
+                        { languageCode: LanguageCode.en },
+                    );
+                    expect(product1?.variants.length).toBe(1);
+
+                    // Change the default language of the channel to "de"
+                    const { updateChannel } = await adminClient.query(updateChannelDocument, {
+                        input: {
+                            id: 'T_1',
+                            defaultLanguageCode: LanguageCode.de,
+                        },
+                    });
+                    updateChannelGuard.assertSuccess(updateChannel);
+                    expect((updateChannel as any).defaultLanguageCode).toBe(LanguageCode.de);
+
+                    // Fetch the product in en, it should still return 1 variant
+                    const { product: product2 } = await getProductWithVariantsInLanguage(
+                        productId,
+                        LanguageCode.en,
+                    );
+                    expect(product2?.variantList.items.length).toBe(1);
+
+                    // Fetch the product in de, it should still return 1 variant
+                    const { product: product3 } = await getProductWithVariantsInLanguage(
+                        productId,
+                        LanguageCode.de,
+                    );
+                    expect(product3?.variantList.items.length).toBe(1);
+                });
+
+                it('returns all variants when sorting on variant name', async () => {
+                    // Fetch the product in en, it should still return 1 variant
+                    const { product: product1 } = await getProductWithVariantsInLanguage(
+                        productId,
+                        LanguageCode.en,
+                        { sort: { name: SortOrder.ASC } },
+                    );
+                    expect(product1?.variantList.items.length).toBe(1);
+
+                    // Fetch the product in de, it should still return 1 variant
+                    const { product: product2 } = await getProductWithVariantsInLanguage(
+                        productId,
+                        LanguageCode.de,
+                        { sort: { name: SortOrder.ASC } },
+                    );
+                    expect(product2?.variantList.items.length).toBe(1);
+                });
             });
         });
     });
 
     describe('deletion', () => {
-        let allProducts: GetProductList.Items[];
-        let productToDelete: GetProductList.Items;
+        let allProducts: ResultOf<typeof getProductListDocument>['products']['items'];
+        let productToDelete: NonNullable<ResultOf<typeof getProductWithVariantsDocument>['product']>;
 
         beforeAll(async () => {
-            const result = await adminClient.query<GetProductList.Query, GetProductList.Variables>(
-                GET_PRODUCT_LIST,
-                {
-                    options: {
-                        sort: {
-                            id: SortOrder.ASC,
-                        },
+            const result = await adminClient.query(getProductListDocument, {
+                options: {
+                    sort: {
+                        id: SortOrder.ASC,
                     },
                 },
-            );
+            });
             allProducts = result.products.items;
         });
 
         it('deletes a product', async () => {
-            productToDelete = allProducts[0];
-            const result = await adminClient.query<DeleteProduct.Mutation, DeleteProduct.Variables>(
-                DELETE_PRODUCT,
-                { id: productToDelete.id },
-            );
+            const { product } = await adminClient.query(getProductWithVariantsDocument, {
+                id: allProducts[0].id,
+            });
+            productGuard.assertSuccess(product);
+            const result = await adminClient.query(deleteProductDocument, { id: product.id });
 
             expect(result.deleteProduct).toEqual({ result: DeletionResult.DELETED });
+
+            productToDelete = product;
         });
 
         it('cannot get a deleted product', async () => {
-            const result = await adminClient.query<
-                GetProductWithVariants.Query,
-                GetProductWithVariants.Variables
-            >(GET_PRODUCT_WITH_VARIANTS, {
+            const { product } = await adminClient.query(getProductWithVariantsDocument, {
                 id: productToDelete.id,
             });
 
-            expect(result.product).toBe(null);
+            expect(product).toBe(null);
+        });
+
+        // https://github.com/vendurehq/vendure/issues/1096
+        it('variants of deleted product are also deleted', async () => {
+            for (const variant of productToDelete.variants) {
+                const { productVariant } = await adminClient.query(getProductVariantDocument, {
+                    id: variant.id,
+                });
+
+                expect(productVariant).toBe(null);
+            }
         });
 
         it('deleted product omitted from list', async () => {
-            const result = await adminClient.query<GetProductList.Query>(GET_PRODUCT_LIST);
+            const result = await adminClient.query(getProductListDocument);
 
             expect(result.products.items.length).toBe(allProducts.length - 1);
             expect(result.products.items.map(c => c.id).includes(productToDelete.id)).toBe(false);
@@ -1546,13 +1977,13 @@ describe('Product resolver', () => {
             'updateProduct throws for deleted product',
             assertThrowsWithMessage(
                 () =>
-                    adminClient.query<UpdateProduct.Mutation, UpdateProduct.Variables>(UPDATE_PRODUCT, {
+                    adminClient.query(updateProductDocument, {
                         input: {
                             id: productToDelete.id,
                             facetValueIds: ['T_1'],
                         },
                     }),
-                `No Product with the id '1' could be found`,
+                'No Product with the id "1" could be found',
             ),
         );
 
@@ -1560,14 +1991,11 @@ describe('Product resolver', () => {
             'addOptionGroupToProduct throws for deleted product',
             assertThrowsWithMessage(
                 () =>
-                    adminClient.query<AddOptionGroupToProduct.Mutation, AddOptionGroupToProduct.Variables>(
-                        ADD_OPTION_GROUP_TO_PRODUCT,
-                        {
-                            optionGroupId: 'T_1',
-                            productId: productToDelete.id,
-                        },
-                    ),
-                `No Product with the id '1' could be found`,
+                    adminClient.query(addOptionGroupToProductDocument, {
+                        optionGroupId: 'T_1',
+                        productId: productToDelete.id,
+                    }),
+                'No Product with the id "1" could be found',
             ),
         );
 
@@ -1575,101 +2003,95 @@ describe('Product resolver', () => {
             'removeOptionGroupToProduct throws for deleted product',
             assertThrowsWithMessage(
                 () =>
-                    adminClient.query<
-                        RemoveOptionGroupFromProduct.Mutation,
-                        RemoveOptionGroupFromProduct.Variables
-                    >(REMOVE_OPTION_GROUP_FROM_PRODUCT, {
+                    adminClient.query(removeOptionGroupFromProductDocument, {
                         optionGroupId: 'T_1',
                         productId: productToDelete.id,
                     }),
-                `No Product with the id '1' could be found`,
+                'No Product with the id "1" could be found',
             ),
         );
 
-        // https://github.com/vendure-ecommerce/vendure/issues/558
+        // https://github.com/vendurehq/vendure/issues/558
         it('slug of a deleted product can be re-used', async () => {
-            const result = await adminClient.query<CreateProduct.Mutation, CreateProduct.Variables>(
-                CREATE_PRODUCT,
-                {
-                    input: {
-                        translations: [
-                            {
-                                languageCode: LanguageCode.en,
-                                name: 'Product reusing deleted slug',
-                                slug: productToDelete.slug,
-                                description: 'stuff',
-                            },
-                        ],
-                    },
+            const result = await adminClient.query(createProductDocument, {
+                input: {
+                    translations: [
+                        {
+                            languageCode: LanguageCode.en,
+                            name: 'Product reusing deleted slug',
+                            slug: productToDelete.slug,
+                            description: 'stuff',
+                        },
+                    ],
                 },
-            );
+            });
             expect(result.createProduct.slug).toBe(productToDelete.slug);
         });
 
-        // https://github.com/vendure-ecommerce/vendure/issues/800
-        it('product can be fetched by slug of a deleted product', async () => {
-            const { product } = await adminClient.query<GetProductSimple.Query, GetProductSimple.Variables>(
-                GET_PRODUCT_SIMPLE,
-                { slug: productToDelete.slug },
-            );
+        // https://github.com/vendurehq/vendure/issues/1505
+        it('attempting to re-use deleted slug twice is not allowed', async () => {
+            const result = await adminClient.query(createProductDocument, {
+                input: {
+                    translations: [
+                        {
+                            languageCode: LanguageCode.en,
+                            name: 'Product reusing deleted slug',
+                            slug: productToDelete.slug,
+                            description: 'stuff',
+                        },
+                    ],
+                },
+            });
 
-            if (!product) {
-                fail('Product not found');
-                return;
-            }
+            expect(result.createProduct.slug).not.toBe(productToDelete.slug);
+            expect(result.createProduct.slug).toBe('laptop-2');
+        });
+
+        // https://github.com/vendurehq/vendure/issues/800
+        it('product can be fetched by slug of a deleted product', async () => {
+            const { product } = await adminClient.query(getProductSimpleDocument, {
+                slug: productToDelete.slug,
+            });
+            productQueryGuard.assertSuccess(product);
             expect(product.slug).toBe(productToDelete.slug);
         });
     });
+
+    async function createOptionGroup(name: string, options: string[]) {
+        const { createProductOptionGroup } = await adminClient.query(createProductOptionGroupDocument, {
+            input: {
+                code: name.toLowerCase(),
+                translations: [{ languageCode: LanguageCode.en, name }],
+                options: options.map(option => ({
+                    code: option.toLowerCase(),
+                    translations: [{ languageCode: LanguageCode.en, name: option }],
+                })),
+            },
+        });
+        return createProductOptionGroup;
+    }
 });
 
-export const REMOVE_OPTION_GROUP_FROM_PRODUCT = gql`
-    mutation RemoveOptionGroupFromProduct($productId: ID!, $optionGroupId: ID!) {
-        removeOptionGroupFromProduct(productId: $productId, optionGroupId: $optionGroupId) {
-            ...ProductWithOptions
-            ... on ProductOptionInUseError {
-                errorCode
-                message
-                optionGroupCode
-                productVariantCount
-            }
-        }
-    }
-    ${PRODUCT_WITH_OPTIONS_FRAGMENT}
-`;
-
-export const GET_OPTION_GROUP = gql`
-    query GetOptionGroup($id: ID!) {
-        productOptionGroup(id: $id) {
-            id
-            code
-            options {
-                id
-                code
-            }
-        }
-    }
-`;
-
-export const GET_PRODUCT_VARIANT = gql`
-    query GetProductVariant($id: ID!) {
-        productVariant(id: $id) {
-            id
-            name
-        }
-    }
-`;
-
-export const GET_PRODUCT_VARIANT_LIST = gql`
-    query GetProductVariantLIST($options: ProductVariantListOptions, $productId: ID) {
-        productVariants(options: $options, productId: $productId) {
+const getProductListFacetValuesDocument = graphql(`
+    query GetProductListFacetValues($options: ProductListOptions) {
+        products(options: $options) {
             items {
                 id
-                name
-                sku
-                price
-                priceWithTax
+                facetValues {
+                    id
+                }
             }
-            totalItems
         }
     }
-`;
+`);
+
+const getProductFacetValuesDocument = graphql(`
+    query GetProductFacetValues($id: ID!) {
+        product(id: $id) {
+            id
+            facetValues {
+                id
+            }
+        }
+    }
+`);

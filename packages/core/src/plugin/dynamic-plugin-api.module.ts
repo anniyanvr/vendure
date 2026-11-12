@@ -1,7 +1,7 @@
 import { DynamicModule } from '@nestjs/common';
+import { Type } from '@vendure/common/lib/shared-types';
+import { notNullOrUndefined } from '@vendure/common/lib/shared-utils';
 
-import { Type } from '../../../common/lib/shared-types';
-import { notNullOrUndefined } from '../../../common/lib/shared-utils';
 import { getConfig } from '../config/config-helpers';
 
 import { getModuleMetadata, graphQLResolversFor, isDynamicModule } from './plugin-metadata';
@@ -33,21 +33,6 @@ export function createDynamicGraphQlModulesForPlugins(apiType: 'shop' | 'admin')
         .filter(notNullOrUndefined);
 }
 
-/**
- * This function retrieves any dynamic modules which were created with createDynamicGraphQlModulesForPlugins.
- */
-export function getDynamicGraphQlModulesForPlugins(apiType: 'shop' | 'admin'): Array<Type<any>> {
-    return getConfig()
-        .plugins.map(plugin => {
-            const pluginModule = isDynamicModule(plugin) ? plugin.module : plugin;
-            const resolvers = graphQLResolversFor(plugin, apiType) || [];
-
-            const className = dynamicClassName(pluginModule, apiType);
-            return dynamicApiModuleClassMap[className];
-        })
-        .filter(notNullOrUndefined);
-}
-
 function dynamicClassName(module: Type<any>, apiType: 'shop' | 'admin'): string {
-    return module.name + `Dynamic` + (apiType === 'shop' ? 'Shop' : 'Admin') + 'Module';
+    return module.name + 'Dynamic' + (apiType === 'shop' ? 'Shop' : 'Admin') + 'Module';
 }

@@ -1,6 +1,8 @@
 import { Injectable } from '@nestjs/common';
+import { pick } from '@vendure/common/lib/pick';
 import { ID, Type } from '@vendure/common/lib/shared-types';
 import { getGraphQlInputName } from '@vendure/common/lib/shared-utils';
+import { In } from 'typeorm';
 
 import { RequestContext } from '../../../api/common/request-context';
 import { ConfigService } from '../../../config/config.service';
@@ -10,12 +12,15 @@ import {
     HasCustomFields,
     RelationCustomFieldConfig,
 } from '../../../config/custom-field/custom-field-types';
+import { TransactionalConnection } from '../../../connection/transactional-connection';
 import { VendureEntity } from '../../../entity/base/base.entity';
-import { TransactionalConnection } from '../../transaction/transactional-connection';
 
 @Injectable()
 export class CustomFieldRelationService {
-    constructor(private connection: TransactionalConnection, private configService: ConfigService) {}
+    constructor(
+        private connection: TransactionalConnection,
+        private configService: ConfigService,
+    ) {}
 
     /**
      * @description
@@ -43,15 +48,35 @@ export class CustomFieldRelationService {
                         // an explicitly `null` value means remove the relation
                         relations = null;
                     } else if (field.list && Array.isArray(idOrIds) && idOrIds.every(id => this.isId(id))) {
-                        relations = await this.connection.getRepository(ctx, field.entity).findByIds(idOrIds);
+                        relations = await this.connection
+                            .getRepository(ctx, field.entity)
+                            .findBy({ id: In(idOrIds) });
                     } else if (!field.list && this.isId(idOrIds)) {
-                        relations = await this.connection.getRepository(ctx, field.entity).findOne(idOrIds);
+                        relations = await this.connection
+                            .getRepository(ctx, field.entity)
+                            .findOne({ where: { id: idOrIds } });
                     }
                     if (relations !== undefined) {
-                        entity.customFields = { ...entity.customFields, [field.name]: relations };
+                        const entityWithCustomFields = await this.connection
+                            .getRepository(ctx, entityType)
+                            .findOne({ where: { id: entity.id } as any, loadEagerRelations: false });
+                        entity.customFields = {
+                            ...entity.customFields,
+                            ...entityWithCustomFields?.customFields,
+                            [field.name]: relations,
+                            // The relation id column must always be kept in sync with the relation
+                            // itself, otherwise a stale id value would conflict with the relation
+                            // when persisting, since both map to the same database column.
+                            ...(field.list
+                                ? {}
+                                : {
+                                      [`${field.name}Id`]:
+                                          relations && !Array.isArray(relations) ? relations.id : null,
+                                  }),
+                        };
                         await this.connection
                             .getRepository(ctx, entityType)
-                            .save(entity as any, { reload: false });
+                            .save(pick(entity, ['id', 'customFields']) as any, { reload: false });
                     }
                 }
             }
@@ -59,7 +84,7 @@ export class CustomFieldRelationService {
         return entity;
     }
 
-    private isRelationalType(input: CustomFieldConfig): input is RelationCustomFieldConfig {
+    private isRelationalType(this: void, input: CustomFieldConfig): input is RelationCustomFieldConfig {
         return input.type === 'relation';
     }
 

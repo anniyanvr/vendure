@@ -1,26 +1,33 @@
-/* tslint:disable:no-non-null-assertion */
+/* eslint-disable @typescript-eslint/no-non-null-assertion */
 import { Injectable, OnApplicationBootstrap, OnModuleDestroy } from '@nestjs/common';
 import { ModuleRef } from '@nestjs/core';
 import { Test, TestingModule } from '@nestjs/testing';
 import { JobState } from '@vendure/common/lib/generated-types';
 import { Subject } from 'rxjs';
 import { take } from 'rxjs/operators';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { assertFound, Injector } from '../common';
 import { ConfigService } from '../config/config.service';
 import { ProcessContext, setProcessContext } from '../process-context/process-context';
 
 import { Job } from './job';
+import { JobBuffer } from './job-buffer/job-buffer';
+import { JobBufferService } from './job-buffer/job-buffer.service';
+import { TestingJobBufferStorageStrategy } from './job-buffer/testing-job-buffer-storage-strategy';
+import { JobQueue } from './job-queue';
 import { JobQueueService } from './job-queue.service';
 import { TestingJobQueueStrategy } from './testing-job-queue-strategy';
 
 const queuePollInterval = 10;
-const backoffStrategySpy = jest.fn();
+const defaultConcurrency = 1;
+const backoffStrategySpy = vi.fn();
 const testJobQueueStrategy = new TestingJobQueueStrategy({
-    concurrency: 1,
+    concurrency: defaultConcurrency,
     pollInterval: queuePollInterval,
     backoffStrategy: backoffStrategySpy.mockReturnValue(0),
 });
+const testJobBufferStorageStrategy = new TestingJobBufferStorageStrategy();
 
 describe('JobQueueService', () => {
     let jobQueueService: JobQueueService;
@@ -31,13 +38,38 @@ describe('JobQueueService', () => {
         return assertFound(testJobQueueStrategy.findOne(id));
     }
 
+    /**
+     * Polls the strategy until every given job is settled. ActiveQueue persists a settled
+     * job from its own `onFailOrComplete()` chain, which the test cannot await, so a fixed
+     * number of ticks would only line up with that chain by accident.
+     */
+    async function waitUntilSettled(...ids: string[]): Promise<void> {
+        const deadline = Date.now() + 2_000;
+        while (Date.now() < deadline) {
+            const jobs = await Promise.all(ids.map(id => getJob(id)));
+            if (jobs.every(job => job.isSettled)) {
+                return;
+            }
+            await tick(1);
+        }
+        throw new Error(`Timed out waiting for jobs to settle: ${ids.join(', ')}`);
+    }
+
     beforeEach(async () => {
         setProcessContext('server');
+
+        // Both strategies are module-level and shared by every test in this file, and
+        // `module.close()` does not clear them. Reset them so no test inherits the jobs,
+        // buffers or concurrency left behind by the one before it.
+        testJobQueueStrategy.reset();
+        testJobQueueStrategy.concurrency = defaultConcurrency;
+        testJobBufferStorageStrategy.reset();
 
         module = await Test.createTestingModule({
             providers: [
                 { provide: ConfigService, useClass: MockConfigService },
                 JobQueueService,
+                JobBufferService,
                 ProcessContext,
             ],
         }).compile();
@@ -91,7 +123,7 @@ describe('JobQueueService', () => {
     });
 
     it('job marked as failed when exception thrown', async () => {
-        const subject = new Subject();
+        const subject = new Subject<string>();
         const testQueue = await jobQueueService.createQueue<string>({
             name: 'test',
             process: async job => {
@@ -132,7 +164,7 @@ describe('JobQueueService', () => {
     });
 
     it('jobs processed in FIFO queue', async () => {
-        const subject = new Subject();
+        const subject = new Subject<void>();
         const testQueue = await jobQueueService.createQueue<string>({
             name: 'test',
             process: job => {
@@ -176,12 +208,9 @@ describe('JobQueueService', () => {
     });
 
     it('with concurrency', async () => {
-        const testingJobQueueStrategy = module.get(ConfigService).jobQueueOptions
-            .jobQueueStrategy as TestingJobQueueStrategy;
+        testJobQueueStrategy.concurrency = 2;
 
-        testingJobQueueStrategy.concurrency = 2;
-
-        const subject = new Subject();
+        const subject = new Subject<void>();
         const testQueue = await jobQueueService.createQueue<string>({
             name: 'test',
             process: job => {
@@ -218,6 +247,10 @@ describe('JobQueueService', () => {
     });
 
     it('processes existing jobs on start', async () => {
+        // Neither job settles until `subject` emits, so both occupy a concurrency slot at
+        // the same time. ActiveQueue reads this when the queue is created below.
+        testJobQueueStrategy.concurrency = 2;
+
         await testJobQueueStrategy.prePopulate([
             new Job<any>({
                 queueName: 'test',
@@ -231,20 +264,34 @@ describe('JobQueueService', () => {
             }),
         ]);
 
+        const subject = new Subject<void>();
+        const processing = new Set<string>();
+        let onBothProcessing: () => void;
+        const bothProcessing = new Promise<void>(resolve => (onBothProcessing = resolve));
         const testQueue = await jobQueueService.createQueue<string>({
             name: 'test',
-            process: async job => {
-                return;
+            process: job => {
+                processing.add(job.id as string);
+                if (processing.size === 2) {
+                    onBothProcessing();
+                }
+                return subject.pipe(take(1)).toPromise();
             },
         });
 
-        const job1 = await getJob('job-1');
-        const job2 = await getJob('job-2');
-        expect(job1?.state).toBe(JobState.COMPLETED);
-        expect(job2?.state).toBe(JobState.RUNNING);
+        const getStates = async () => [(await getJob('job-1')).state, (await getJob('job-2')).state];
 
-        await tick(queuePollInterval);
-        expect((await getJob('job-2')).state).toBe(JobState.COMPLETED);
+        // ActiveQueue persists a job before it calls `process`, so once both jobs have
+        // entered `process` both must be RUNNING in the store. Neither has settled, so this
+        // can only hold if the queue dispatched the jobs which existed before it started.
+        await bothProcessing;
+        expect(await getStates()).toEqual([JobState.RUNNING, JobState.RUNNING]);
+
+        subject.next();
+        await waitUntilSettled('job-1', 'job-2');
+        expect(await getStates()).toEqual([JobState.COMPLETED, JobState.COMPLETED]);
+
+        subject.complete();
     });
 
     it('retries', async () => {
@@ -278,7 +325,9 @@ describe('JobQueueService', () => {
         await tick(queuePollInterval);
 
         expect(backoffStrategySpy).toHaveBeenCalledTimes(1);
-        expect(backoffStrategySpy.mock.calls[0]).toEqual(['test', 1, await getJob(testJob)]);
+        expect(backoffStrategySpy.mock.calls[0][0]).toBe('test');
+        expect(backoffStrategySpy.mock.calls[0][1]).toBe(1);
+        expect(backoffStrategySpy.mock.calls[0][2].id).toBe(testJob.id);
 
         subject.next(false);
         await tick();
@@ -288,7 +337,9 @@ describe('JobQueueService', () => {
         await tick(queuePollInterval);
 
         expect(backoffStrategySpy).toHaveBeenCalledTimes(2);
-        expect(backoffStrategySpy.mock.calls[1]).toEqual(['test', 2, await getJob(testJob)]);
+        expect(backoffStrategySpy.mock.calls[1][0]).toBe('test');
+        expect(backoffStrategySpy.mock.calls[1][1]).toBe(2);
+        expect(backoffStrategySpy.mock.calls[1][2].id).toBe(testJob.id);
 
         subject.next(false);
         await tick();
@@ -366,6 +417,83 @@ describe('JobQueueService', () => {
 
         expect((await getJob(testJob)).state).toBe(JobState.PENDING);
     });
+
+    describe('buffering', () => {
+        class TestJobBuffer implements JobBuffer<string> {
+            readonly id = 'test-job-buffer';
+
+            collect(job: Job<string>): boolean | Promise<boolean> {
+                return job.queueName === 'buffer-test-queue-1';
+            }
+
+            reduce(collectedJobs: Array<Job<string>>): Array<Job<string>> {
+                const concated = collectedJobs.map(j => j.data).join(' ');
+                return [
+                    new Job({
+                        ...collectedJobs[0],
+                        id: undefined,
+                        data: concated,
+                    }),
+                ];
+            }
+        }
+
+        let testQueue1: JobQueue<string>;
+        let testQueue2: JobQueue<string>;
+        const subject1 = new Subject();
+        const subject2 = new Subject();
+        const testJobBuffer = new TestJobBuffer();
+
+        beforeEach(async () => {
+            // Both queue-2 jobs must be dispatched by the same poll cycle. ActiveQueue reads
+            // the concurrency when the queue is created, so this has to be set beforehand.
+            testJobQueueStrategy.concurrency = 2;
+
+            testQueue1 = await jobQueueService.createQueue({
+                name: 'buffer-test-queue-1',
+                process: job => {
+                    return subject1.toPromise();
+                },
+            });
+            testQueue2 = await jobQueueService.createQueue({
+                name: 'buffer-test-queue-2',
+                process: job => {
+                    return subject2.toPromise();
+                },
+            });
+
+            jobQueueService.addBuffer(testJobBuffer);
+        });
+
+        it('buffers the specified jobs', async () => {
+            const testJob1_1 = await testQueue1.add('hello');
+            const testJob1_2 = await testQueue1.add('world');
+            const testJob2_1 = await testQueue2.add('foo');
+            const testJob2_2 = await testQueue2.add('bar');
+
+            await tick(queuePollInterval);
+            expect(await getJob(testJob1_1)).toBeUndefined();
+            expect(await getJob(testJob1_2)).toBeUndefined();
+
+            expect((await getJob(testJob2_1)).state).toBe(JobState.RUNNING);
+            expect((await getJob(testJob2_2)).state).toBe(JobState.RUNNING);
+
+            // #5395: jobs must be stored under the buffer's declared id, not under `undefined`
+            const bufferedJobs = testJobBufferStorageStrategy.getBufferedJobs('test-job-buffer');
+            expect(bufferedJobs.map(j => j.data)).toEqual(['hello', 'world']);
+        });
+
+        it('flushes and reduces buffered jobs', async () => {
+            await testQueue1.add('hello');
+            await testQueue1.add('world');
+            await tick(queuePollInterval);
+
+            const result = await jobQueueService.flush(testJobBuffer);
+
+            expect(result.length).toBe(1);
+            expect(result[0].data).toBe('hello world');
+        });
+    });
 });
 
 function tick(ms: number = 0): Promise<void> {
@@ -385,14 +513,19 @@ class MockConfigService implements OnApplicationBootstrap, OnModuleDestroy {
     jobQueueOptions = {
         jobQueueStrategy: testJobQueueStrategy,
         activeQueues: [],
+        jobBufferStorageStrategy: testJobBufferStorageStrategy,
+    };
+
+    systemOptions = {
+        errorHandlers: [],
     };
 
     async onApplicationBootstrap() {
         const injector = new Injector(this.moduleRef);
-        await this.jobQueueOptions.jobQueueStrategy.init(injector);
+        this.jobQueueOptions.jobQueueStrategy.init(injector);
     }
 
     async onModuleDestroy() {
-        await this.jobQueueOptions.jobQueueStrategy.destroy();
+        this.jobQueueOptions.jobQueueStrategy.destroy();
     }
 }

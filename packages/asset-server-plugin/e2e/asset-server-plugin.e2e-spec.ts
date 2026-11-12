@@ -1,42 +1,65 @@
-/* tslint:disable:no-non-null-assertion */
-import { DefaultLogger, LogLevel, mergeConfig } from '@vendure/core';
+/* eslint-disable @typescript-eslint/no-non-null-assertion */
+import { DeletionResult } from '@vendure/common/lib/generated-types';
+import { ConfigService, mergeConfig } from '@vendure/core';
 import { createTestEnvironment } from '@vendure/testing';
+import { exec } from 'child_process';
 import fs from 'fs-extra';
-import gql from 'graphql-tag';
-import fetch from 'node-fetch';
 import path from 'path';
+import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 import { initialData } from '../../../e2e-common/e2e-initial-data';
-import { testConfig, TEST_SETUP_TIMEOUT_MS } from '../../../e2e-common/test-config';
+import { TEST_SETUP_TIMEOUT_MS, testConfig } from '../../../e2e-common/test-config';
+import {
+    GetImageTransformParametersArgs,
+    ImageTransformParameters,
+    ImageTransformStrategy,
+} from '../src/config/image-transform-strategy';
+import { DEFAULT_CACHE_HEADER } from '../src/constants';
 import { AssetServerPlugin } from '../src/plugin';
+import { CacheConfig } from '../src/types';
 
-import { CreateAssets, DeleteAsset, DeletionResult } from './graphql/generated-e2e-asset-server-plugin-types';
+import { createAssetsDocument, deleteAssetDocument } from './graphql/admin-definitions';
+import { assetFragment } from './graphql/fragments-admin';
+import { FragmentOf } from './graphql/graphql-admin';
 
 const TEST_ASSET_DIR = 'test-assets';
 const IMAGE_BASENAME = 'derick-david-409858-unsplash';
 
+class TestImageTransformStrategy implements ImageTransformStrategy {
+    getImageTransformParameters(args: GetImageTransformParametersArgs): ImageTransformParameters {
+        if (args.input.preset === 'test') {
+            throw new Error('Test error');
+        }
+        return args.input;
+    }
+}
+
 describe('AssetServerPlugin', () => {
-    let asset: CreateAssets.CreateAssets;
+    let asset: FragmentOf<typeof assetFragment>;
     const sourceFilePath = path.join(__dirname, TEST_ASSET_DIR, `source/b6/${IMAGE_BASENAME}.jpg`);
     const previewFilePath = path.join(__dirname, TEST_ASSET_DIR, `preview/71/${IMAGE_BASENAME}__preview.jpg`);
+    const options = {
+        assetUploadDir: path.join(__dirname, TEST_ASSET_DIR),
+        route: 'assets',
+        imageTransformStrategy: new TestImageTransformStrategy(),
+    };
 
-    const { server, adminClient, shopClient } = createTestEnvironment(
-        mergeConfig(testConfig, {
-            apiOptions: {
-                port: 5050,
+    const { server, adminClient } = createTestEnvironment(
+        mergeConfig(testConfig(), {
+            // logger: new DefaultLogger({ level: LogLevel.Info }),
+            // The types these tests actually upload. `text/html` is added on top of the usual
+            // image/pdf set so the security-headers tests can exercise the non-SVG markup branch.
+            assetOptions: {
+                permittedFileTypes: ['image/*', '.pdf', 'text/html'],
             },
-            logger: new DefaultLogger({ level: LogLevel.Info }),
-            plugins: [
-                AssetServerPlugin.init({
-                    port: 3060,
-                    assetUploadDir: path.join(__dirname, TEST_ASSET_DIR),
-                    route: 'assets',
-                }),
-            ],
+            plugins: [AssetServerPlugin.init(options)],
         }),
     );
 
     beforeAll(async () => {
+        // Multiple test servers in this file share AssetServerPlugin's static options
+        // (read at bootstrap), so reassert this suite's config immediately before boot.
+        AssetServerPlugin.init(options);
         await fs.emptyDir(path.join(__dirname, TEST_ASSET_DIR, 'source'));
         await fs.emptyDir(path.join(__dirname, TEST_ASSET_DIR, 'preview'));
         await fs.emptyDir(path.join(__dirname, TEST_ASSET_DIR, 'cache'));
@@ -55,26 +78,26 @@ describe('AssetServerPlugin', () => {
 
     it('names the Asset correctly', async () => {
         const filesToUpload = [path.join(__dirname, `fixtures/assets/${IMAGE_BASENAME}.jpg`)];
-        const { createAssets }: CreateAssets.Mutation = await adminClient.fileUploadMutation({
-            mutation: CREATE_ASSETS,
+        const { createAssets } = await adminClient.fileUploadMutation({
+            mutation: createAssetsDocument,
             filePaths: filesToUpload,
             mapVariables: filePaths => ({
                 input: filePaths.map(p => ({ file: null })),
             }),
         });
 
-        expect(createAssets[0].name).toBe(`${IMAGE_BASENAME}.jpg`);
         asset = createAssets[0];
+        expect(asset.name).toBe(`${IMAGE_BASENAME}.jpg`);
     });
 
-    it('creates the expected asset files', async () => {
+    it('creates the expected asset files', () => {
         expect(fs.existsSync(sourceFilePath)).toBe(true);
         expect(fs.existsSync(previewFilePath)).toBe(true);
     });
 
     it('serves the source file', async () => {
         const res = await fetch(`${asset.source}`);
-        const responseBuffer = await res.buffer();
+        const responseBuffer = Buffer.from(await res.arrayBuffer());
         const sourceFile = await fs.readFile(sourceFilePath);
 
         expect(Buffer.compare(responseBuffer, sourceFile)).toBe(0);
@@ -82,8 +105,38 @@ describe('AssetServerPlugin', () => {
 
     it('serves the untransformed preview file', async () => {
         const res = await fetch(`${asset.preview}`);
-        const responseBuffer = await res.buffer();
+        const responseBuffer = Buffer.from(await res.arrayBuffer());
         const previewFile = await fs.readFile(previewFilePath);
+
+        expect(Buffer.compare(responseBuffer, previewFile)).toBe(0);
+    });
+
+    it('can handle non-latin filenames', async () => {
+        const FILE_NAME_ZH = '白飯';
+        const filesToUpload = [path.join(__dirname, `fixtures/assets/${FILE_NAME_ZH}.jpg`)];
+        const { createAssets } = await adminClient.fileUploadMutation({
+            mutation: createAssetsDocument,
+            filePaths: filesToUpload,
+            mapVariables: filePaths => ({
+                input: filePaths.map(p => ({ file: null })),
+            }),
+        });
+        expect(createAssets[0].name).toBe(`${FILE_NAME_ZH}.jpg`);
+        expect(createAssets[0].source).toContain(`${FILE_NAME_ZH}.jpg`);
+
+        const previewUrl = encodeURI(createAssets[0].preview);
+        const res = await fetch(previewUrl);
+
+        expect(res.status).toBe(200);
+
+        const previewFilePathZH = path.join(
+            __dirname,
+            TEST_ASSET_DIR,
+            `preview/3f/${FILE_NAME_ZH}__preview.jpg`,
+        );
+
+        const responseBuffer = Buffer.from(await res.arrayBuffer());
+        const previewFile = await fs.readFile(previewFilePathZH);
 
         expect(Buffer.compare(responseBuffer, previewFile)).toBe(0);
     });
@@ -99,7 +152,7 @@ describe('AssetServerPlugin', () => {
 
         it('creates cached image on first request', async () => {
             const res = await fetch(`${asset.preview}?preset=thumb`);
-            const responseBuffer = await res.buffer();
+            const responseBuffer = Buffer.from(await res.arrayBuffer());
             expect(fs.existsSync(cacheFileDir)).toBe(true);
 
             const files = await fs.readdir(cacheFileDir);
@@ -133,7 +186,7 @@ describe('AssetServerPlugin', () => {
             expect(files.length).toBe(1);
 
             const previewFile = await fs.readFile(previewFilePath);
-            const responseBuffer = await res.buffer();
+            const responseBuffer = Buffer.from(await res.arrayBuffer());
             expect(Buffer.compare(responseBuffer, previewFile)).toBe(0);
         });
 
@@ -152,6 +205,137 @@ describe('AssetServerPlugin', () => {
         });
     });
 
+    // GHSA-f4r3-h6jf-4m29: harden the headers on served assets so that a permitted-but-scriptable
+    // asset (SVG in particular) cannot execute script when opened directly or embedded.
+    describe('security headers', () => {
+        const BASE_CSP = "default-src 'none'; script-src 'none'";
+        const MARKUP_CSP = `${BASE_CSP}; sandbox`;
+        const uploadAsset = async (fileName: string): Promise<FragmentOf<typeof assetFragment>> => {
+            const { createAssets } = await adminClient.fileUploadMutation({
+                mutation: createAssetsDocument,
+                filePaths: [path.join(__dirname, `fixtures/assets/${fileName}`)],
+                mapVariables: filePaths => ({ input: filePaths.map(() => ({ file: null })) }),
+            });
+            return createAssets[0];
+        };
+
+        it('serves an SVG source as an attachment with nosniff and a sandboxed CSP', async () => {
+            const svgAsset = await uploadAsset('test.svg');
+            const res = await fetch(svgAsset.source);
+
+            expect(res.headers.get('content-type')).toContain('image/svg+xml');
+            expect(res.headers.get('content-disposition')).toBe('attachment');
+            expect(res.headers.get('x-content-type-options')).toBe('nosniff');
+            expect(res.headers.get('content-security-policy')).toBe(MARKUP_CSP);
+        });
+
+        // Upload validation accepts JPEG bytes under an `.svg` name. Its transform is cached and
+        // served as PNG, so the bytes must be PNG too.
+        it('rasterises a resized .svg asset to PNG whatever its bytes are', async () => {
+            const jpegContentAsset = await uploadAsset('jpeg-content.svg');
+            const pngSignature = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+            const res = await fetch(`${jpegContentAsset.source}?w=40`);
+            const body = Buffer.from(await res.arrayBuffer());
+
+            expect(res.headers.get('content-type')).toBe('image/png');
+            expect(body.subarray(0, 8).equals(pngSignature)).toBe(true);
+        });
+
+        it('serves an HTML asset as an attachment (non-SVG markup branch)', async () => {
+            const htmlAsset = await uploadAsset('test.html');
+            const res = await fetch(htmlAsset.source);
+
+            expect(res.headers.get('content-type')).toContain('text/html');
+            expect(res.headers.get('content-disposition')).toBe('attachment');
+            expect(res.headers.get('x-content-type-options')).toBe('nosniff');
+            expect(res.headers.get('content-security-policy')).toBe(MARKUP_CSP);
+        });
+
+        it('does not force-download or sandbox a non-markup asset, but still sends nosniff + CSP', async () => {
+            const jpgAsset = await uploadAsset('test.jpg');
+            const res = await fetch(jpgAsset.source);
+
+            expect(res.headers.get('content-disposition')).toBeNull();
+            expect(res.headers.get('x-content-type-options')).toBe('nosniff');
+            expect(res.headers.get('content-security-policy')).toBe(BASE_CSP);
+        });
+
+        // The regression this split fixes: a PDF must NOT get the `sandbox` token (which forced a
+        // download in Chromium) nor `Content-Disposition: attachment`, so it still renders inline.
+        it('does not sandbox or force-download a PDF', async () => {
+            const pdfAsset = await uploadAsset('test.pdf');
+            const res = await fetch(pdfAsset.source);
+
+            expect(res.headers.get('content-disposition')).toBeNull();
+            expect(res.headers.get('x-content-type-options')).toBe('nosniff');
+            expect(res.headers.get('content-security-policy')).toBe(BASE_CSP);
+        });
+
+        it('sets the same headers on transformed images', async () => {
+            const jpgAsset = await uploadAsset('test.jpg');
+            const res = await fetch(`${jpgAsset.preview}?w=57&h=57`);
+
+            expect(res.headers.get('x-content-type-options')).toBe('nosniff');
+            expect(res.headers.get('content-security-policy')).toBe(BASE_CSP);
+        });
+
+        // A resized SVG is a PNG, so it must be served as `image/png` without the markup headers,
+        // both when it is generated and when it is served from the cache.
+        it('serves a transformed SVG as the rasterised type, not as SVG', async () => {
+            const svgAsset = await uploadAsset('test.svg');
+            const sourceKey = new URL(svgAsset.source).pathname.replace(/^\/assets\//, '');
+            const cacheFileDir = path.join(__dirname, TEST_ASSET_DIR, 'cache', path.dirname(sourceKey));
+            const cachedFileName = new RegExp(`^${path.basename(sourceKey, '.svg')}[0-9a-f]{32}\\.png$`);
+
+            let cachedFileMtime: number | undefined;
+            for (const pass of ['generated', 'from cache']) {
+                const res = await fetch(`${svgAsset.source}?w=100`);
+
+                expect(res.headers.get('content-type'), pass).toBe('image/png');
+                expect(res.headers.get('content-disposition'), pass).toBeNull();
+                expect(res.headers.get('x-content-type-options'), pass).toBe('nosniff');
+                expect(res.headers.get('content-security-policy'), pass).toBe(BASE_CSP);
+                const cachedFiles = (await fs.readdir(cacheFileDir)).filter(f => cachedFileName.test(f));
+                expect(cachedFiles.length, pass).toBe(1);
+                // An unchanged mtime shows the second response was read from the cache, not regenerated.
+                const { mtimeMs } = await fs.stat(path.join(cacheFileDir, cachedFiles[0]));
+                expect(mtimeMs, pass).toBe(cachedFileMtime ?? mtimeMs);
+                cachedFileMtime = mtimeMs;
+            }
+        });
+    });
+
+    describe('Cache-Control headers', () => {
+        it('sets the default header on generated and cached GET and HEAD responses', async () => {
+            const { createAssets } = await adminClient.fileUploadMutation({
+                mutation: createAssetsDocument,
+                filePaths: [path.join(__dirname, 'fixtures/assets/test.jpg')],
+                mapVariables: filePaths => ({ input: filePaths.map(() => ({ file: null })) }),
+            });
+            const testAsset = createAssets[0];
+
+            const generatedGet = await fetch(`${testAsset.preview}?w=53&h=53`);
+            expect(generatedGet.status).toBe(200);
+            expect(generatedGet.headers.get('cache-control')).toBe(DEFAULT_CACHE_HEADER);
+
+            const cachedGet = await fetch(`${testAsset.preview}?w=53&h=53`);
+            expect(cachedGet.status).toBe(200);
+            expect(cachedGet.headers.get('cache-control')).toBe(DEFAULT_CACHE_HEADER);
+
+            const uncached = await fetch(`${testAsset.preview}?w=57&h=57&cache=false`);
+            expect(uncached.status).toBe(200);
+            expect(uncached.headers.get('cache-control')).toBe(DEFAULT_CACHE_HEADER);
+
+            const generatedHead = await fetch(`${testAsset.preview}?w=54&h=54`, { method: 'HEAD' });
+            expect(generatedHead.status).toBe(200);
+            expect(generatedHead.headers.get('cache-control')).toBe(DEFAULT_CACHE_HEADER);
+
+            const cachedHead = await fetch(`${testAsset.preview}?w=54&h=54`, { method: 'HEAD' });
+            expect(cachedHead.status).toBe(200);
+            expect(cachedHead.headers.get('cache-control')).toBe(DEFAULT_CACHE_HEADER);
+        });
+    });
+
     describe('unexpected input', () => {
         it('does not error on non-integer width', async () => {
             return fetch(`${asset.preview}?w=10.5`);
@@ -160,44 +344,82 @@ describe('AssetServerPlugin', () => {
         it('does not error on non-integer height', async () => {
             return fetch(`${asset.preview}?h=10.5`);
         });
+
+        // https://github.com/vendurehq/vendure/security/advisories/GHSA-r9mq-3c9r-fmjq
+        describe('path traversal', () => {
+            function curlWithPathAsIs(url: string) {
+                return new Promise<string>((resolve, reject) => {
+                    // We use curl here rather than fetch or any other fetch-type function because
+                    // those will automatically perform path normalization which will mask the path traversal
+                    return exec(`curl --path-as-is ${url}`, (err, stdout, stderr) => {
+                        if (err) {
+                            reject(err);
+                        }
+                        resolve(stdout);
+                    });
+                });
+            }
+
+            function testPathTraversalOnUrl(urlPath: string) {
+                return async () => {
+                    const port = server.app.get(ConfigService).apiOptions.port;
+                    const result = await curlWithPathAsIs(`http://localhost:${port}/assets${urlPath}`);
+                    expect(result).not.toContain('@vendure/asset-server-plugin');
+                    expect(result.toLowerCase()).toContain('resource not found');
+                };
+            }
+
+            it('blocks path traversal 1', testPathTraversalOnUrl(`/../../package.json`));
+            it('blocks path traversal 2', testPathTraversalOnUrl(`/foo/../../../package.json`));
+            it('blocks path traversal 3', testPathTraversalOnUrl(`/foo/../../../foo/../package.json`));
+            it('blocks path traversal 4', testPathTraversalOnUrl(`/%2F..%2F..%2Fpackage.json`));
+            it('blocks path traversal 5', testPathTraversalOnUrl(`/%2E%2E/%2E%2E/package.json`));
+            it('blocks path traversal 6', testPathTraversalOnUrl(`/..//..//package.json`));
+            it('blocks path traversal 7', testPathTraversalOnUrl(`/.%2F.%2F.%2Fpackage.json`));
+            it('blocks path traversal 8', testPathTraversalOnUrl(`/..\\\\..\\\\package.json`));
+            it('blocks path traversal 9', testPathTraversalOnUrl(`/\\\\\\..\\\\\\..\\\\\\package.json`));
+            it('blocks path traversal 10', testPathTraversalOnUrl(`/./../././.././package.json`));
+            it('blocks path traversal 11', testPathTraversalOnUrl(`/\\.\\..\\.\\.\\..\\.\\package.json`));
+        });
     });
 
     describe('deletion', () => {
         it('deleting Asset deletes binary file', async () => {
-            const { deleteAsset } = await adminClient.query<DeleteAsset.Mutation, DeleteAsset.Variables>(
-                DELETE_ASSET,
-                {
-                    input: {
-                        assetId: asset.id,
-                        force: true,
-                    },
+            const { deleteAsset } = await adminClient.query(deleteAssetDocument, {
+                input: {
+                    assetId: asset.id,
+                    force: true,
                 },
-            );
+            });
 
             expect(deleteAsset.result).toBe(DeletionResult.DELETED);
 
-            expect(fs.existsSync(sourceFilePath)).toBe(false);
-            expect(fs.existsSync(previewFilePath)).toBe(false);
+            await expect
+                .poll(() => [sourceFilePath, previewFilePath].some(filePath => fs.existsSync(filePath)))
+                .toBe(false);
         });
     });
 
     describe('MIME type detection', () => {
-        let testImages: CreateAssets.CreateAssets[] = [];
+        let testImages: Array<FragmentOf<typeof assetFragment>> = [];
 
         async function testMimeTypeOfAssetWithExt(ext: string, expectedMimeType: string) {
-            const testImage = testImages.find(i => i.source.endsWith(ext))!;
-            const result = await fetch(testImage.source);
+            // Use optional chaining so a rejected upload (no `source`) does not throw here and
+            // cascade into false failures for the other formats; assert it was accepted instead.
+            const testImage = testImages.find(i => i.source?.endsWith(ext));
+            expect(testImage?.source, `Asset with extension ".${ext}" was not created`).toBeTruthy();
+            const result = await fetch(testImage!.source);
             const contentType = result.headers.get('Content-Type');
 
             expect(contentType).toBe(expectedMimeType);
         }
 
         beforeAll(async () => {
-            const formats = ['gif', 'jpg', 'png', 'svg', 'tiff', 'webp'];
+            const formats = ['gif', 'jpg', 'pdf', 'png', 'svg', 'tiff', 'webp'];
 
             const filesToUpload = formats.map(ext => path.join(__dirname, `fixtures/assets/test.${ext}`));
-            const { createAssets }: CreateAssets.Mutation = await adminClient.fileUploadMutation({
-                mutation: CREATE_ASSETS,
+            const { createAssets } = await adminClient.fileUploadMutation({
+                mutation: createAssetsDocument,
                 filePaths: filesToUpload,
                 mapVariables: filePaths => ({
                     input: filePaths.map(p => ({ file: null })),
@@ -213,6 +435,10 @@ describe('AssetServerPlugin', () => {
 
         it('jpg', async () => {
             await testMimeTypeOfAssetWithExt('jpg', 'image/jpeg');
+        });
+
+        it('pdf', async () => {
+            await testMimeTypeOfAssetWithExt('pdf', 'application/pdf');
         });
 
         it('png', async () => {
@@ -231,29 +457,81 @@ describe('AssetServerPlugin', () => {
             await testMimeTypeOfAssetWithExt('webp', 'image/webp');
         });
     });
+
+    // https://github.com/vendurehq/vendure/issues/1563
+    it('falls back to binary preview if image file cannot be processed', async () => {
+        const filesToUpload = [path.join(__dirname, 'fixtures/assets/bad-image.jpg')];
+        const { createAssets } = await adminClient.fileUploadMutation({
+            mutation: createAssetsDocument,
+            filePaths: filesToUpload,
+            mapVariables: filePaths => ({
+                input: filePaths.map(p => ({ file: null })),
+            }),
+        });
+
+        expect(createAssets.length).toBe(1);
+        expect(createAssets[0].name).toBe('bad-image.jpg');
+    });
+
+    it('ImageTransformStrategy can throw to prevent transform', async () => {
+        const res = await fetch(`${asset.preview}?preset=test`);
+        expect(res.status).toBe(400);
+        const text = await res.text();
+        expect(text).toContain('Invalid parameters');
+    });
 });
 
-export const CREATE_ASSETS = gql`
-    mutation CreateAssets($input: [CreateAssetInput!]!) {
-        createAssets(input: $input) {
-            ... on Asset {
-                id
-                name
-                source
-                preview
-                focalPoint {
-                    x
-                    y
-                }
-            }
-        }
-    }
-`;
+describe.each<{ dir: string; cacheHeader: string | CacheConfig; expected: string }>([
+    {
+        dir: 'test-assets-cache-custom',
+        cacheHeader: 'public, max-age=3600',
+        expected: 'public, max-age=3600',
+    },
+    { dir: 'test-assets-cache-nostore', cacheHeader: 'no-store', expected: 'no-store' },
+    {
+        dir: 'test-assets-cache-object',
+        cacheHeader: { restriction: 'private', maxAge: 3600 },
+        expected: 'private, max-age=3600',
+    },
+])('AssetServerPlugin with cacheHeader $expected', ({ dir, cacheHeader, expected }) => {
+    const options = { assetUploadDir: path.join(__dirname, dir), route: 'assets', cacheHeader };
+    const { server, adminClient } = createTestEnvironment(
+        mergeConfig(testConfig(), {
+            plugins: [AssetServerPlugin.init(options)],
+        }),
+    );
 
-export const DELETE_ASSET = gql`
-    mutation DeleteAsset($input: DeleteAssetInput!) {
-        deleteAsset(input: $input) {
-            result
-        }
-    }
-`;
+    beforeAll(async () => {
+        // Multiple test servers in this file share AssetServerPlugin's static options
+        // (read at bootstrap), so reassert this suite's config immediately before boot.
+        AssetServerPlugin.init(options);
+        await fs.emptyDir(options.assetUploadDir);
+        await server.init({
+            initialData,
+            productsCsvPath: path.join(__dirname, 'fixtures/e2e-products-empty.csv'),
+            customerCount: 1,
+        });
+        await adminClient.asSuperAdmin();
+    }, TEST_SETUP_TIMEOUT_MS);
+
+    afterAll(async () => {
+        await server.destroy();
+    });
+
+    it('sets the configured header on generated and cached image responses', async () => {
+        const { createAssets } = await adminClient.fileUploadMutation({
+            mutation: createAssetsDocument,
+            filePaths: [path.join(__dirname, 'fixtures/assets/test.jpg')],
+            mapVariables: filePaths => ({ input: filePaths.map(() => ({ file: null })) }),
+        });
+        const url = `${createAssets[0].preview}?w=55&h=55`;
+
+        const generated = await fetch(url);
+        expect(generated.status).toBe(200);
+        expect(generated.headers.get('cache-control')).toBe(expected);
+
+        const cached = await fetch(url);
+        expect(cached.status).toBe(200);
+        expect(cached.headers.get('cache-control')).toBe(expected);
+    });
+});

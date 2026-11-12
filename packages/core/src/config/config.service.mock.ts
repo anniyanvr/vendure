@@ -1,8 +1,12 @@
-import { VendureEntity } from '../entity/base/base.entity';
+/* eslint-disable @typescript-eslint/no-empty-object-type */
+import { Mock, vi } from 'vitest';
+
 import { MockClass } from '../testing/testing-types';
 
 import { ConfigService } from './config.service';
-import { EntityIdStrategy, PrimaryKeyType } from './entity-id-strategy/entity-id-strategy';
+import { EntityIdStrategy } from './entity/entity-id-strategy';
+import { DefaultOrderLineDiscountDistributionStrategy } from './order/default-order-line-discount-distribution-strategy';
+import { OrderOptions } from './vendure-config';
 
 export class MockConfigService implements MockClass<ConfigService> {
     apiOptions = {
@@ -20,9 +24,10 @@ export class MockConfigService implements MockClass<ConfigService> {
     };
     authOptions: {};
     defaultChannelToken: 'channel-token';
-    defaultLanguageCode: jest.Mock<any>;
+    defaultLanguageCode: Mock<any>;
     roundingStrategy: {};
     entityIdStrategy = new MockIdStrategy();
+    entityOptions = {};
     assetOptions = {
         assetNamingStrategy: {} as any,
         assetStorageStrategy: {} as any,
@@ -40,12 +45,15 @@ export class MockConfigService implements MockClass<ConfigService> {
     taxOptions: {};
     emailOptions: {};
     importExportOptions: {};
-    orderOptions = {};
+    orderOptions: Partial<OrderOptions> = {
+        orderLineDiscountDistributionStrategy: new DefaultOrderLineDiscountDistributionStrategy(),
+    };
     customFields = {};
 
     plugins = [];
     logger = {} as any;
     jobQueueOptions = {};
+    systemOptions = {};
 }
 
 export const ENCODED = 'encoded';
@@ -53,6 +61,6 @@ export const DECODED = 'decoded';
 
 export class MockIdStrategy implements EntityIdStrategy<'increment'> {
     readonly primaryKeyType = 'increment';
-    encodeId = jest.fn().mockReturnValue(ENCODED);
-    decodeId = jest.fn().mockReturnValue(DECODED);
+    encodeId = vi.fn().mockReturnValue(ENCODED);
+    decodeId = vi.fn().mockReturnValue(DECODED);
 }

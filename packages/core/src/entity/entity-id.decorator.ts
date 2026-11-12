@@ -30,9 +30,13 @@ export function PrimaryGeneratedId() {
 }
 
 /**
+ * @description
  * Decorates a property which points to another entity by ID. This custom decorator is needed
  * because we do not know the data type of the ID column until runtime, when we have access
  * to the configured EntityIdStrategy.
+ *
+ * @docsCategory configuration
+ * @docsPage EntityId Decorator
  */
 export function EntityId(options?: IdColumnOptions) {
     return (entity: any, propertyName: string) => {
@@ -49,12 +53,15 @@ export function EntityId(options?: IdColumnOptions) {
 /**
  * Returns any columns on the entity which have been decorated with the {@link EntityId}
  * decorator.
+ *
+ * Multiple registry entries can exist for a single entity type, since dynamically-registered
+ * columns (e.g. custom field relation id columns) are decorated on separate instances
+ * rather than on the class prototype.
  */
 export function getIdColumnsFor(entityType: Type<any>): IdColumnConfig[] {
-    const match = Array.from(idColumnRegistry.entries()).find(
-        ([entity, columns]) => entity.constructor === entityType,
-    );
-    return match ? match[1] : [];
+    return Array.from(idColumnRegistry.entries())
+        .filter(([entity]) => entity.constructor === entityType)
+        .flatMap(([, columns]) => columns);
 }
 
 /**
@@ -64,7 +71,7 @@ export function getIdColumnsFor(entityType: Type<any>): IdColumnConfig[] {
 export function getPrimaryGeneratedIdColumn(): { entity: any; name: string } {
     if (!primaryGeneratedColumn) {
         throw new Error(
-            `primaryGeneratedColumn is undefined. The base VendureEntity must have the @PrimaryGeneratedId() decorator set on its id property.`,
+            'primaryGeneratedColumn is undefined. The base VendureEntity must have the @PrimaryGeneratedId() decorator set on its id property.',
         );
     }
     return primaryGeneratedColumn;

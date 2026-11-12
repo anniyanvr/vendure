@@ -1,7 +1,8 @@
+import { ApolloServerPlugin, GraphQLRequestListener, GraphQLServerContext } from '@apollo/server';
 import { isObject } from '@vendure/common/lib/shared-utils';
-import { ApolloServerPlugin, GraphQLRequestListener, GraphQLServiceContext } from 'apollo-server-plugin-base';
-import { DocumentNode, OperationDefinitionNode } from 'graphql';
+import { DocumentNode } from 'graphql';
 
+import { ApiType } from '../common/get-api-type';
 import { GraphqlValueTransformer } from '../common/graphql-value-transformer';
 import { IdCodecService } from '../common/id-codec.service';
 
@@ -13,39 +14,55 @@ import { IdCodecService } from '../common/id-codec.service';
  */
 export class IdCodecPlugin implements ApolloServerPlugin {
     private graphqlValueTransformer: GraphqlValueTransformer;
-    constructor(private idCodecService: IdCodecService) {}
+    // Job ids only exist in the Admin API. A plugin could define its own `Job` type in the Shop API.
+    private readonly transformJobIds: boolean;
+    constructor(
+        private idCodecService: IdCodecService,
+        apiType: ApiType,
+    ) {
+        this.transformJobIds = apiType !== 'admin' || idCodecService.transformJobIds;
+    }
 
-    serverWillStart(service: GraphQLServiceContext): Promise<void> | void {
+    async serverWillStart(service: GraphQLServerContext): Promise<void> {
         this.graphqlValueTransformer = new GraphqlValueTransformer(service.schema);
     }
 
-    requestDidStart(): GraphQLRequestListener {
+    async requestDidStart(): Promise<GraphQLRequestListener<any>> {
         return {
-            willSendResponse: requestContext => {
+            willSendResponse: async requestContext => {
                 const { document } = requestContext;
                 if (document) {
-                    const data = requestContext.response.data;
-                    if (data) {
-                        this.encodeIdFields(document, data);
+                    const { body } = requestContext.response;
+                    if (body.kind === 'single') {
+                        this.encodeIdFields(document, body.singleResult.data);
                     }
                 }
             },
         };
     }
 
-    private encodeIdFields(document: DocumentNode, data: Record<string, any>) {
+    private encodeIdFields(document: DocumentNode, data?: Record<string, unknown> | null) {
+        if (!data) {
+            return;
+        }
         const typeTree = this.graphqlValueTransformer.getOutputTypeTree(document);
-        this.graphqlValueTransformer.transformValues(typeTree, data, (value, type) => {
+        this.graphqlValueTransformer.transformValues(typeTree, data, (value, type, parentType) => {
             const isIdType = type && type.name === 'ID';
+            if (isIdType && parentType?.name === 'Job' && !this.transformJobIds) {
+                return value;
+            }
             if (type && type.name === 'JSON' && isObject(value)) {
                 return this.idCodecService.encode(value, [
                     'paymentId',
                     'fulfillmentId',
                     'orderItemIds',
+                    'orderLineId',
                     'promotionId',
                     'refundId',
                     'groupId',
                     'modificationId',
+                    'previousCustomerId',
+                    'newCustomerId',
                 ]);
             }
             return isIdType ? this.idCodecService.encode(value) : value;

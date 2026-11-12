@@ -12,7 +12,7 @@ const gripeSDK = {
                 id: Math.random().toString(36).substr(3),
             });
         },
-        capture: (transactionId: string) => {
+        capture: async (transactionId: string) => {
             return true;
         },
     },
@@ -29,7 +29,7 @@ export const examplePaymentHandler = new PaymentMethodHandler({
         automaticCapture: { type: 'boolean', required: false },
         apiKey: { type: 'string', required: false },
     },
-    createPayment: async (ctx, order, amount, args, metadata): Promise<CreatePaymentResult> => {
+    createPayment: async (ctx, order, amount, args, metadata, method): Promise<CreatePaymentResult> => {
         try {
             const result = await gripeSDK.charges.create({
                 apiKey: args.apiKey,
@@ -42,17 +42,17 @@ export const examplePaymentHandler = new PaymentMethodHandler({
                 transactionId: result.id.toString(),
                 metadata,
             };
-        } catch (err) {
+        } catch (err: any) {
             return {
                 amount,
-                state: 'Declined' as 'Declined',
+                state: 'Declined' as const,
                 metadata: {
                     errorMessage: err.message,
                 },
             };
         }
     },
-    settlePayment: async (ctx, order, payment, args) => {
+    settlePayment: async (ctx, order, payment, args, method) => {
         const result = await gripeSDK.charges.capture(payment.transactionId);
         return {
             success: result,

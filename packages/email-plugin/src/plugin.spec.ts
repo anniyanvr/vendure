@@ -1,38 +1,61 @@
-/* tslint:disable:no-non-null-assertion */
+/* eslint-disable @typescript-eslint/no-non-null-assertion */
+import { MiddlewareConsumer } from '@nestjs/common';
+import { ModuleRef } from '@nestjs/core';
 import { Test, TestingModule } from '@nestjs/testing';
 import { TypeOrmModule } from '@nestjs/typeorm';
 import { DEFAULT_CHANNEL_CODE } from '@vendure/common/lib/shared-constants';
 import {
+    EntityHydrator,
     EventBus,
+    Injector,
+    JobQueueService,
     LanguageCode,
     Logger,
     Order,
     OrderStateTransitionEvent,
     PluginCommonModule,
+    ProcessContext,
     RequestContext,
     VendureEvent,
 } from '@vendure/core';
+import { ensureConfigLoaded } from '@vendure/core/dist/config/config-helpers';
 import { TestingLogger } from '@vendure/testing';
+import { createReadStream, readFileSync } from 'fs';
 import path from 'path';
+import { Readable } from 'stream';
+import { afterEach, beforeEach, describe, expect, it, Mock, vi } from 'vitest';
 
-import { orderConfirmationHandler } from './default-email-handlers';
-import { EmailEventHandler } from './event-handler';
+import { EmailProcessor } from './email-processor';
 import { EmailEventListener } from './event-listener';
+import { NoopEmailGenerator } from './generator/noop-email-generator';
+import { orderConfirmationHandler } from './handler/default-email-handlers';
+import { EmailEventHandler } from './handler/event-handler';
 import { EmailPlugin } from './plugin';
-import { EmailDetails, EmailPluginOptions, EmailSender, EmailTransportOptions } from './types';
+import { EmailSender } from './sender/email-sender';
+import { FileBasedTemplateLoader } from './template-loader/file-based-template-loader';
+import { TemplateLoader } from './template-loader/template-loader';
+import {
+    EmailDetails,
+    Partial as EmailPartial,
+    EmailPluginOptions,
+    EmailTransportOptions,
+    InitializedEmailPluginOptions,
+    LoadTemplateInput,
+} from './types';
 
 describe('EmailPlugin', () => {
     let eventBus: EventBus;
-    let onSend: jest.Mock;
+    let onSend: Mock;
     let module: TestingModule;
 
-    const testingLogger = new TestingLogger(() => jest.fn());
+    const testingLogger = new TestingLogger((...args) => vi.fn(...args));
 
     async function initPluginWithHandlers(
         handlers: Array<EmailEventHandler<string, any>>,
         options?: Partial<EmailPluginOptions>,
     ) {
-        onSend = jest.fn();
+        await ensureConfigLoaded();
+        onSend = vi.fn();
         module = await Test.createTestingModule({
             imports: [
                 TypeOrmModule.forRoot({
@@ -41,7 +64,7 @@ describe('EmailPlugin', () => {
                 }),
                 PluginCommonModule,
                 EmailPlugin.init({
-                    templatePath: path.join(__dirname, '../test-templates'),
+                    templateLoader: new FileBasedTemplateLoader(path.join(__dirname, '../test-templates')),
                     transport: {
                         type: 'testing',
                         onSend,
@@ -51,7 +74,14 @@ describe('EmailPlugin', () => {
                 }),
             ],
             providers: [MockService],
-        }).compile();
+        })
+            .overrideProvider(EntityHydrator)
+            .useValue({
+                hydrate() {
+                    // noop
+                },
+            })
+            .compile();
 
         Logger.useLogger(testingLogger);
         module.useLogger(new Logger());
@@ -82,7 +112,7 @@ describe('EmailPlugin', () => {
 
         await initPluginWithHandlers([handler]);
 
-        eventBus.publish(new MockEvent(ctx, true));
+        await eventBus.publish(new MockEvent(ctx, true));
         await pause();
         expect(onSend.mock.calls[0][0].subject).toBe('Hello');
         expect(onSend.mock.calls[0][0].recipient).toBe('test@test.com');
@@ -105,11 +135,11 @@ describe('EmailPlugin', () => {
 
             await initPluginWithHandlers([handler]);
 
-            eventBus.publish(new MockEvent(ctx, false));
+            await eventBus.publish(new MockEvent(ctx, false));
             await pause();
             expect(onSend).not.toHaveBeenCalled();
 
-            eventBus.publish(new MockEvent(ctx, true));
+            await eventBus.publish(new MockEvent(ctx, true));
             await pause();
             expect(onSend).toHaveBeenCalledTimes(1);
         });
@@ -125,13 +155,13 @@ describe('EmailPlugin', () => {
 
             await initPluginWithHandlers([handler]);
 
-            eventBus.publish(new MockEvent(ctx, true));
+            await eventBus.publish(new MockEvent(ctx, true));
             await pause();
             expect(onSend).not.toHaveBeenCalled();
 
             const ctxWithUser = RequestContext.deserialize({ ...ctx, _session: { user: { id: 42 } } } as any);
 
-            eventBus.publish(new MockEvent(ctxWithUser, true));
+            await eventBus.publish(new MockEvent(ctxWithUser, true));
             await pause();
             expect(onSend).toHaveBeenCalledTimes(1);
         });
@@ -147,11 +177,11 @@ describe('EmailPlugin', () => {
 
             await initPluginWithHandlers([handler]);
 
-            eventBus.publish(new MockEvent(ctx, false));
+            await eventBus.publish(new MockEvent(ctx, false));
             await pause();
             expect(onSend).not.toHaveBeenCalled();
 
-            eventBus.publish(new MockEvent(ctx, true));
+            await eventBus.publish(new MockEvent(ctx, true));
             await pause();
             expect(onSend).toHaveBeenCalledTimes(1);
         });
@@ -173,7 +203,7 @@ describe('EmailPlugin', () => {
 
             await initPluginWithHandlers([handler]);
 
-            eventBus.publish(new MockEvent(ctx, true));
+            await eventBus.publish(new MockEvent(ctx, true));
             await pause();
             expect(onSend.mock.calls[0][0].subject).toBe('Hello foo');
         });
@@ -188,7 +218,7 @@ describe('EmailPlugin', () => {
 
             await initPluginWithHandlers([handler]);
 
-            eventBus.publish(new MockEvent(ctx, true));
+            await eventBus.publish(new MockEvent(ctx, true));
             await pause();
             expect(onSend.mock.calls[0][0].body).toContain('this is the test var');
         });
@@ -196,7 +226,7 @@ describe('EmailPlugin', () => {
         /**
          * Intended to test the ability for Handlebars to interpolate
          * getters on the Order entity prototype.
-         * See https://github.com/vendure-ecommerce/vendure/issues/259
+         * See https://github.com/vendurehq/vendure/issues/259
          */
         it('interpolates body with property from entity', async () => {
             const handler = new EmailEventListener('test')
@@ -208,7 +238,7 @@ describe('EmailPlugin', () => {
 
             await initPluginWithHandlers([handler]);
 
-            eventBus.publish(new MockEvent(ctx, true));
+            await eventBus.publish(new MockEvent(ctx, true));
             await pause();
             expect(onSend.mock.calls[0][0].body).toContain('Total: 123');
         });
@@ -224,9 +254,40 @@ describe('EmailPlugin', () => {
                 globalTemplateVars: { globalVar: 'baz' },
             });
 
-            eventBus.publish(new MockEvent(ctx, true));
+            await eventBus.publish(new MockEvent(ctx, true));
             await pause();
             expect(onSend.mock.calls[0][0].subject).toBe('Hello baz');
+        });
+
+        it('loads globalTemplateVars async', async () => {
+            const handler = new EmailEventListener('test')
+                .on(MockEvent)
+                .setFrom('"test from" <noreply@test.com>')
+                .setRecipient(() => 'test@test.com')
+                .setSubject('Job {{ name }}, {{ primaryColor }}');
+
+            await initPluginWithHandlers([handler], {
+                globalTemplateVars: async (_ctxLocal: RequestContext, injector: Injector) => {
+                    const jobQueueService = injector.get(JobQueueService);
+                    const jobQueue = await jobQueueService.createQueue({
+                        name: 'hello-service',
+                        // eslint-disable-next-line
+                        process: async job => {
+                            return 'hello';
+                        },
+                    });
+                    const name = jobQueue.name;
+
+                    return {
+                        name,
+                        primaryColor: 'blue',
+                    };
+                },
+            });
+
+            await eventBus.publish(new MockEvent(ctx, true));
+            await pause();
+            expect(onSend.mock.calls[0][0].subject).toBe(`Job hello-service, blue`);
         });
 
         it('interpolates from', async () => {
@@ -240,12 +301,12 @@ describe('EmailPlugin', () => {
                 globalTemplateVars: { globalVar: 'baz' },
             });
 
-            eventBus.publish(new MockEvent(ctx, true));
+            await eventBus.publish(new MockEvent(ctx, true));
             await pause();
             expect(onSend.mock.calls[0][0].from).toBe('"test from baz" <noreply@test.com>');
         });
 
-        // Test fix for https://github.com/vendure-ecommerce/vendure/issues/363
+        // Test fix for https://github.com/vendurehq/vendure/issues/363
         it('does not escape HTML chars when interpolating "from"', async () => {
             const handler = new EmailEventListener('test')
                 .on(MockEvent)
@@ -257,7 +318,7 @@ describe('EmailPlugin', () => {
                 globalTemplateVars: { globalFrom: 'Test <test@test.com>' },
             });
 
-            eventBus.publish(new MockEvent(ctx, true));
+            await eventBus.publish(new MockEvent(ctx, true));
             await pause();
             expect(onSend.mock.calls[0][0].from).toBe('Test <test@test.com>');
         });
@@ -268,13 +329,13 @@ describe('EmailPlugin', () => {
                 .setFrom('"test from" <noreply@test.com>')
                 .setRecipient(() => 'test@test.com')
                 .setSubject('Hello {{ testVar }}')
-                .setTemplateVars((event, globals) => ({ testVar: globals.globalVar + ' quux' }));
+                .setTemplateVars((event, globals) => ({ testVar: (globals.globalVar as string) + ' quux' }));
 
             await initPluginWithHandlers([handler], {
                 globalTemplateVars: { globalVar: 'baz' },
             });
 
-            eventBus.publish(new MockEvent(ctx, true));
+            await eventBus.publish(new MockEvent(ctx, true));
             await pause();
             expect(onSend.mock.calls[0][0].subject).toBe('Hello baz quux');
         });
@@ -289,9 +350,104 @@ describe('EmailPlugin', () => {
 
             await initPluginWithHandlers([handler], { globalTemplateVars: { name: 'baz' } });
 
-            eventBus.publish(new MockEvent(ctx, true));
+            await eventBus.publish(new MockEvent(ctx, true));
             await pause();
             expect(onSend.mock.calls[0][0].subject).toBe('Hello quux');
+        });
+    });
+
+    describe('plain text body', () => {
+        const ctx = RequestContext.deserialize({
+            _channel: { code: DEFAULT_CHANNEL_CODE },
+            _languageCode: LanguageCode.en,
+        } as any);
+
+        it('sends no plain text body when not set', async () => {
+            const handler = new EmailEventListener('test')
+                .on(MockEvent)
+                .setFrom('"test from" <noreply@test.com>')
+                .setRecipient(() => 'test@test.com')
+                .setSubject('Hello')
+                .setTemplateVars(() => ({ testVar: 'this is the test var' }));
+
+            await initPluginWithHandlers([handler]);
+
+            await eventBus.publish(new MockEvent(ctx, true));
+            await pause();
+            expect(onSend.mock.calls[0][0].text).toBeUndefined();
+        });
+
+        it('uses the plain text body when set', async () => {
+            const handler = new EmailEventListener('test')
+                .on(MockEvent)
+                .setFrom('"test from" <noreply@test.com>')
+                .setRecipient(() => 'test@test.com')
+                .setSubject('Hello')
+                .setTemplateVars(() => ({ testVar: 'this is the test var' }))
+                .setPlainTextBody(() => 'custom plain text');
+
+            await initPluginWithHandlers([handler]);
+
+            await eventBus.publish(new MockEvent(ctx, true));
+            await pause();
+            expect(onSend.mock.calls[0][0].text).toBe('custom plain text');
+        });
+
+        it('sets the plain text body when using the NoopEmailGenerator', async () => {
+            const handler = new EmailEventListener('test')
+                .on(MockEvent)
+                .setFrom('"test from" <noreply@test.com>')
+                .setRecipient(() => 'test@test.com')
+                .setSubject('Hello')
+                .setTemplateVars(() => ({ testVar: 'this is the test var' }))
+                .setPlainTextBody(() => 'custom plain text');
+
+            await initPluginWithHandlers([handler], { emailGenerator: new NoopEmailGenerator() });
+
+            await eventBus.publish(new MockEvent(ctx, true));
+            await pause();
+            expect(onSend.mock.calls[0][0].text).toBe('custom plain text');
+        });
+
+        it('passes the template vars to the setPlainTextBody function', async () => {
+            const handler = new EmailEventListener('test')
+                .on(MockEvent)
+                .setFrom('"test from" <noreply@test.com>')
+                .setRecipient(() => 'test@test.com')
+                .setSubject('Hello')
+                .setTemplateVars(() => ({ testVar: 'foo' }))
+                .setPlainTextBody(
+                    (event, templateVars) =>
+                        `${templateVars.globalVar as string} ${templateVars.testVar as string}`,
+                );
+
+            await initPluginWithHandlers([handler], { globalTemplateVars: { globalVar: 'baz' } });
+
+            await eventBus.publish(new MockEvent(ctx, true));
+            await pause();
+            expect(onSend.mock.calls[0][0].text).toBe('baz foo');
+        });
+
+        it('logs the error and still sends the email if the setPlainTextBody function throws', async () => {
+            testingLogger.errorSpy.mockClear();
+
+            const handler = new EmailEventListener('test')
+                .on(MockEvent)
+                .setFrom('"test from" <noreply@test.com>')
+                .setRecipient(() => 'test@test.com')
+                .setSubject('Hello')
+                .setTemplateVars(() => ({ testVar: 'this is the test var' }))
+                .setPlainTextBody(() => {
+                    throw new Error('boom');
+                });
+
+            await initPluginWithHandlers([handler]);
+
+            await eventBus.publish(new MockEvent(ctx, true));
+            await pause();
+            expect(testingLogger.errorSpy.mock.calls[0][0]).toContain('boom');
+            expect(onSend).toHaveBeenCalledTimes(1);
+            expect(onSend.mock.calls[0][0].text).toBeUndefined();
         });
     });
 
@@ -311,7 +467,7 @@ describe('EmailPlugin', () => {
 
             await initPluginWithHandlers([handler]);
 
-            eventBus.publish(new MockEvent(ctx, true));
+            await eventBus.publish(new MockEvent(ctx, true));
             await pause();
             expect(onSend.mock.calls[0][0].body).toContain('Date: Wed Jan 01 2020 10:00:00');
         });
@@ -326,9 +482,11 @@ describe('EmailPlugin', () => {
 
             await initPluginWithHandlers([handler]);
 
-            eventBus.publish(new MockEvent(ctx, true));
+            await eventBus.publish(new MockEvent(ctx, true));
             await pause();
             expect(onSend.mock.calls[0][0].body).toContain('Price: 1.23');
+            expect(onSend.mock.calls[0][0].body).toContain('Price: €1.23');
+            expect(onSend.mock.calls[0][0].body).toContain('Price: £1.23');
         });
     });
 
@@ -355,13 +513,35 @@ describe('EmailPlugin', () => {
             await initPluginWithHandlers([handler]);
 
             const ctxTa = RequestContext.deserialize({ ...ctx, _languageCode: LanguageCode.ta } as any);
-            eventBus.publish(new MockEvent(ctxTa, true));
+            await eventBus.publish(new MockEvent(ctxTa, true));
             await pause();
             expect(onSend.mock.calls[0][0].subject).toBe('Hello, Test!');
             expect(onSend.mock.calls[0][0].body).toContain('Default body.');
 
             const ctxDe = RequestContext.deserialize({ ...ctx, _languageCode: LanguageCode.de } as any);
-            eventBus.publish(new MockEvent(ctxDe, true));
+            await eventBus.publish(new MockEvent(ctxDe, true));
+            await pause();
+            expect(onSend.mock.calls[1][0].subject).toBe('Servus, Test!');
+            expect(onSend.mock.calls[1][0].body).toContain('German body.');
+        });
+
+        it('set LanguageCode', async () => {
+            const handler = new EmailEventListener('test')
+                .on(MockEvent)
+                .setFrom('"test from" <noreply@test.com>')
+                .setSubject('Hello, {{ name }}!')
+                .setRecipient(() => 'test@test.com')
+                .setLanguageCode(() => LanguageCode.de)
+                .setTemplateVars(() => ({ name: 'Test' }))
+                .addTemplate({
+                    channelCode: 'default',
+                    languageCode: LanguageCode.de,
+                    templateFile: 'body.de.hbs',
+                    subject: 'Servus, {{ name }}!',
+                });
+
+            const ctxEn = RequestContext.deserialize({ ...ctx, _languageCode: LanguageCode.en } as any);
+            await eventBus.publish(new MockEvent(ctxEn, true));
             await pause();
             expect(onSend.mock.calls[1][0].subject).toBe('Servus, Test!');
             expect(onSend.mock.calls[1][0].body).toContain('German body.');
@@ -383,7 +563,7 @@ describe('EmailPlugin', () => {
 
             await initPluginWithHandlers([handler]);
 
-            eventBus.publish(
+            await eventBus.publish(
                 new MockEvent(
                     RequestContext.deserialize({
                         _channel: { code: DEFAULT_CHANNEL_CODE },
@@ -411,7 +591,7 @@ describe('EmailPlugin', () => {
 
             await initPluginWithHandlers([handler]);
 
-            eventBus.publish(
+            await eventBus.publish(
                 new MockEvent(
                     RequestContext.deserialize({
                         _channel: { code: DEFAULT_CHANNEL_CODE },
@@ -438,8 +618,8 @@ describe('EmailPlugin', () => {
 
             await initPluginWithHandlers([handler]);
 
-            eventBus.publish(new MockEvent(RequestContext.empty(), false));
-            eventBus.publish(new MockEvent(RequestContext.empty(), true));
+            await eventBus.publish(new MockEvent(RequestContext.empty(), false));
+            await eventBus.publish(new MockEvent(RequestContext.empty(), true));
             await pause();
 
             expect(callCount).toBe(1);
@@ -462,7 +642,7 @@ describe('EmailPlugin', () => {
 
             await initPluginWithHandlers([handler]);
 
-            eventBus.publish(new MockEvent(ctx, true));
+            await eventBus.publish(new MockEvent(ctx, true));
             await pause();
             expect(onSend.mock.calls[0][0].attachments).toEqual([]);
         });
@@ -480,7 +660,7 @@ describe('EmailPlugin', () => {
                 ]);
 
             await initPluginWithHandlers([handler]);
-            eventBus.publish(new MockEvent(ctx, true));
+            await eventBus.publish(new MockEvent(ctx, true));
             await pause();
 
             expect(onSend.mock.calls[0][0].attachments).toEqual([{ path: TEST_IMAGE_PATH }]);
@@ -499,17 +679,143 @@ describe('EmailPlugin', () => {
                 ]);
 
             await initPluginWithHandlers([handler]);
-            eventBus.publish(new MockEvent(ctx, true));
+            await eventBus.publish(new MockEvent(ctx, true));
             await pause();
 
             expect(onSend.mock.calls[0][0].attachments).toEqual([{ path: TEST_IMAGE_PATH }]);
+        });
+
+        it('attachment content as a string buffer', async () => {
+            const handler = new EmailEventListener('test')
+                .on(MockEvent)
+                .setFrom('"test from" <noreply@test.com>')
+                .setRecipient(() => 'test@test.com')
+                .setSubject('Hello {{ subjectVar }}')
+                .setAttachments(() => [
+                    {
+                        content: Buffer.from('hello'),
+                    },
+                ]);
+
+            await initPluginWithHandlers([handler]);
+            await eventBus.publish(new MockEvent(ctx, true));
+            await pause();
+
+            const attachment = onSend.mock.calls[0][0].attachments[0].content;
+            expect(Buffer.compare(attachment, Buffer.from('hello'))).toBe(0); // 0 = buffers are equal
+        });
+
+        it('attachment content as an image buffer', async () => {
+            const imageFileBuffer = readFileSync(TEST_IMAGE_PATH);
+            const handler = new EmailEventListener('test')
+                .on(MockEvent)
+                .setFrom('"test from" <noreply@test.com>')
+                .setRecipient(() => 'test@test.com')
+                .setSubject('Hello {{ subjectVar }}')
+                .setAttachments(() => [
+                    {
+                        content: imageFileBuffer,
+                    },
+                ]);
+
+            await initPluginWithHandlers([handler]);
+            await eventBus.publish(new MockEvent(ctx, true));
+            await pause();
+
+            const attachment = onSend.mock.calls[0][0].attachments[0].content;
+            expect(Buffer.compare(attachment, imageFileBuffer)).toBe(0); // 0 = buffers are equal
+        });
+
+        it('attachment content as a string', async () => {
+            const handler = new EmailEventListener('test')
+                .on(MockEvent)
+                .setFrom('"test from" <noreply@test.com>')
+                .setRecipient(() => 'test@test.com')
+                .setSubject('Hello {{ subjectVar }}')
+                .setAttachments(() => [
+                    {
+                        content: 'hello',
+                    },
+                ]);
+
+            await initPluginWithHandlers([handler]);
+            await eventBus.publish(new MockEvent(ctx, true));
+            await pause();
+
+            const attachment = onSend.mock.calls[0][0].attachments[0].content;
+            expect(attachment).toBe('hello');
+        });
+
+        it('attachment content as a string stream', async () => {
+            const handler = new EmailEventListener('test')
+                .on(MockEvent)
+                .setFrom('"test from" <noreply@test.com>')
+                .setRecipient(() => 'test@test.com')
+                .setSubject('Hello {{ subjectVar }}')
+                .setAttachments(() => [
+                    {
+                        content: Readable.from(['hello']),
+                    },
+                ]);
+
+            await initPluginWithHandlers([handler]);
+            await eventBus.publish(new MockEvent(ctx, true));
+            await pause();
+
+            const attachment = onSend.mock.calls[0][0].attachments[0].content;
+            expect(Buffer.compare(attachment, Buffer.from('hello'))).toBe(0); // 0 = buffers are equal
+        });
+
+        it('attachment content as an image stream', async () => {
+            const imageFileBuffer = readFileSync(TEST_IMAGE_PATH);
+            const imageFileStream = createReadStream(TEST_IMAGE_PATH);
+            const handler = new EmailEventListener('test')
+                .on(MockEvent)
+                .setFrom('"test from" <noreply@test.com>')
+                .setRecipient(() => 'test@test.com')
+                .setSubject('Hello {{ subjectVar }}')
+                .setAttachments(() => [
+                    {
+                        content: imageFileStream,
+                    },
+                ]);
+
+            await initPluginWithHandlers([handler]);
+            await eventBus.publish(new MockEvent(ctx, true));
+            await pause();
+
+            const attachment = onSend.mock.calls[0][0].attachments[0].content;
+            expect(Buffer.compare(attachment, imageFileBuffer)).toBe(0); // 0 = buffers are equal
+        });
+
+        it('raises a warning for large content attachments', async () => {
+            testingLogger.warnSpy.mockClear();
+            const largeBuffer = Buffer.from(Array.from({ length: 65535, 0: 0 }));
+            const handler = new EmailEventListener('test')
+                .on(MockEvent)
+                .setFrom('"test from" <noreply@test.com>')
+                .setRecipient(() => 'test@test.com')
+                .setSubject('Hello {{ subjectVar }}')
+                .setAttachments(() => [
+                    {
+                        content: largeBuffer,
+                    },
+                ]);
+
+            await initPluginWithHandlers([handler]);
+            await eventBus.publish(new MockEvent(ctx, true));
+            await pause();
+
+            expect(testingLogger.warnSpy.mock.calls[0][0]).toContain(
+                "Email has a large 'content' attachment (64k). Consider using the 'path' instead for improved performance.",
+            );
         });
     });
 
     describe('orderConfirmationHandler', () => {
         beforeEach(async () => {
             await initPluginWithHandlers([orderConfirmationHandler], {
-                templatePath: path.join(__dirname, '../templates'),
+                templateLoader: new FileBasedTemplateLoader(path.join(__dirname, '../templates')),
             });
         });
 
@@ -518,43 +824,72 @@ describe('EmailPlugin', () => {
             _languageCode: LanguageCode.en,
         } as any);
 
-        const order = ({
+        const order = {
             code: 'ABCDE',
             customer: {
                 emailAddress: 'test@test.com',
             },
-        } as Partial<Order>) as any;
+            lines: [],
+        } as any;
 
         it('filters events with wrong order state', async () => {
-            eventBus.publish(new OrderStateTransitionEvent('AddingItems', 'ArrangingPayment', ctx, order));
+            await eventBus.publish(
+                new OrderStateTransitionEvent('AddingItems', 'ArrangingPayment', ctx, order),
+            );
             await pause();
             expect(onSend).not.toHaveBeenCalled();
 
-            eventBus.publish(new OrderStateTransitionEvent('AddingItems', 'Cancelled', ctx, order));
+            await eventBus.publish(new OrderStateTransitionEvent('AddingItems', 'Cancelled', ctx, order));
             await pause();
             expect(onSend).not.toHaveBeenCalled();
 
-            eventBus.publish(new OrderStateTransitionEvent('AddingItems', 'PaymentAuthorized', ctx, order));
+            await eventBus.publish(
+                new OrderStateTransitionEvent('AddingItems', 'PaymentAuthorized', ctx, order),
+            );
             await pause();
             expect(onSend).not.toHaveBeenCalled();
 
-            eventBus.publish(new OrderStateTransitionEvent('ArrangingPayment', 'PaymentSettled', ctx, order));
+            await eventBus.publish(
+                new OrderStateTransitionEvent('ArrangingPayment', 'PaymentSettled', ctx, order),
+            );
             await pause();
             expect(onSend).toHaveBeenCalledTimes(1);
         });
 
         it('sets the Order Customer emailAddress as recipient', async () => {
-            eventBus.publish(new OrderStateTransitionEvent('ArrangingPayment', 'PaymentSettled', ctx, order));
+            await eventBus.publish(
+                new OrderStateTransitionEvent('ArrangingPayment', 'PaymentSettled', ctx, order),
+            );
             await pause();
 
             expect(onSend.mock.calls[0][0].recipient).toBe(order.customer!.emailAddress);
         });
 
         it('sets the subject', async () => {
-            eventBus.publish(new OrderStateTransitionEvent('ArrangingPayment', 'PaymentSettled', ctx, order));
+            await eventBus.publish(
+                new OrderStateTransitionEvent('ArrangingPayment', 'PaymentSettled', ctx, order),
+            );
             await pause();
 
-            expect(onSend.mock.calls[0][0].subject).toBe(`Order confirmation for #${order.code}`);
+            expect(onSend.mock.calls[0][0].subject).toBe(`Order confirmation for #${order.code as string}`);
+        });
+
+        it('supports BCC address', async () => {
+            onSend.mockClear();
+            const bccHandler = orderConfirmationHandler.setOptionalAddressFields(event => ({
+                bcc: 'bcc@example.com',
+            }));
+
+            const initResult = await initPluginWithHandlers([bccHandler], {
+                templateLoader: new FileBasedTemplateLoader(path.join(__dirname, '../templates')),
+            });
+
+            await eventBus.publish(
+                new OrderStateTransitionEvent('ArrangingPayment', 'PaymentSettled', ctx, order),
+            );
+            await pause();
+
+            expect(onSend.mock.calls[0][0].bcc).toBe('bcc@example.com');
         });
     });
 
@@ -574,9 +909,9 @@ describe('EmailPlugin', () => {
 
             await initPluginWithHandlers([handler]);
 
-            eventBus.publish(new MockEvent(ctx, true));
+            await eventBus.publish(new MockEvent(ctx, true));
             await pause();
-            expect(testingLogger.errorSpy.mock.calls[0][0]).toContain(`ENOENT: no such file or directory`);
+            expect(testingLogger.errorSpy.mock.calls[0][0]).toContain('ENOENT: no such file or directory');
         });
 
         it('Logs a Handlebars error if the template is invalid', async () => {
@@ -594,9 +929,9 @@ describe('EmailPlugin', () => {
 
             await initPluginWithHandlers([handler]);
 
-            eventBus.publish(new MockEvent(ctx, true));
+            await eventBus.publish(new MockEvent(ctx, true));
             await pause();
-            expect(testingLogger.errorSpy.mock.calls[0][0]).toContain(`Parse error on line 3:`);
+            expect(testingLogger.errorSpy.mock.calls[0][0]).toContain('Parse error on line 3:');
         });
 
         it('Logs an error if the loadData method throws', async () => {
@@ -617,9 +952,9 @@ describe('EmailPlugin', () => {
 
             await initPluginWithHandlers([handler]);
 
-            eventBus.publish(new MockEvent(ctx, true));
+            await eventBus.publish(new MockEvent(ctx, true));
             await pause();
-            expect(testingLogger.errorSpy.mock.calls[0][0]).toContain(`something went horribly wrong!`);
+            expect(testingLogger.errorSpy.mock.calls[0][0]).toContain('something went horribly wrong!');
         });
     });
 
@@ -637,19 +972,270 @@ describe('EmailPlugin', () => {
                 .setTemplateVars(event => ({ subjectVar: 'foo' }));
 
             const fakeSender = new FakeCustomSender();
-            const send = jest.fn();
+            const send = vi.fn();
             fakeSender.send = send;
 
             await initPluginWithHandlers([handler], {
                 emailSender: fakeSender,
             });
 
-            eventBus.publish(new MockEvent(ctx, true));
+            await eventBus.publish(new MockEvent(ctx, true));
             await pause();
             expect(send.mock.calls[0][0].subject).toBe('Hello');
             expect(send.mock.calls[0][0].recipient).toBe('test@test.com');
             expect(send.mock.calls[0][0].from).toBe('"test from" <noreply@test.com>');
             expect(onSend).toHaveBeenCalledTimes(0);
+        });
+    });
+
+    describe('optional address fields', () => {
+        const ctx = RequestContext.deserialize({
+            _channel: { code: DEFAULT_CHANNEL_CODE },
+            _languageCode: LanguageCode.en,
+        } as any);
+
+        it('cc', async () => {
+            const handler = new EmailEventListener('test')
+                .on(MockEvent)
+                .setFrom('"test from" <noreply@test.com>')
+                .setRecipient(() => 'test@test.com')
+                .setSubject('Hello {{ subjectVar }}')
+                .setOptionalAddressFields(() => ({ cc: 'foo@bar.com' }));
+
+            await initPluginWithHandlers([handler]);
+            await eventBus.publish(new MockEvent(ctx, true));
+            await pause();
+
+            expect(onSend.mock.calls[0][0].cc).toBe('foo@bar.com');
+        });
+
+        it('bcc', async () => {
+            const handler = new EmailEventListener('test')
+                .on(MockEvent)
+                .setFrom('"test from" <noreply@test.com>')
+                .setRecipient(() => 'test@test.com')
+                .setSubject('Hello {{ subjectVar }}')
+                .setOptionalAddressFields(() => ({ bcc: 'foo@bar.com' }));
+
+            await initPluginWithHandlers([handler]);
+            await eventBus.publish(new MockEvent(ctx, true));
+            await pause();
+
+            expect(onSend.mock.calls[0][0].bcc).toBe('foo@bar.com');
+        });
+
+        it('replyTo', async () => {
+            const handler = new EmailEventListener('test')
+                .on(MockEvent)
+                .setFrom('"test from" <noreply@test.com>')
+                .setRecipient(() => 'test@test.com')
+                .setSubject('Hello {{ subjectVar }}')
+                .setOptionalAddressFields(() => ({ replyTo: 'foo@bar.com' }));
+
+            await initPluginWithHandlers([handler]);
+            await eventBus.publish(new MockEvent(ctx, true));
+            await pause();
+
+            expect(onSend.mock.calls[0][0].replyTo).toBe('foo@bar.com');
+        });
+    });
+
+    describe('Dynamic transport settings', () => {
+        let injectorArg: Injector | undefined;
+        let ctxArg: RequestContext | undefined;
+
+        it('Initializes with async transport settings', async () => {
+            const handler = new EmailEventListener('test')
+                .on(MockEvent)
+                .setFrom('"test from" <noreply@test.com>')
+                .setRecipient(() => 'test@test.com')
+                .setSubject('Hello')
+                .setTemplateVars(event => ({ subjectVar: 'foo' }));
+            module = await initPluginWithHandlers([handler], {
+                transport: async (injector, _ctx) => {
+                    injectorArg = injector;
+                    ctxArg = _ctx;
+                    return {
+                        type: 'testing',
+                        onSend: () => {
+                            /* */
+                        },
+                    };
+                },
+            });
+            const ctx = RequestContext.deserialize({
+                _channel: { code: DEFAULT_CHANNEL_CODE },
+                _languageCode: LanguageCode.en,
+            } as any);
+            await module!.get(EventBus).publish(new MockEvent(ctx, true));
+            await pause();
+            expect(module).toBeDefined();
+            expect(typeof module.get(EmailPlugin).options.transport).toBe('function');
+        });
+
+        it('Passes injector and context to transport function', async () => {
+            const ctx = RequestContext.deserialize({
+                _channel: { code: DEFAULT_CHANNEL_CODE },
+                _languageCode: LanguageCode.en,
+            } as any);
+            await module!.get(EventBus).publish(new MockEvent(ctx, true));
+            await pause();
+            expect(injectorArg?.constructor.name).toBe('Injector');
+            expect(ctxArg?.constructor.name).toBe('RequestContext');
+        });
+
+        it('Resolves async transport settings', async () => {
+            const transport = await module!.get(EmailProcessor).getTransportSettings();
+            expect(transport.type).toBe('testing');
+        });
+    });
+
+    describe('Dynamic subject handling', () => {
+        it('With string', async () => {
+            const ctx = RequestContext.deserialize({
+                _channel: { code: DEFAULT_CHANNEL_CODE },
+                _languageCode: LanguageCode.en,
+            } as any);
+            const handler = new EmailEventListener('test')
+                .on(MockEvent)
+                .setFrom('"test from" <noreply@test.com>')
+                .setRecipient(() => 'test@test.com')
+                .setSubject('Hello')
+                .setTemplateVars(event => ({ subjectVar: 'foo' }));
+
+            await initPluginWithHandlers([handler]);
+
+            await eventBus.publish(new MockEvent(ctx, true));
+            await pause();
+            expect(onSend.mock.calls[0][0].subject).toBe('Hello');
+            expect(onSend.mock.calls[0][0].recipient).toBe('test@test.com');
+            expect(onSend.mock.calls[0][0].from).toBe('"test from" <noreply@test.com>');
+        });
+        it('With callback function', async () => {
+            const ctx = RequestContext.deserialize({
+                _channel: { code: DEFAULT_CHANNEL_CODE },
+                _languageCode: LanguageCode.en,
+            } as any);
+            const handler = new EmailEventListener('test')
+                .on(MockEvent)
+                .setFrom('"test from" <noreply@test.com>')
+                .setRecipient(() => 'test@test.com')
+                .setSubject(async (_e, _ctx, _i) => {
+                    const service = _i.get(MockService);
+                    const mockData = await service.someAsyncMethod();
+                    return `Hello from ${mockData} and {{ subjectVar }}`;
+                })
+                .setTemplateVars(event => ({ subjectVar: 'foo' }));
+
+            await initPluginWithHandlers([handler]);
+
+            await eventBus.publish(new MockEvent(ctx, true));
+            await pause();
+            expect(onSend.mock.calls[0][0].subject).toBe('Hello from loaded data and foo');
+            expect(onSend.mock.calls[0][0].recipient).toBe('test@test.com');
+            expect(onSend.mock.calls[0][0].from).toBe('"test from" <noreply@test.com>');
+        });
+    });
+    // Only in case of custom template loader - part of the jsDoc - not used in the core code
+    describe('CustomLanguageAwareTemplateLoader example', () => {
+        it('loads language-specific template correctly', async () => {
+            class CustomLanguageAwareTemplateLoader implements TemplateLoader {
+                constructor(private templateDir: string) {}
+
+                async loadTemplate(
+                    _injector: Injector,
+                    context: RequestContext,
+                    { type, templateName }: LoadTemplateInput,
+                ) {
+                    const filePath = path.join(
+                        this.templateDir,
+                        type,
+                        `${templateName}.${context.languageCode}.hbs`,
+                    );
+                    return readFileSync(filePath, 'utf-8');
+                }
+
+                async loadPartials(): Promise<EmailPartial[]> {
+                    return [];
+                }
+            }
+
+            const templatePath = path.join(__dirname, '../test-templates');
+            const loader = new CustomLanguageAwareTemplateLoader(templatePath);
+
+            const requestContext = RequestContext.deserialize({
+                _channel: { code: DEFAULT_CHANNEL_CODE },
+                _languageCode: LanguageCode.de,
+            } as any);
+
+            const result = await loader.loadTemplate({} as Injector, requestContext, {
+                type: 'test',
+                templateName: 'body',
+                templateVars: {},
+            });
+
+            expect(result).toContain('German body');
+        });
+    });
+
+    describe('devMode production warning', () => {
+        const devModeOptions = {
+            devMode: true,
+            route: 'mailbox',
+            outputPath: path.join(__dirname, '../test-emails'),
+            handlers: [],
+            templateLoader: new FileBasedTemplateLoader(path.join(__dirname, '../test-templates')),
+        } as unknown as InitializedEmailPluginOptions;
+
+        function configureServerPlugin(options: InitializedEmailPluginOptions) {
+            Logger.useLogger(testingLogger);
+            testingLogger.warnSpy.mockClear();
+            const plugin = new EmailPlugin(
+                {} as EventBus,
+                {} as ModuleRef,
+                {} as EmailProcessor,
+                {} as JobQueueService,
+                { isServer: true } as ProcessContext,
+                options,
+            );
+            const consumer = { apply: () => ({ forRoutes: () => consumer }) };
+            plugin.configure(consumer as unknown as MiddlewareConsumer);
+        }
+
+        afterEach(() => {
+            vi.unstubAllEnvs();
+        });
+
+        it('warns at startup when devMode is enabled and NODE_ENV is production', () => {
+            vi.stubEnv('NODE_ENV', 'production');
+
+            configureServerPlugin(devModeOptions);
+
+            expect(testingLogger.warnSpy).toHaveBeenCalledTimes(1);
+            const [message, context] = testingLogger.warnSpy.mock.calls[0];
+            expect(context).toBe('EmailPlugin');
+            expect(message).toContain('dev mailbox at route "mailbox" has no authentication');
+            expect(message).toContain('/generate/:type/:languageCode');
+            expect(message).toContain('are not sent');
+        });
+
+        it('does not warn when devMode is enabled outside production', () => {
+            vi.stubEnv('NODE_ENV', 'development');
+
+            configureServerPlugin(devModeOptions);
+
+            expect(testingLogger.warnSpy).not.toHaveBeenCalled();
+        });
+
+        it('does not warn in production when a transport is configured instead of devMode', () => {
+            vi.stubEnv('NODE_ENV', 'production');
+
+            configureServerPlugin({
+                handlers: [],
+                transport: { type: 'smtp', host: 'smtp.example.com' },
+            } as unknown as InitializedEmailPluginOptions);
+
+            expect(testingLogger.warnSpy).not.toHaveBeenCalled();
         });
     });
 });
@@ -661,7 +1247,10 @@ class FakeCustomSender implements EmailSender {
 const pause = () => new Promise(resolve => setTimeout(resolve, 100));
 
 class MockEvent extends VendureEvent {
-    constructor(public ctx: RequestContext, public shouldSend: boolean) {
+    constructor(
+        public ctx: RequestContext,
+        public shouldSend: boolean,
+    ) {
         super();
     }
 }

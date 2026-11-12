@@ -1,7 +1,6 @@
 import { RequestHandler } from 'express';
-import { createProxyMiddleware } from 'http-proxy-middleware';
 
-import { Logger, RuntimeVendureConfig, VendureConfig } from '../config';
+import { Logger } from '../config';
 
 /**
  * @description
@@ -35,32 +34,28 @@ import { Logger, RuntimeVendureConfig, VendureConfig } from '../config';
  * @docsPage Plugin Utilities
  */
 export function createProxyHandler(options: ProxyOptions): RequestHandler {
+    // Required lazily so that the http-proxy-middleware package is only loaded
+    // when a plugin actually proxies a route.
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const { createProxyMiddleware } = require('http-proxy-middleware');
     const route = options.route.charAt(0) === '/' ? options.route : '/' + options.route;
     const proxyHostname = options.hostname || 'localhost';
     const middleware = createProxyMiddleware({
         // TODO: how do we detect https?
-        target: `http://${proxyHostname}:${options.port}`,
+        target: `http://${proxyHostname}:${options.port}/${options.basePath ?? ''}`,
         pathRewrite: {
-            [`^${route}`]: `/` + (options.basePath || ''),
+            [`^${route}`]: '/' + (options.basePath || ''),
         },
-        logProvider(provider) {
-            return {
-                log(message: string) {
-                    Logger.debug(message, options.label);
-                },
-                debug(message: string) {
-                    Logger.debug(message, options.label);
-                },
-                info(message: string) {
-                    Logger.debug(message, options.label);
-                },
-                warn(message: string) {
-                    Logger.warn(message, options.label);
-                },
-                error(message: string) {
-                    Logger.error(message, options.label);
-                },
-            };
+        logger: {
+            info(message: string) {
+                Logger.debug(message, options.label);
+            },
+            warn(message: string) {
+                Logger.warn(message, options.label);
+            },
+            error(message: string) {
+                Logger.error(message, options.label);
+            },
         },
     });
     return middleware;

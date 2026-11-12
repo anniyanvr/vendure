@@ -5,6 +5,7 @@ import {
     MutationAssignPromotionsToChannelArgs,
     MutationCreatePromotionArgs,
     MutationDeletePromotionArgs,
+    MutationDeletePromotionsArgs,
     MutationRemovePromotionsFromChannelArgs,
     MutationUpdatePromotionArgs,
     Permission,
@@ -22,6 +23,7 @@ import { PromotionService } from '../../../service/services/promotion.service';
 import { ConfigurableOperationCodec } from '../../common/configurable-operation-codec';
 import { RequestContext } from '../../common/request-context';
 import { Allow } from '../../decorators/allow.decorator';
+import { RelationPaths, Relations } from '../../decorators/relations.decorator';
 import { Ctx } from '../../decorators/request-context.decorator';
 import { Transaction } from '../../decorators/transaction.decorator';
 
@@ -37,8 +39,9 @@ export class PromotionResolver {
     promotions(
         @Ctx() ctx: RequestContext,
         @Args() args: QueryPromotionsArgs,
+        @Relations(Promotion) relations: RelationPaths<Promotion>,
     ): Promise<PaginatedList<Promotion>> {
-        return this.promotionService.findAll(ctx, args.options || undefined).then(res => {
+        return this.promotionService.findAll(ctx, args.options || undefined, relations).then(res => {
             res.items.forEach(this.encodeConditionsAndActions);
             return res;
         });
@@ -46,8 +49,12 @@ export class PromotionResolver {
 
     @Query()
     @Allow(Permission.ReadPromotion)
-    promotion(@Ctx() ctx: RequestContext, @Args() args: QueryPromotionArgs): Promise<Promotion | undefined> {
-        return this.promotionService.findOne(ctx, args.id).then(this.encodeConditionsAndActions);
+    promotion(
+        @Ctx() ctx: RequestContext,
+        @Args() args: QueryPromotionArgs,
+        @Relations(Promotion) relations: RelationPaths<Promotion>,
+    ): Promise<Promotion | undefined> {
+        return this.promotionService.findOne(ctx, args.id, relations).then(this.encodeConditionsAndActions);
     }
 
     @Query()
@@ -69,8 +76,11 @@ export class PromotionResolver {
         @Ctx() ctx: RequestContext,
         @Args() args: MutationCreatePromotionArgs,
     ): Promise<ErrorResultUnion<CreatePromotionResult, Promotion>> {
+        // Note: PromotionItemAction and PromotionOrderAction share the same
+        // pool of action defs in getAvailableDefsOfType(), so a single call
+        // with either type will decode ID args for all promotion actions.
         this.configurableOperationCodec.decodeConfigurableOperationIds(
-            PromotionOrderAction,
+            PromotionItemAction,
             args.input.actions,
         );
         this.configurableOperationCodec.decodeConfigurableOperationIds(
@@ -87,10 +97,11 @@ export class PromotionResolver {
         @Ctx() ctx: RequestContext,
         @Args() args: MutationUpdatePromotionArgs,
     ): Promise<ErrorResultUnion<UpdatePromotionResult, Promotion>> {
-        this.configurableOperationCodec.decodeConfigurableOperationIds(
-            PromotionOrderAction,
-            args.input.actions || [],
-        );
+        // Note: PromotionItemAction and PromotionOrderAction share the same
+        // pool of action defs in getAvailableDefsOfType(), so a single call
+        // with either type will decode ID args for all promotion actions.
+        // Calling decode twice on the same input array would cause double-decoding,
+        // which breaks custom EntityIdStrategies (e.g. hashed IDs).
         this.configurableOperationCodec.decodeConfigurableOperationIds(
             PromotionItemAction,
             args.input.actions || [],
@@ -110,6 +121,16 @@ export class PromotionResolver {
         @Args() args: MutationDeletePromotionArgs,
     ): Promise<DeletionResponse> {
         return this.promotionService.softDeletePromotion(ctx, args.id);
+    }
+
+    @Transaction()
+    @Mutation()
+    @Allow(Permission.DeletePromotion)
+    deletePromotions(
+        @Ctx() ctx: RequestContext,
+        @Args() args: MutationDeletePromotionsArgs,
+    ): Promise<DeletionResponse[]> {
+        return Promise.all(args.ids.map(id => this.promotionService.softDeletePromotion(ctx, id)));
     }
 
     @Transaction()
@@ -136,7 +157,7 @@ export class PromotionResolver {
      * Encodes any entity IDs used in the filter arguments.
      */
     private encodeConditionsAndActions = <
-        T extends ErrorResultUnion<CreatePromotionResult, Promotion> | undefined
+        T extends ErrorResultUnion<CreatePromotionResult, Promotion> | undefined,
     >(
         maybePromotion: T,
     ): T => {

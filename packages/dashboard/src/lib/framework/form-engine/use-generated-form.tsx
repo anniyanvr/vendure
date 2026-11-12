@@ -1,0 +1,440 @@
+import { zodResolver, type ZodObject, type ZodTypeAny } from '@/vdb/lib/zod.js';
+import type { TypedDocumentNode } from '@graphql-typed-document-node/core';
+import { VariablesOf } from 'gql.tada';
+import { FormEvent, useEffect, useMemo, useRef } from 'react';
+import { useForm } from 'react-hook-form';
+import { useChannel } from '../../hooks/use-channel.js';
+import { useServerConfig } from '../../hooks/use-server-config.js';
+import { getOperationVariablesFields } from '../document-introspection/get-document-structure.js';
+import {
+    applyNullableSelectCustomFieldDefaults,
+    createFormSchemaFromFields,
+    getDefaultValuesFromFields,
+} from './form-schema-tools.js';
+import {
+    convertEmptyStringsToNull,
+    getChangedTopLevelFields,
+    mergeStartingValues,
+    removeEmptyIdFields,
+    stripNullNullableFields,
+    stripUntouchedTranslations,
+    transformRelationFields,
+} from './utils.js';
+
+/**
+ * @description
+ * Metadata passed as the second argument to a {@link GeneratedFormOptions} `onSubmit`
+ * handler, describing which fields the user changed relative to the loaded entity.
+ *
+ * @docsCategory detail-views
+ * @docsPage useGeneratedForm
+ * @since 3.8.0
+ */
+export interface GeneratedFormSubmitMeta {
+    /**
+     * @description
+     * The set of top-level input field names the user actually changed relative to
+     * the loaded entity (plus non-nullable fields which are always included).
+     * `undefined` when creating a new entity (there is no baseline to diff against).
+     */
+    changedFields?: ReadonlySet<string>;
+}
+
+// Stable empty array reference used as a fallback when the server config
+// (and therefore `availableLanguages`) has not yet loaded — keeps memo
+// dependencies stable across renders.
+const EMPTY_LANGUAGES: string[] = [];
+
+export type WithLooseCustomFields<T> = T extends { customFields?: any }
+    ? Omit<T, 'customFields'> & { customFields?: T['customFields'] | unknown }
+    : T;
+
+/**
+ * @description
+ * Options for the useGeneratedForm hook.
+ *
+ * @docsCategory detail-views
+ * @docsPage useGeneratedForm
+ * @since 3.3.0
+ */
+export interface GeneratedFormOptions<
+    T extends TypedDocumentNode<any, any>,
+    VarName extends keyof VariablesOf<T> | undefined = 'input',
+    E extends Record<string, any> = Record<string, any>,
+> {
+    /**
+     * @description
+     * The document to use to generate the form.
+     */
+    document?: T;
+    /**
+     * @description
+     * The name of the variable to use in the document.
+     */
+    varName?: VarName;
+    /**
+     * @description
+     * The entity to use to generate the form.
+     */
+    entity: E | null | undefined;
+    customFieldConfig?: any[]; // Add custom field config for validation
+    /**
+     * @description
+     * Refines the auto-generated Zod schema before it is passed to the form resolver. Use this
+     * to declare the fields which must actually be filled in by the user.
+     *
+     * The generated schema is derived from the GraphQL input type, which only expresses
+     * nullability — and nullability tells you nothing about whether a value is required:
+     *
+     * - A non-nullable field may still be legitimately empty. `String!` means "not null", not
+     *   "not empty", and a non-nullable `ID!` such as `CreateFacetValueInput.facetId` may be
+     *   supplied by the page in `transformCreateInput` rather than by the user.
+     * - A nullable field may still be required by the server. `CreateChannelInput.
+     *   defaultCurrencyCode` is nullable, yet `ChannelService.create` rejects the input unless
+     *   it is set.
+     *
+     * Note that this is read once, when the schema is first built: it is held in a ref so that
+     * an inline arrow function does not replace the resolver on every render.
+     *
+     * @example
+     * ```ts
+     * extendSchema: schema =>
+     *     schema.extend({
+     *         code: z.string().min(1, { message: t`This field is required` }),
+     *     }),
+     * ```
+     *
+     * @since 3.7.0
+     */
+    extendSchema?: (schema: ZodObject<any>) => ZodTypeAny;
+    setValues: (
+        entity: NonNullable<E>,
+    ) => WithLooseCustomFields<
+        VarName extends keyof VariablesOf<T> ? VariablesOf<T>[VarName] : VariablesOf<T>
+    >;
+    /**
+     * @description
+     * The starting values to apply on top of the default values when there is no entity. They count as
+     * unsaved changes. The form resets whenever they change, so values such as `new Date()` should not
+     * be recreated on every render.
+     *
+     * @since 3.8.0
+     */
+    startingValues?: WithLooseCustomFields<
+        Partial<VarName extends keyof VariablesOf<T> ? VariablesOf<T>[VarName] : VariablesOf<T>>
+    >;
+    onSubmit?: (
+        values: VarName extends keyof VariablesOf<T> ? VariablesOf<T>[VarName] : VariablesOf<T>,
+        meta?: GeneratedFormSubmitMeta,
+    ) => void;
+}
+
+/**
+ * @description
+ * This hook is used to create a form from a document and an entity.
+ * It will create a form with the fields defined in the document's input type.
+ * It will also create a submit handler that will submit the form to the server.
+ *
+ * This hook is mostly used internally by the higher-level {@link useDetailPage} hook,
+ * but can in some cases be useful to use directly.
+ *
+ * @example
+ * ```tsx
+ * const { form, submitHandler } = useGeneratedForm({
+ *  document: setDraftOrderCustomFieldsDocument,
+ *  varName: undefined,
+ *  entity: entity,
+ *  setValues: entity => {
+ *    return {
+ *      orderId: entity.id,
+ *      input: {
+ *        customFields: entity.customFields,
+ *      },
+ *    };
+ *  },
+ * });
+ * ```
+ *
+ * @docsCategory detail-views
+ * @docsPage useGeneratedForm
+ * @since 3.3.0
+ * @docsWeight 0
+ */
+export function useGeneratedForm<
+    T extends TypedDocumentNode<any, any>,
+    VarName extends keyof VariablesOf<T> | undefined,
+    E extends Record<string, any> = Record<string, any>,
+>(options: GeneratedFormOptions<T, VarName, E>) {
+    const {
+        document,
+        entity,
+        setValues,
+        startingValues: startingValuesOption,
+        onSubmit,
+        varName,
+        customFieldConfig,
+        extendSchema,
+    } = options;
+    const { activeChannel } = useChannel();
+    const serverConfig = useServerConfig();
+
+    // Callers typically pass `setValues` as an inline arrow function, which
+    // would change identity every render. Hold it in a ref so the values
+    // memo below can call the latest version without recomputing — and
+    // without going stale on a closure.
+    const setValuesRef = useRef(setValues);
+    useEffect(() => {
+        setValuesRef.current = setValues;
+    }, [setValues]);
+
+    // Same reasoning as `setValues`: an inline `extendSchema` arrow would change
+    // identity every render, replacing the resolver and re-validating the whole
+    // form each time. Read it from a ref so the schema memo below stays stable.
+    //
+    // Assign during render rather than in an effect. The schema memo reads this ref in the same
+    // render pass, and it is rebuilt when `document` swaps from the create to the update operation
+    // — which happens on the `/new` -> `/:id` navigation after a create, while the route component
+    // stays mounted. An effect runs after that render, so the memo would rebuild from the previous
+    // extender and keep a create-only rule alive for the rest of the edit session.
+    const extendSchemaRef = useRef(extendSchema);
+    extendSchemaRef.current = extendSchema;
+
+    const startingValues = entity ? undefined : startingValuesOption;
+
+    // Recomputing this on every render produces a new array identity which
+    // ripples into the schema and default-values memos below, defeating any
+    // stable form state. Memoise on the document + varName.
+    const updateFields = useMemo(
+        () => (document ? getOperationVariablesFields(document, varName) : []),
+        [document, varName],
+    );
+
+    // ServerConfigProvider memoises its value on the underlying query data,
+    // so this array has stable identity across renders when the server
+    // config hasn't changed.
+    const availableLanguages = serverConfig?.availableLanguages ?? EMPTY_LANGUAGES;
+
+    // A create form has no entity. `useDetailPage` reads the entity through a suspended query, so
+    // `isCreateForm` stays constant there and the resolver is not swapped. A caller that passes the
+    // entity after the first render gets the update schema once it arrives. See
+    // `applyCustomFieldModifiers` (#5241).
+    const isCreateForm = !entity;
+
+    // Without memoisation these objects/arrays are rebuilt on every render of
+    // the parent route. When the schema changes identity, react-hook-form's
+    // resolver is replaced and the form re-validates everything; when
+    // defaultValues changes identity it can also reset uncontrolled inputs.
+    const schema = useMemo(() => {
+        const generated = createFormSchemaFromFields(updateFields, customFieldConfig, false, isCreateForm);
+        return extendSchemaRef.current?.(generated) ?? generated;
+    }, [updateFields, customFieldConfig, isCreateForm]);
+    const defaultValues = useMemo(
+        () => getDefaultValuesFromFields(updateFields, activeChannel?.defaultLanguageCode, customFieldConfig),
+        [updateFields, activeChannel?.defaultLanguageCode, customFieldConfig],
+    );
+    const processedEntity = useMemo(
+        () => ensureTranslationsForAllLanguages(entity, availableLanguages, defaultValues),
+        [entity, availableLanguages, defaultValues],
+    );
+    const processedDefaultValues = useMemo(
+        () =>
+            ensureTranslationsForAllLanguages(defaultValues, availableLanguages, defaultValues) ??
+            defaultValues,
+        [defaultValues, availableLanguages],
+    );
+
+    const values = useMemo(() => {
+        const raw = processedEntity
+            ? transformRelationFields(updateFields, setValuesRef.current(processedEntity))
+            : processedDefaultValues;
+        return applyNullableSelectCustomFieldDefaults(raw, customFieldConfig);
+    }, [processedEntity, processedDefaultValues, updateFields, customFieldConfig]);
+
+    const form = useForm({
+        resolver: zodResolver(schema),
+        mode: 'onChange',
+        defaultValues: processedDefaultValues,
+        values,
+    });
+    // Read `dirtyFields` here, during render, so react-hook-form's lazily-tracked `formState`
+    // Proxy actually populates it. If it were only read inside the submit handler it could come
+    // back empty, and `stripUntouchedTranslations` would then keep every seeded row (see its docs).
+    const { dirtyFields } = form.formState;
+
+    // When editing an existing entity, validate the loaded values so that a stored value which
+    // fails validation is shown as an error, rather than only disabling the submit button.
+    //
+    // Keyed on the content of `values`, not its identity. react-hook-form resets the form, and
+    // clears its errors, whenever `values` changes by deep equality, so this re-validates after
+    // every such reset (e.g. a refetch of the same entity). Content keying also means a caller
+    // passing a new `customFieldConfig` array or `entity` object on each render does not re-run
+    // it on every render.
+    const valuesKey = JSON.stringify(values);
+    useEffect(() => {
+        if (entity) {
+            void form.trigger();
+        }
+    }, [valuesKey]);
+
+    // Put the starting values on top of the defaults. The defaults stay the baseline, so the starting
+    // values count as unsaved changes. Keep this below `useForm`: it must run after react-hook-form
+    // resets the form to `values`, which also happens whenever `values` changes.
+    const startingValuesKey = JSON.stringify(startingValues);
+    useEffect(() => {
+        if (startingValues) {
+            form.reset(mergeStartingValues(values, startingValues), { keepDefaultValues: true });
+        }
+    }, [valuesKey, startingValuesKey]);
+
+    let submitHandler = (event: FormEvent): any => {
+        event.preventDefault();
+    };
+    if (onSubmit) {
+        submitHandler = async (event: FormEvent) => {
+            event.preventDefault();
+
+            // Trigger validation on ALL fields, not just dirty ones
+            const isValid = await form.trigger();
+
+            if (!isValid) {
+                event.stopPropagation();
+                return;
+            }
+
+            const onSubmitWrapper = (rawValues: any) => {
+                let processed = convertEmptyStringsToNull(
+                    removeEmptyIdFields(rawValues, updateFields),
+                    updateFields,
+                );
+                // Drop translation rows the form seeded for languages the user never filled,
+                // so we don't persist empty translations that break language fallback (#4885).
+                processed = stripUntouchedTranslations(processed, updateFields, dirtyFields);
+                if (!entity) {
+                    processed = stripNullNullableFields(processed, updateFields);
+                }
+                // Compute which top-level fields actually changed relative to the
+                // loaded entity, so that consumers (e.g. useDetailPage) can omit
+                // untouched fields from update mutations and avoid clobbering
+                // concurrent edits. Diff the raw values against the `values` memo,
+                // which is the exact baseline the form was last reset to. Only
+                // meaningful for updates (an existing entity provides the baseline).
+                const meta: GeneratedFormSubmitMeta = {
+                    changedFields: entity
+                        ? getChangedTopLevelFields(rawValues, values, updateFields)
+                        : undefined,
+                };
+                // Dev-time guard for the invariant `changedFields` depends on: it is computed on the
+                // raw values, but a consumer applies it to `processed` (after the transforms above).
+                // That only stays correct while none of those transforms renames or drops a top-level
+                // key the user changed — otherwise the change would be silently omitted from the
+                // update. Empty-string IDs are the one legitimate removal (`removeEmptyIdFields`), so
+                // they are excluded. This fires only in dev/test builds; production is unaffected.
+                if (import.meta.env.DEV && meta.changedFields) {
+                    for (const key of meta.changedFields) {
+                        if (
+                            Object.prototype.hasOwnProperty.call(rawValues, key) &&
+                            rawValues[key] !== '' &&
+                            !Object.prototype.hasOwnProperty.call(processed, key)
+                        ) {
+                            throw new Error(
+                                `Form-engine invariant violated: the changed top-level field "${key}" ` +
+                                    `was removed by a pre-submission transform. Those transforms must not ` +
+                                    `rename or drop a changed key, or a consumer pruning to the changed-` +
+                                    `field set would silently omit it from the update payload.`,
+                            );
+                        }
+                    }
+                }
+                onSubmit(processed, meta);
+            };
+            form.handleSubmit(onSubmitWrapper)(event);
+        };
+    }
+
+    return { form, submitHandler };
+}
+
+/**
+ * Ensures that an entity with translations has entries for all available languages.
+ * If a language is missing, it creates an empty translation based on the structure of existing translations
+ * and the expected form structure from defaultValues.
+ */
+function ensureTranslationsForAllLanguages<E extends Record<string, any>>(
+    entity: E | null | undefined,
+    availableLanguages: string[] = [],
+    expectedStructure?: Record<string, any>,
+): E | null | undefined {
+    if (
+        !entity ||
+        !('translations' in entity) ||
+        !Array.isArray((entity as any).translations) ||
+        !availableLanguages.length
+    ) {
+        return entity;
+    }
+
+    // Create a deep copy of the entity to avoid mutation
+    const processedEntity = { ...entity } as any;
+    const translations = [...(processedEntity.translations || [])];
+
+    // Get existing language codes
+    const existingLanguageCodes = new Set(translations.map((t: any) => t.languageCode));
+
+    // Get the expected translation structure from defaultValues or existing translations
+    const existingTemplate = translations[0] || {};
+    const expectedTranslationStructure = expectedStructure?.translations?.[0] || {};
+
+    // Merge the structures to ensure we have all expected fields
+    const templateStructure = {
+        ...expectedTranslationStructure,
+        ...existingTemplate,
+    };
+
+    // Add missing language translations
+    for (const langCode of availableLanguages) {
+        if (!existingLanguageCodes.has(langCode)) {
+            const emptyTranslation: Record<string, any> = {
+                languageCode: langCode,
+            };
+
+            // Add empty fields based on merged template structure (excluding languageCode)
+            Object.keys(templateStructure).forEach(key => {
+                if (key !== 'languageCode') {
+                    if (typeof templateStructure[key] === 'object' && templateStructure[key] !== null) {
+                        // For nested objects like customFields, create an empty object
+                        emptyTranslation[key] = Array.isArray(templateStructure[key]) ? [] : {};
+                    } else {
+                        // For primitive values, use empty string as default
+                        emptyTranslation[key] = '';
+                    }
+                }
+            });
+
+            translations.push(emptyTranslation);
+        } else {
+            // For existing translations, ensure they have all expected fields
+            const existingTranslation = translations.find((t: any) => t.languageCode === langCode);
+            if (existingTranslation) {
+                Object.keys(expectedTranslationStructure).forEach(key => {
+                    if (key !== 'languageCode' && !(key in existingTranslation)) {
+                        if (
+                            typeof expectedTranslationStructure[key] === 'object' &&
+                            expectedTranslationStructure[key] !== null
+                        ) {
+                            existingTranslation[key] = Array.isArray(expectedTranslationStructure[key])
+                                ? []
+                                : {};
+                        } else {
+                            existingTranslation[key] = '';
+                        }
+                    }
+                });
+            }
+        }
+    }
+
+    // Update the processed entity with complete translations
+    processedEntity.translations = translations;
+
+    return processedEntity as E;
+}

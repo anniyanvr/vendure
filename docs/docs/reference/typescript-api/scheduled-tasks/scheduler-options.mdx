@@ -1,0 +1,55 @@
+---
+title: "SchedulerOptions"
+generated: true
+---
+<GenerationInfo sourceFile="packages/core/src/config/vendure-config.ts" sourceLine="1188" packageName="@vendure/core" since="3.3.0" />
+
+Options related to scheduled tasks..
+
+```ts title="Signature"
+interface SchedulerOptions {
+    schedulerStrategy?: SchedulerStrategy;
+    tasks?: ScheduledTask[];
+    runTasksInWorkerOnly?: boolean;
+    timezone?: string;
+}
+```
+
+<div className="members-wrapper">
+
+### schedulerStrategy
+
+<MemberInfo kind="property" type={`<a href='/reference/typescript-api/scheduled-tasks/scheduler-strategy#schedulerstrategy'>SchedulerStrategy</a>`}   />
+
+The strategy used to execute scheduled tasks. If you are using the
+[DefaultSchedulerPlugin](/reference/typescript-api/scheduled-tasks/default-scheduler-plugin#defaultschedulerplugin) (which is recommended) then this will be set to the
+[DefaultSchedulerStrategy](/reference/typescript-api/scheduled-tasks/default-scheduler-strategy#defaultschedulerstrategy).
+### tasks
+
+<MemberInfo kind="property" type={`<a href='/reference/typescript-api/scheduled-tasks/scheduled-task#scheduledtask'>ScheduledTask</a>[]`}   />
+
+The tasks to be executed.
+### runTasksInWorkerOnly
+
+<MemberInfo kind="property" type={`boolean`} default={`true`}   />
+
+Whether to run tasks only in the worker process. Generally this should
+be left as true, since tasks may involve expensive operations that should
+not be allowed to interfere with the server responsiveness.
+
+This option mainly exists for testing purposes.
+### timezone
+
+<MemberInfo kind="property" type={`string`} default={`undefined`}  since="3.8.0"  />
+
+The IANA timezone identifier (e.g. `'Europe/Stockholm'`, `'America/New_York'`) in which
+the cron schedules of all scheduled tasks are evaluated. Individual tasks can override
+this via the `timezone` property of [ScheduledTaskConfig](/reference/typescript-api/scheduled-tasks/scheduled-task#scheduledtaskconfig).
+
+When not set, cron expressions are evaluated in the timezone of the Node.js process,
+as determined by the `TZ` environment variable. Setting this option allows the process
+to run in UTC while schedules still follow local wall-clock time, including daylight
+saving time transitions.
+
+
+</div>

@@ -22,20 +22,6 @@ export const COUNTRY_FRAGMENT = gql`
     }
 `;
 
-export const GET_COUNTRY_LIST = gql`
-    query GetCountryList($options: CountryListOptions) {
-        countries(options: $options) {
-            items {
-                id
-                code
-                name
-                enabled
-            }
-            totalItems
-        }
-    }
-`;
-
 export const GET_AVAILABLE_COUNTRIES = gql`
     query GetAvailableCountries {
         countries(options: { filter: { enabled: { eq: true } } }) {
@@ -47,15 +33,6 @@ export const GET_AVAILABLE_COUNTRIES = gql`
             }
         }
     }
-`;
-
-export const GET_COUNTRY = gql`
-    query GetCountry($id: ID!) {
-        country(id: $id) {
-            ...Country
-        }
-    }
-    ${COUNTRY_FRAGMENT}
 `;
 
 export const CREATE_COUNTRY = gql`
@@ -85,34 +62,26 @@ export const DELETE_COUNTRY = gql`
     }
 `;
 
+export const DELETE_COUNTRIES = gql`
+    mutation DeleteCountries($ids: [ID!]!) {
+        deleteCountries(ids: $ids) {
+            result
+            message
+        }
+    }
+`;
+
 export const ZONE_FRAGMENT = gql`
     fragment Zone on Zone {
         id
+        createdAt
+        updatedAt
         name
         members {
             ...Country
         }
     }
     ${COUNTRY_FRAGMENT}
-`;
-
-export const GET_ZONES = gql`
-    query GetZones {
-        zones {
-            id
-            createdAt
-            updatedAt
-            name
-            members {
-                createdAt
-                updatedAt
-                id
-                name
-                code
-                enabled
-            }
-        }
-    }
 `;
 
 export const GET_ZONE = gql`
@@ -151,6 +120,15 @@ export const DELETE_ZONE = gql`
     }
 `;
 
+export const DELETE_ZONES = gql`
+    mutation DeleteZones($ids: [ID!]!) {
+        deleteZones(ids: $ids) {
+            message
+            result
+        }
+    }
+`;
+
 export const ADD_MEMBERS_TO_ZONE = gql`
     mutation AddMembersToZone($zoneId: ID!, $memberIds: [ID!]!) {
         addMembersToZone(zoneId: $zoneId, memberIds: $memberIds) {
@@ -180,18 +158,12 @@ export const TAX_CATEGORY_FRAGMENT = gql`
 `;
 
 export const GET_TAX_CATEGORIES = gql`
-    query GetTaxCategories {
-        taxCategories {
-            ...TaxCategory
-        }
-    }
-    ${TAX_CATEGORY_FRAGMENT}
-`;
-
-export const GET_TAX_CATEGORY = gql`
-    query GetTaxCategory($id: ID!) {
-        taxCategory(id: $id) {
-            ...TaxCategory
+    query GetTaxCategories($options: TaxCategoryListOptions) {
+        taxCategories(options: $options) {
+            items {
+                ...TaxCategory
+            }
+            totalItems
         }
     }
     ${TAX_CATEGORY_FRAGMENT}
@@ -224,6 +196,15 @@ export const DELETE_TAX_CATEGORY = gql`
     }
 `;
 
+export const DELETE_TAX_CATEGORIES = gql`
+    mutation DeleteTaxCategories($ids: [ID!]!) {
+        deleteTaxCategories(ids: $ids) {
+            result
+            message
+        }
+    }
+`;
+
 export const TAX_RATE_FRAGMENT = gql`
     fragment TaxRate on TaxRate {
         id
@@ -247,25 +228,28 @@ export const TAX_RATE_FRAGMENT = gql`
     }
 `;
 
-export const GET_TAX_RATE_LIST = gql`
-    query GetTaxRateList($options: TaxRateListOptions) {
+export const GET_TAX_RATE_LIST_SIMPLE = gql`
+    query GetTaxRateListSimple($options: TaxRateListOptions) {
         taxRates(options: $options) {
             items {
-                ...TaxRate
+                id
+                createdAt
+                updatedAt
+                name
+                enabled
+                value
+                category {
+                    id
+                    name
+                }
+                zone {
+                    id
+                    name
+                }
             }
             totalItems
         }
     }
-    ${TAX_RATE_FRAGMENT}
-`;
-
-export const GET_TAX_RATE = gql`
-    query GetTaxRate($id: ID!) {
-        taxRate(id: $id) {
-            ...TaxRate
-        }
-    }
-    ${TAX_RATE_FRAGMENT}
 `;
 
 export const CREATE_TAX_RATE = gql`
@@ -295,6 +279,15 @@ export const DELETE_TAX_RATE = gql`
     }
 `;
 
+export const DELETE_TAX_RATES = gql`
+    mutation DeleteTaxRates($ids: [ID!]!) {
+        deleteTaxRates(ids: $ids) {
+            result
+            message
+        }
+    }
+`;
+
 export const CHANNEL_FRAGMENT = gql`
     fragment Channel on Channel {
         id
@@ -303,7 +296,9 @@ export const CHANNEL_FRAGMENT = gql`
         code
         token
         pricesIncludeTax
-        currencyCode
+        availableCurrencyCodes
+        availableLanguageCodes
+        defaultCurrencyCode
         defaultLanguageCode
         defaultShippingZone {
             id
@@ -313,25 +308,84 @@ export const CHANNEL_FRAGMENT = gql`
             id
             name
         }
+        seller {
+            id
+            name
+        }
+    }
+`;
+
+export const SELLER_FRAGMENT = gql`
+    fragment Seller on Seller {
+        id
+        createdAt
+        updatedAt
+        name
+        translations {
+            id
+            languageCode
+        }
     }
 `;
 
 export const GET_CHANNELS = gql`
-    query GetChannels {
-        channels {
-            ...Channel
+    query GetChannels($options: ChannelListOptions) {
+        channels(options: $options) {
+            items {
+                ...Channel
+            }
+            totalItems
         }
     }
     ${CHANNEL_FRAGMENT}
 `;
 
-export const GET_CHANNEL = gql`
-    query GetChannel($id: ID!) {
-        channel(id: $id) {
-            ...Channel
+export const GET_SELLERS = gql`
+    query GetSellers($options: SellerListOptions) {
+        sellers(options: $options) {
+            items {
+                ...Seller
+            }
+            totalItems
         }
     }
-    ${CHANNEL_FRAGMENT}
+    ${SELLER_FRAGMENT}
+`;
+
+export const CREATE_SELLER = gql`
+    mutation CreateSeller($input: CreateSellerInput!) {
+        createSeller(input: $input) {
+            ...Seller
+        }
+    }
+    ${SELLER_FRAGMENT}
+`;
+
+export const UPDATE_SELLER = gql`
+    mutation UpdateSeller($input: UpdateSellerInput!) {
+        updateSeller(input: $input) {
+            ...Seller
+        }
+    }
+    ${SELLER_FRAGMENT}
+`;
+
+export const DELETE_SELLER = gql`
+    mutation DeleteSeller($id: ID!) {
+        deleteSeller(id: $id) {
+            result
+            message
+        }
+    }
+`;
+
+export const DELETE_SELLERS = gql`
+    mutation DeleteSellers($ids: [ID!]!) {
+        deleteSellers(ids: $ids) {
+            result
+            message
+        }
+    }
 `;
 
 export const GET_ACTIVE_CHANNEL = gql`
@@ -374,6 +428,15 @@ export const DELETE_CHANNEL = gql`
     }
 `;
 
+export const DELETE_CHANNELS = gql`
+    mutation DeleteChannels($ids: [ID!]!) {
+        deleteChannels(ids: $ids) {
+            result
+            message
+        }
+    }
+`;
+
 export const PAYMENT_METHOD_FRAGMENT = gql`
     fragment PaymentMethod on PaymentMethod {
         id
@@ -383,6 +446,12 @@ export const PAYMENT_METHOD_FRAGMENT = gql`
         code
         description
         enabled
+        translations {
+            id
+            languageCode
+            name
+            description
+        }
         checker {
             ...ConfigurableOperation
         }
@@ -391,18 +460,6 @@ export const PAYMENT_METHOD_FRAGMENT = gql`
         }
     }
     ${CONFIGURABLE_OPERATION_FRAGMENT}
-`;
-
-export const GET_PAYMENT_METHOD_LIST = gql`
-    query GetPaymentMethodList($options: PaymentMethodListOptions!) {
-        paymentMethods(options: $options) {
-            items {
-                ...PaymentMethod
-            }
-            totalItems
-        }
-    }
-    ${PAYMENT_METHOD_FRAGMENT}
 `;
 
 export const GET_PAYMENT_METHOD_OPERATIONS = gql`
@@ -415,15 +472,6 @@ export const GET_PAYMENT_METHOD_OPERATIONS = gql`
         }
     }
     ${CONFIGURABLE_OPERATION_DEF_FRAGMENT}
-`;
-
-export const GET_PAYMENT_METHOD = gql`
-    query GetPaymentMethod($id: ID!) {
-        paymentMethod(id: $id) {
-            ...PaymentMethod
-        }
-    }
-    ${PAYMENT_METHOD_FRAGMENT}
 `;
 
 export const CREATE_PAYMENT_METHOD = gql`
@@ -447,6 +495,15 @@ export const UPDATE_PAYMENT_METHOD = gql`
 export const DELETE_PAYMENT_METHOD = gql`
     mutation DeletePaymentMethod($id: ID!, $force: Boolean) {
         deletePaymentMethod(id: $id, force: $force) {
+            result
+            message
+        }
+    }
+`;
+
+export const DELETE_PAYMENT_METHODS = gql`
+    mutation DeletePaymentMethods($ids: [ID!]!, $force: Boolean) {
+        deletePaymentMethods(ids: $ids, force: $force) {
             result
             message
         }
@@ -506,6 +563,9 @@ export const CUSTOM_FIELD_CONFIG_FRAGMENT = gql`
             value
         }
         readonly
+        nullable
+        requiresPermission
+        ui
     }
 `;
 
@@ -527,6 +587,18 @@ export const LOCALE_STRING_CUSTOM_FIELD_FRAGMENT = gql`
     fragment LocaleStringCustomField on LocaleStringCustomFieldConfig {
         ...CustomFieldConfig
         pattern
+    }
+    ${CUSTOM_FIELD_CONFIG_FRAGMENT}
+`;
+export const TEXT_CUSTOM_FIELD_FRAGMENT = gql`
+    fragment TextCustomField on TextCustomFieldConfig {
+        ...CustomFieldConfig
+    }
+    ${CUSTOM_FIELD_CONFIG_FRAGMENT}
+`;
+export const LOCALE_TEXT_CUSTOM_FIELD_FRAGMENT = gql`
+    fragment LocaleTextCustomField on LocaleTextCustomFieldConfig {
+        ...CustomFieldConfig
     }
     ${CUSTOM_FIELD_CONFIG_FRAGMENT}
 `;
@@ -572,6 +644,54 @@ export const RELATION_CUSTOM_FIELD_FRAGMENT = gql`
     ${CUSTOM_FIELD_CONFIG_FRAGMENT}
 `;
 
+export const STRUCT_CUSTOM_FIELD_FRAGMENT = gql`
+    fragment StructCustomField on StructCustomFieldConfig {
+        ...CustomFieldConfig
+        fields {
+            ... on StructField {
+                name
+                type
+                list
+                description {
+                    languageCode
+                    value
+                }
+                label {
+                    languageCode
+                    value
+                }
+                ui
+            }
+            ... on StringStructFieldConfig {
+                pattern
+                options {
+                    label {
+                        languageCode
+                        value
+                    }
+                    value
+                }
+            }
+            ... on IntStructFieldConfig {
+                intMin: min
+                intMax: max
+                intStep: step
+            }
+            ... on FloatStructFieldConfig {
+                floatMin: min
+                floatMax: max
+                floatStep: step
+            }
+            ... on DateTimeStructFieldConfig {
+                datetimeMin: min
+                datetimeMax: max
+                datetimeStep: step
+            }
+        }
+    }
+    ${CUSTOM_FIELD_CONFIG_FRAGMENT}
+`;
+
 export const ALL_CUSTOM_FIELDS_FRAGMENT = gql`
     fragment CustomFields on CustomField {
         ... on StringCustomFieldConfig {
@@ -579,6 +699,12 @@ export const ALL_CUSTOM_FIELDS_FRAGMENT = gql`
         }
         ... on LocaleStringCustomFieldConfig {
             ...LocaleStringCustomField
+        }
+        ... on TextCustomFieldConfig {
+            ...TextCustomField
+        }
+        ... on LocaleTextCustomFieldConfig {
+            ...LocaleTextCustomField
         }
         ... on BooleanCustomFieldConfig {
             ...BooleanCustomField
@@ -595,14 +721,20 @@ export const ALL_CUSTOM_FIELDS_FRAGMENT = gql`
         ... on RelationCustomFieldConfig {
             ...RelationCustomField
         }
+        ... on StructCustomFieldConfig {
+            ...StructCustomField
+        }
     }
     ${STRING_CUSTOM_FIELD_FRAGMENT}
     ${LOCALE_STRING_CUSTOM_FIELD_FRAGMENT}
+    ${TEXT_CUSTOM_FIELD_FRAGMENT}
     ${BOOLEAN_CUSTOM_FIELD_FRAGMENT}
     ${INT_CUSTOM_FIELD_FRAGMENT}
     ${FLOAT_CUSTOM_FIELD_FRAGMENT}
     ${DATE_TIME_CUSTOM_FIELD_FRAGMENT}
     ${RELATION_CUSTOM_FIELD_FRAGMENT}
+    ${LOCALE_TEXT_CUSTOM_FIELD_FRAGMENT}
+    ${STRUCT_CUSTOM_FIELD_FRAGMENT}
 `;
 
 export const GET_SERVER_CONFIG = gql`
@@ -610,6 +742,7 @@ export const GET_SERVER_CONFIG = gql`
         globalSettings {
             id
             serverConfig {
+                moneyStrategyPrecision
                 orderProcess {
                     name
                     to
@@ -620,59 +753,9 @@ export const GET_SERVER_CONFIG = gql`
                     description
                     assignable
                 }
-                customFieldConfig {
-                    Address {
-                        ...CustomFields
-                    }
-                    Administrator {
-                        ...CustomFields
-                    }
-                    Asset {
-                        ...CustomFields
-                    }
-                    Channel {
-                        ...CustomFields
-                    }
-                    Collection {
-                        ...CustomFields
-                    }
-                    Customer {
-                        ...CustomFields
-                    }
-                    Facet {
-                        ...CustomFields
-                    }
-                    FacetValue {
-                        ...CustomFields
-                    }
-                    Fulfillment {
-                        ...CustomFields
-                    }
-                    GlobalSettings {
-                        ...CustomFields
-                    }
-                    Order {
-                        ...CustomFields
-                    }
-                    OrderLine {
-                        ...CustomFields
-                    }
-                    Product {
-                        ...CustomFields
-                    }
-                    ProductOption {
-                        ...CustomFields
-                    }
-                    ProductOptionGroup {
-                        ...CustomFields
-                    }
-                    ProductVariant {
-                        ...CustomFields
-                    }
-                    ShippingMethod {
-                        ...CustomFields
-                    }
-                    User {
+                entityCustomFields {
+                    entityName
+                    customFields {
                         ...CustomFields
                     }
                 }
@@ -696,6 +779,8 @@ export const JOB_INFO_FRAGMENT = gql`
         data
         result
         error
+        retries
+        attempts
     }
 `;
 
@@ -754,4 +839,18 @@ export const REINDEX = gql`
         }
     }
     ${JOB_INFO_FRAGMENT}
+`;
+
+export const GET_PENDING_SEARCH_INDEX_UPDATES = gql`
+    query GetPendingSearchIndexUpdates {
+        pendingSearchIndexUpdates
+    }
+`;
+
+export const RUN_PENDING_SEARCH_INDEX_UPDATES = gql`
+    mutation RunPendingSearchIndexUpdates {
+        runPendingSearchIndexUpdates {
+            success
+        }
+    }
 `;

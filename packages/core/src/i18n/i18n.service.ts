@@ -3,11 +3,12 @@ import { Handler, Request } from 'express';
 import * as fs from 'fs';
 import { GraphQLError } from 'graphql';
 import i18next, { TFunction } from 'i18next';
-import i18nextMiddleware from 'i18next-express-middleware';
 import Backend from 'i18next-fs-backend';
+import i18nextMiddleware from 'i18next-http-middleware';
 import ICU from 'i18next-icu';
 import path from 'path';
 
+import { ConfigurableOperationTranslator } from '../common/configurable-operation';
 import { GraphQLErrorResult } from '../common/error/error-result';
 import { Logger } from '../config';
 import { ConfigService } from '../config/config.service';
@@ -18,13 +19,20 @@ import { I18nError } from './i18n-error';
  * @description
  * I18n resources used for translations
  *
- * @docsCategory Translation
+ * @docsCategory common
+ * @docsPage I18nService
  */
 export interface VendureTranslationResources {
     error: any;
     errorResult: any;
     message: any;
+    configurableOperation?: any;
 }
+
+/**
+ * The namespace within the translation resources under which ConfigurableOperationDef strings live.
+ */
+const CONFIGURABLE_OPERATION_NAMESPACE = 'configurableOperation';
 
 export interface I18nRequest extends Request {
     t: TFunction;
@@ -35,10 +43,21 @@ export interface I18nRequest extends Request {
  * The `i18next-express-middleware` middleware detects the client's preferred language based on
  * the `Accept-Language` header or "lang" query param and adds language-specific translation
  * functions to the Express request / response objects.
- * @docsCategory Translation
+ *
+ * @docsCategory common
+ * @docsPage I18nService
+ * @docsWeight 0
  */
 @Injectable()
-export class I18nService implements OnModuleInit {
+export class I18nService implements OnModuleInit, ConfigurableOperationTranslator {
+    /**
+     * The set of language codes we have translation resources for. Used as the i18next
+     * `supportedLngs` allow-list. Without this, `i18next-http-middleware` appends every
+     * distinct request language code to `options.preload` forever, which is then re-walked
+     * (via `Intl.getCanonicalLocales`) on every request — degrading performance over time.
+     */
+    private readonly supportedLanguages = new Set<string>();
+
     /**
      * @internal
      * @param configService
@@ -49,12 +68,17 @@ export class I18nService implements OnModuleInit {
      * @internal
      */
     onModuleInit() {
+        for (const langKey of this.getBundledLanguageCodes()) {
+            this.supportedLanguages.add(langKey);
+        }
         return i18next
             .use(i18nextMiddleware.LanguageDetector)
             .use(Backend as any)
-            .use(ICU as any)
+            .use(ICU)
             .init({
-                preload: ['en', 'de'],
+                nsSeparator: false,
+                preload: Array.from(this.supportedLanguages),
+                supportedLngs: Array.from(this.supportedLanguages),
                 fallbackLng: 'en',
                 detection: {
                     lookupQuerystring: 'languageCode',
@@ -67,10 +91,54 @@ export class I18nService implements OnModuleInit {
     }
 
     /**
+     * Reads the language codes for which we ship message files, derived from the filenames
+     * in the `messages` directory (e.g. `en.json` -> `en`, `pt_BR.json` -> `pt_BR`). Falls
+     * back to a static list if the directory cannot be read.
+     */
+    private getBundledLanguageCodes(): string[] {
+        const fallback = ['en', 'de', 'es', 'fr', 'pt_BR', 'pt_PT', 'ru', 'uk'];
+        try {
+            const messagesDir = path.join(__dirname, 'messages');
+            const codes = fs
+                .readdirSync(messagesDir)
+                .filter(file => file.endsWith('.json'))
+                .map(file => path.basename(file, '.json'));
+            return codes.length ? codes : fallback;
+        } catch (e: any) {
+            Logger.warn(
+                `Could not read i18n messages directory, falling back to default language list: ${e.message as string}`,
+                'I18nService',
+            );
+            return fallback;
+        }
+    }
+
+    /**
+     * Registers a language code as supported, extending the i18next `supportedLngs` allow-list
+     * at runtime. Needed because plugins may add translations for new languages after init via
+     * {@link addTranslation}. `supportedLngs` is cached inside i18next's `languageUtils` at init
+     * time, so both the cached copy and `options` must be updated for the change to take effect.
+     */
+    private registerSupportedLanguage(langKey: string): void {
+        if (this.supportedLanguages.has(langKey)) {
+            return;
+        }
+        this.supportedLanguages.add(langKey);
+        const supportedLngs = [...this.supportedLanguages, 'cimode'];
+        i18next.options.supportedLngs = supportedLngs;
+        const languageUtils = (i18next as any).services?.languageUtils;
+        if (languageUtils) {
+            languageUtils.supportedLngs = supportedLngs;
+        }
+    }
+
+    /**
      * @internal
      */
     handle(): Handler {
-        return i18nextMiddleware.handle(i18next);
+        // Explicit cast due to type mismatch between express v5 (Vendure core)
+        // and express v4 (several transitive dependencies)
+        return i18nextMiddleware.handle(i18next) as unknown as Handler;
     }
 
     /**
@@ -85,8 +153,8 @@ export class I18nService implements OnModuleInit {
             const rawData = fs.readFileSync(filePath);
             const resources = JSON.parse(rawData.toString('utf-8'));
             this.addTranslation(langKey, resources);
-        } catch (err) {
-            Logger.error(`Could not load resources file ${filePath}`, `I18nService`);
+        } catch (err: any) {
+            Logger.error(`Could not load resources file ${filePath}`, 'I18nService');
         }
     }
 
@@ -98,7 +166,34 @@ export class I18nService implements OnModuleInit {
      * @param resources key-value translations
      */
     addTranslation(langKey: string, resources: VendureTranslationResources | any): void {
+        this.registerSupportedLanguage(langKey);
         i18next.addResourceBundle(langKey, 'translation', resources, true, true);
+    }
+
+    /**
+     * @description
+     * Returns the string stored at the given path within the `configurableOperation` namespace of
+     * the catalog for `languageCode`, or `undefined` if there is no entry there.
+     *
+     * The resource is read straight out of the store rather than via `t()`, for two reasons. The
+     * values contain `{ argName }` placeholders which the Admin UI interpolates with the live
+     * argument values, so they must reach the client untouched by ICU formatting. And the keys may
+     * contain dots — a plugin is free to use a code such as `acme.shipping.handler` — which
+     * i18next would otherwise treat as path separators.
+     *
+     * @since 3.8.0
+     */
+    getConfigurableOperationTranslation(languageCode: string, keyPath: string[]): string | undefined {
+        let node: any = i18next.getResourceBundle(languageCode, 'translation')?.[
+            CONFIGURABLE_OPERATION_NAMESPACE
+        ];
+        for (const segment of keyPath) {
+            if (node == null || typeof node !== 'object') {
+                return undefined;
+            }
+            node = node[segment];
+        }
+        return typeof node === 'string' ? node : undefined;
     }
 
     /**
@@ -113,8 +208,10 @@ export class I18nService implements OnModuleInit {
             let translation = originalError.message;
             try {
                 translation = t(originalError.message, originalError.variables);
-            } catch (e) {
-                translation += ` (Translation format error: ${e.message})`;
+            } catch (e: any) {
+                const message =
+                    typeof e.message === 'string' ? (e.message as string) : JSON.stringify(e.message);
+                translation += ` (Translation format error: ${message})`;
             }
             error.message = translation;
             // We can now safely remove the variables object so that they do not appear in
@@ -134,9 +231,10 @@ export class I18nService implements OnModuleInit {
         let translation: string = error.message;
         const key = `errorResult.${error.message}`;
         try {
-            translation = t(key, error as any);
-        } catch (e) {
-            translation += ` (Translation format error: ${e.message})`;
+            translation = t(key, error);
+        } catch (e: any) {
+            const message = typeof e.message === 'string' ? (e.message as string) : JSON.stringify(e.message);
+            translation += ` (Translation format error: ${message})`;
         }
         error.message = translation;
     }

@@ -1,50 +1,70 @@
 import { Injectable } from '@nestjs/common';
 import {
+    AssignShippingMethodsToChannelInput,
     ConfigurableOperationDefinition,
     CreateShippingMethodInput,
     DeletionResponse,
     DeletionResult,
+    Permission,
+    RemoveShippingMethodsFromChannelInput,
     UpdateShippingMethodInput,
 } from '@vendure/common/lib/generated-types';
 import { omit } from '@vendure/common/lib/omit';
 import { ID, PaginatedList } from '@vendure/common/lib/shared-types';
+import { IsNull } from 'typeorm';
 
 import { RequestContext } from '../../api/common/request-context';
-import { EntityNotFoundError } from '../../common/error/errors';
+import { RelationPaths } from '../../api/decorators/relations.decorator';
+import { EntityNotFoundError, ForbiddenError, UserInputError } from '../../common/error/errors';
+import { Instrument } from '../../common/instrument-decorator';
 import { ListQueryOptions } from '../../common/types/common-types';
+import { Translated } from '../../common/types/locale-types';
 import { assertFound, idsAreEqual } from '../../common/utils';
 import { ConfigService } from '../../config/config.service';
 import { Logger } from '../../config/logger/vendure-logger';
-import { Channel } from '../../entity/channel/channel.entity';
+import { findOptionsArrayToObject } from '../../connection/find-options-array-to-object';
+import { TransactionalConnection } from '../../connection/transactional-connection';
 import { ShippingMethodTranslation } from '../../entity/shipping-method/shipping-method-translation.entity';
 import { ShippingMethod } from '../../entity/shipping-method/shipping-method.entity';
+import { EventBus } from '../../event-bus';
+import { ShippingMethodEvent } from '../../event-bus/events/shipping-method-event';
 import { ConfigArgService } from '../helpers/config-arg/config-arg.service';
 import { CustomFieldRelationService } from '../helpers/custom-field-relation/custom-field-relation.service';
 import { ListQueryBuilder } from '../helpers/list-query-builder/list-query-builder';
 import { TranslatableSaver } from '../helpers/translatable-saver/translatable-saver';
-import { translateDeep } from '../helpers/utils/translate-entity';
-import { TransactionalConnection } from '../transaction/transactional-connection';
+import { TranslatorService } from '../helpers/translator/translator.service';
 
 import { ChannelService } from './channel.service';
+import { RoleService } from './role.service';
 
+/**
+ * @description
+ * Contains methods relating to {@link ShippingMethod} entities.
+ *
+ * @docsCategory services
+ */
 @Injectable()
+@Instrument()
 export class ShippingMethodService {
-    private activeShippingMethods: ShippingMethod[];
-
     constructor(
         private connection: TransactionalConnection,
         private configService: ConfigService,
+        private roleService: RoleService,
         private listQueryBuilder: ListQueryBuilder,
         private channelService: ChannelService,
         private configArgService: ConfigArgService,
         private translatableSaver: TranslatableSaver,
         private customFieldRelationService: CustomFieldRelationService,
+        private eventBus: EventBus,
+        private translator: TranslatorService,
     ) {}
 
+    /** @internal */
     async initShippingMethods() {
         if (this.configService.shippingOptions.fulfillmentHandlers.length === 0) {
             throw new Error(
-                `No FulfillmentHandlers were found. Please ensure the VendureConfig.shippingOptions.fulfillmentHandlers array contains at least one FulfillmentHandler.`,
+                'No FulfillmentHandlers were found.' +
+                    ' Please ensure the VendureConfig.shippingOptions.fulfillmentHandlers array contains at least one FulfillmentHandler.',
             );
         }
         await this.verifyShippingMethods();
@@ -53,17 +73,18 @@ export class ShippingMethodService {
     findAll(
         ctx: RequestContext,
         options?: ListQueryOptions<ShippingMethod>,
-    ): Promise<PaginatedList<ShippingMethod>> {
+        relations: RelationPaths<ShippingMethod> = [],
+    ): Promise<PaginatedList<Translated<ShippingMethod>>> {
         return this.listQueryBuilder
             .build(ShippingMethod, options, {
-                relations: ['channels'],
-                where: { deletedAt: null },
+                relations,
+                where: { deletedAt: IsNull() },
                 channelId: ctx.channelId,
                 ctx,
             })
             .getManyAndCount()
             .then(([items, totalItems]) => ({
-                items: items.map(i => translateDeep(i, ctx.languageCode)),
+                items: items.map(i => this.translator.translate(i, ctx)),
                 totalItems,
             }));
     }
@@ -72,21 +93,36 @@ export class ShippingMethodService {
         ctx: RequestContext,
         shippingMethodId: ID,
         includeDeleted = false,
-    ): Promise<ShippingMethod | undefined> {
-        const shippingMethod = await this.connection.findOneInChannel(
-            ctx,
-            ShippingMethod,
-            shippingMethodId,
-            ctx.channelId,
-            {
-                relations: ['channels'],
-                ...(includeDeleted === false ? { where: { deletedAt: null } } : {}),
-            },
-        );
-        return shippingMethod && translateDeep(shippingMethod, ctx.languageCode);
+        relations: RelationPaths<ShippingMethod> = [],
+        filterOnChannel = true,
+    ): Promise<Translated<ShippingMethod> | undefined> {
+        let shippingMethod: ShippingMethod | undefined | null;
+
+        if (!filterOnChannel) {
+            shippingMethod = await this.connection.getRepository(ctx, ShippingMethod).findOne({
+                where: {
+                    id: shippingMethodId,
+                    ...(includeDeleted ? {} : { deletedAt: IsNull() }),
+                },
+                relations: findOptionsArrayToObject<ShippingMethod>(relations),
+            });
+        } else {
+            shippingMethod = await this.connection.findOneInChannel(
+                ctx,
+                ShippingMethod,
+                shippingMethodId,
+                ctx.channelId,
+                {
+                    relations,
+                    ...(includeDeleted === false ? { where: { deletedAt: IsNull() } } : {}),
+                },
+            );
+        }
+
+        return (shippingMethod && this.translator.translate(shippingMethod, ctx)) ?? undefined;
     }
 
-    async create(ctx: RequestContext, input: CreateShippingMethodInput): Promise<ShippingMethod> {
+    async create(ctx: RequestContext, input: CreateShippingMethodInput): Promise<Translated<ShippingMethod>> {
         const shippingMethod = await this.translatableSaver.create({
             ctx,
             input,
@@ -104,16 +140,23 @@ export class ShippingMethodService {
                 method.calculator = this.configArgService.parseInput('ShippingCalculator', input.calculator);
             },
         });
-        this.channelService.assignToCurrentChannel(shippingMethod, ctx);
+        await this.channelService.assignToCurrentChannel(shippingMethod, ctx);
         const newShippingMethod = await this.connection
             .getRepository(ctx, ShippingMethod)
             .save(shippingMethod);
-        await this.customFieldRelationService.updateRelations(ctx, ShippingMethod, input, newShippingMethod);
-        await this.updateActiveShippingMethods(ctx);
+        const shippingMethodWithRelations = await this.customFieldRelationService.updateRelations(
+            ctx,
+            ShippingMethod,
+            input,
+            newShippingMethod,
+        );
+        await this.eventBus.publish(
+            new ShippingMethodEvent(ctx, shippingMethodWithRelations, 'created', input),
+        );
         return assertFound(this.findOne(ctx, newShippingMethod.id));
     }
 
-    async update(ctx: RequestContext, input: UpdateShippingMethodInput): Promise<ShippingMethod> {
+    async update(ctx: RequestContext, input: UpdateShippingMethodInput): Promise<Translated<ShippingMethod>> {
         const shippingMethod = await this.findOne(ctx, input.id);
         if (!shippingMethod) {
             throw new EntityNotFoundError('ShippingMethod', input.id);
@@ -128,12 +171,14 @@ export class ShippingMethodService {
             updatedShippingMethod.checker = this.configArgService.parseInput(
                 'ShippingEligibilityChecker',
                 input.checker,
+                shippingMethod.checker ?? undefined,
             );
         }
         if (input.calculator) {
             updatedShippingMethod.calculator = this.configArgService.parseInput(
                 'ShippingCalculator',
                 input.calculator,
+                shippingMethod.calculator ?? undefined,
             );
         }
         if (input.fulfillmentHandler) {
@@ -142,30 +187,104 @@ export class ShippingMethodService {
                 input.fulfillmentHandler,
             );
         }
-        await this.connection
-            .getRepository(ctx, ShippingMethod)
-            .save(updatedShippingMethod, { reload: false });
         await this.customFieldRelationService.updateRelations(
             ctx,
             ShippingMethod,
             input,
             updatedShippingMethod,
         );
-        await this.updateActiveShippingMethods(ctx);
+        await this.connection
+            .getRepository(ctx, ShippingMethod)
+            .save(updatedShippingMethod, { reload: false });
+        await this.eventBus.publish(new ShippingMethodEvent(ctx, updatedShippingMethod, 'updated', input));
         return assertFound(this.findOne(ctx, shippingMethod.id));
     }
 
     async softDelete(ctx: RequestContext, id: ID): Promise<DeletionResponse> {
         const shippingMethod = await this.connection.getEntityOrThrow(ctx, ShippingMethod, id, {
             channelId: ctx.channelId,
-            where: { deletedAt: null },
+            where: { deletedAt: IsNull() },
         });
         shippingMethod.deletedAt = new Date();
         await this.connection.getRepository(ctx, ShippingMethod).save(shippingMethod, { reload: false });
-        await this.updateActiveShippingMethods(ctx);
+        await this.eventBus.publish(new ShippingMethodEvent(ctx, shippingMethod, 'deleted', id));
         return {
             result: DeletionResult.DELETED,
         };
+    }
+
+    async assignShippingMethodsToChannel(
+        ctx: RequestContext,
+        input: AssignShippingMethodsToChannelInput,
+    ): Promise<Array<Translated<ShippingMethod>>> {
+        const hasPermission = await this.roleService.userHasAnyPermissionsOnChannel(ctx, input.channelId, [
+            Permission.UpdateShippingMethod,
+            Permission.UpdateSettings,
+        ]);
+        if (!hasPermission) {
+            throw new ForbiddenError();
+        }
+        // Source entities must be visible in the active Channel (GHSA-422x-jq57-j238).
+        const shippingMethods = await this.connection.findByIdsInChannel(
+            ctx,
+            ShippingMethod,
+            input.shippingMethodIds,
+            ctx.channelId,
+            {},
+        );
+        for (const shippingMethod of shippingMethods) {
+            await this.channelService.assignToChannels(ctx, ShippingMethod, shippingMethod.id, [
+                input.channelId,
+            ]);
+        }
+        return this.connection
+            .findByIdsInChannel(
+                ctx,
+                ShippingMethod,
+                shippingMethods.map(method => method.id),
+                ctx.channelId,
+                {},
+            )
+            .then(methods => methods.map(method => this.translator.translate(method, ctx)));
+    }
+
+    async removeShippingMethodsFromChannel(
+        ctx: RequestContext,
+        input: RemoveShippingMethodsFromChannelInput,
+    ): Promise<Array<Translated<ShippingMethod>>> {
+        const hasPermission = await this.roleService.userHasAnyPermissionsOnChannel(ctx, input.channelId, [
+            Permission.DeleteShippingMethod,
+            Permission.DeleteSettings,
+        ]);
+        if (!hasPermission) {
+            throw new ForbiddenError();
+        }
+        const defaultChannel = await this.channelService.getDefaultChannel(ctx);
+        if (idsAreEqual(input.channelId, defaultChannel.id)) {
+            throw new UserInputError('error.items-cannot-be-removed-from-default-channel');
+        }
+        // Source entities must be visible in the active Channel (GHSA-422x-jq57-j238).
+        const shippingMethods = await this.connection.findByIdsInChannel(
+            ctx,
+            ShippingMethod,
+            input.shippingMethodIds,
+            ctx.channelId,
+            {},
+        );
+        for (const shippingMethod of shippingMethods) {
+            await this.channelService.removeFromChannels(ctx, ShippingMethod, shippingMethod.id, [
+                input.channelId,
+            ]);
+        }
+        return this.connection
+            .findByIdsInChannel(
+                ctx,
+                ShippingMethod,
+                shippingMethods.map(method => method.id),
+                ctx.channelId,
+                {},
+            )
+            .then(methods => methods.map(method => this.translator.translate(method, ctx)));
     }
 
     getShippingEligibilityCheckers(ctx: RequestContext): ConfigurableOperationDefinition[] {
@@ -182,31 +301,31 @@ export class ShippingMethodService {
         return this.configArgService.getDefinitions('FulfillmentHandler').map(x => x.toGraphQlType(ctx));
     }
 
-    getActiveShippingMethods(channel: Channel): ShippingMethod[] {
-        return this.activeShippingMethods.filter(sm => sm.channels.find(c => idsAreEqual(c.id, channel.id)));
+    async getActiveShippingMethods(ctx: RequestContext): Promise<ShippingMethod[]> {
+        const shippingMethods = await this.connection.getRepository(ctx, ShippingMethod).find({
+            relations: { channels: true, customFields: true },
+            where: { deletedAt: IsNull() },
+        });
+        return shippingMethods
+            .filter(sm => sm.channels.find(c => idsAreEqual(c.id, ctx.channelId)))
+            .map(m => this.translator.translate(m, ctx));
     }
 
     /**
      * Ensures that all ShippingMethods have a valid fulfillmentHandlerCode
      */
     private async verifyShippingMethods() {
-        await this.updateActiveShippingMethods(RequestContext.empty());
-        for (const method of this.activeShippingMethods) {
+        const activeShippingMethods = await this.connection.rawConnection.getRepository(ShippingMethod).find({
+            where: { deletedAt: IsNull() },
+        });
+        for (const method of activeShippingMethods) {
             const handlerCode = method.fulfillmentHandlerCode;
             const verifiedHandlerCode = this.ensureValidFulfillmentHandlerCode(method.code, handlerCode);
             if (handlerCode !== verifiedHandlerCode) {
                 method.fulfillmentHandlerCode = verifiedHandlerCode;
-                await this.connection.getRepository(ShippingMethod).save(method);
+                await this.connection.rawConnection.getRepository(ShippingMethod).save(method);
             }
         }
-    }
-
-    private async updateActiveShippingMethods(ctx: RequestContext) {
-        const activeShippingMethods = await this.connection.getRepository(ctx, ShippingMethod).find({
-            relations: ['channels'],
-            where: { deletedAt: null },
-        });
-        this.activeShippingMethods = activeShippingMethods.map(m => translateDeep(m, ctx.languageCode));
     }
 
     private ensureValidFulfillmentHandlerCode(

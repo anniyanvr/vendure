@@ -1,88 +1,101 @@
-import { OnModuleInit } from '@nestjs/common';
-import { HistoryEntryType } from '@vendure/common/lib/generated-types';
+import {
+    CurrencyCode,
+    DeletionResult,
+    ErrorCode,
+    HistoryEntryType,
+    LanguageCode,
+    Permission,
+} from '@vendure/common/lib/generated-types';
 import { omit } from '@vendure/common/lib/omit';
 import { pick } from '@vendure/common/lib/pick';
 import {
     AccountRegistrationEvent,
+    AccountVerifiedEvent,
+    ConfigService,
     EventBus,
-    EventBusModule,
-    mergeConfig,
-    VendurePlugin,
+    NativeAuthenticationMethod,
+    OrderService,
+    RequestContextService,
+    TransactionalConnection,
 } from '@vendure/core';
-import { createErrorResultGuard, createTestEnvironment, ErrorResultGuard } from '@vendure/testing';
-import gql from 'graphql-tag';
+import {
+    createErrorResultGuard,
+    createTestEnvironment,
+    E2E_DEFAULT_CHANNEL_TOKEN,
+    ErrorResultGuard,
+} from '@vendure/testing';
 import path from 'path';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 
 import { initialData } from '../../../e2e-common/e2e-initial-data';
-import { testConfig, TEST_SETUP_TIMEOUT_MS } from '../../../e2e-common/test-config';
+import { TEST_SETUP_TIMEOUT_MS, testConfig } from '../../../e2e-common/test-config';
 
-import { CUSTOMER_FRAGMENT } from './graphql/fragments';
+import { customerFragment } from './graphql/fragments-admin';
+import { FragmentOf, ResultOf } from './graphql/graphql-admin';
+import { FragmentOf as FragmentOfShop } from './graphql/graphql-shop';
 import {
-    AddNoteToCustomer,
-    CreateAddress,
-    CreateCustomer,
-    CustomerFragment,
-    DeleteCustomer,
-    DeleteCustomerAddress,
-    DeleteCustomerNote,
-    DeletionResult,
-    ErrorCode,
-    GetCustomer,
-    GetCustomerHistory,
-    GetCustomerList,
-    GetCustomerOrders,
-    GetCustomerWithUser,
-    UpdateAddress,
-    UpdateCustomer,
-    UpdateCustomerNote,
-} from './graphql/generated-e2e-admin-types';
-import { AddItemToOrder, UpdatedOrderFragment } from './graphql/generated-e2e-shop-types';
-import {
-    CREATE_ADDRESS,
-    CREATE_CUSTOMER,
-    DELETE_CUSTOMER,
-    DELETE_CUSTOMER_NOTE,
-    GET_CUSTOMER,
-    GET_CUSTOMER_HISTORY,
-    GET_CUSTOMER_LIST,
-    UPDATE_ADDRESS,
-    UPDATE_CUSTOMER,
-    UPDATE_CUSTOMER_NOTE,
+    addNoteToCustomerDocument,
+    createAddressDocument,
+    createAdministratorDocument,
+    createChannelDocument,
+    createCustomerDocument,
+    createRoleDocument,
+    deleteCustomerAddressDocument,
+    deleteCustomerDocument,
+    deleteCustomerNoteDocument,
+    getCustomerDocument,
+    getCustomerHistoryDocument,
+    getCustomerListDocument,
+    getCustomerOrdersDocument,
+    getCustomerWithUserDocument,
+    MeDocument,
+    updateAddressDocument,
+    updateCustomerDocument,
+    updateCustomerNoteDocument,
+    verifyCustomerAccountDocument,
 } from './graphql/shared-definitions';
-import { ADD_ITEM_TO_ORDER } from './graphql/shop-definitions';
+import {
+    activeOrderCustomerDocument,
+    addItemToOrderDocument,
+    registerAccountDocument,
+    setCustomerDocument,
+    updatedOrderFragment,
+} from './graphql/shop-definitions';
 import { assertThrowsWithMessage } from './utils/assert-throws-with-message';
 
-// tslint:disable:no-non-null-assertion
-let sendEmailFn: jest.Mock;
+/* eslint-disable @typescript-eslint/no-non-null-assertion */
 
-/**
- * This mock plugin simulates an EmailPlugin which would send emails
- * on the registration & password reset events.
- */
-@VendurePlugin({
-    imports: [EventBusModule],
-})
-class TestEmailPlugin implements OnModuleInit {
-    constructor(private eventBus: EventBus) {}
-    onModuleInit() {
-        this.eventBus.ofType(AccountRegistrationEvent).subscribe(event => {
-            sendEmailFn(event);
-        });
-    }
-}
+type CustomerListItem = ResultOf<typeof getCustomerListDocument>['customers']['items'][number];
+type CustomerFragment = FragmentOf<typeof customerFragment>;
+type UpdatedOrderFragment = FragmentOfShop<typeof updatedOrderFragment>;
+type ActiveOrderCustomerFragment = FragmentOfShop<typeof activeOrderCustomerDocument>;
+type CustomerOrdersResult = NonNullable<ResultOf<typeof getCustomerOrdersDocument>['customer']>;
+type CustomerHistoryResult = NonNullable<ResultOf<typeof getCustomerHistoryDocument>['customer']>;
 
+const customerErrorGuard: ErrorResultGuard<CustomerFragment> = createErrorResultGuard(
+    input => !!input.emailAddress,
+);
+const orderResultGuard: ErrorResultGuard<UpdatedOrderFragment> = createErrorResultGuard(
+    input => 'lines' in input && !!input.lines,
+);
+const setCustomerForOrderGuard: ErrorResultGuard<ActiveOrderCustomerFragment> = createErrorResultGuard(
+    input => 'lines' in input && !!input.lines,
+);
+const customerOrdersGuard: ErrorResultGuard<CustomerOrdersResult> = createErrorResultGuard(
+    input => !!input.orders,
+);
+const customerHistoryGuard: ErrorResultGuard<CustomerHistoryResult> = createErrorResultGuard(
+    input => !!input.history,
+);
+const successErrorGuard: ErrorResultGuard<{ success: boolean }> = createErrorResultGuard(
+    input => 'success' in input,
+);
 describe('Customer resolver', () => {
-    const { server, adminClient, shopClient } = createTestEnvironment(
-        mergeConfig(testConfig, { plugins: [TestEmailPlugin] }),
-    );
+    const { server, adminClient, shopClient } = createTestEnvironment(testConfig());
 
-    let firstCustomer: GetCustomerList.Items;
-    let secondCustomer: GetCustomerList.Items;
-    let thirdCustomer: GetCustomerList.Items;
-
-    const customerErrorGuard: ErrorResultGuard<CustomerFragment> = createErrorResultGuard(
-        input => !!input.emailAddress,
-    );
+    let firstCustomer: CustomerListItem;
+    let secondCustomer: CustomerListItem;
+    let thirdCustomer: CustomerListItem;
 
     beforeAll(async () => {
         await server.init({
@@ -98,9 +111,7 @@ describe('Customer resolver', () => {
     });
 
     it('customers list', async () => {
-        const result = await adminClient.query<GetCustomerList.Query, GetCustomerList.Variables>(
-            GET_CUSTOMER_LIST,
-        );
+        const result = await adminClient.query(getCustomerListDocument);
 
         expect(result.customers.items.length).toBe(5);
         expect(result.customers.totalItems).toBe(5);
@@ -109,17 +120,58 @@ describe('Customer resolver', () => {
         thirdCustomer = result.customers.items[2];
     });
 
+    it('customers list filter by postalCode', async () => {
+        const result = await adminClient.query(getCustomerListDocument, {
+            options: {
+                filter: {
+                    postalCode: {
+                        eq: 'NU9 0PW',
+                    },
+                },
+            },
+        });
+
+        expect(result.customers.items.length).toBe(1);
+        expect(result.customers.items[0].emailAddress).toBe('eliezer56@yahoo.com');
+    });
+
     it('customer resolver resolves User', async () => {
-        const { customer } = await adminClient.query<
-            GetCustomerWithUser.Query,
-            GetCustomerWithUser.Variables
-        >(GET_CUSTOMER_WITH_USER, {
-            id: firstCustomer.id,
+        const emailAddress = 'same-email@test.com';
+
+        // Create an administrator with the same email first in order to ensure the right user is resolved.
+        // This test also validates that a customer can be created with the same identifier
+        // of an existing administrator
+        const { createAdministrator } = await adminClient.query(createAdministratorDocument, {
+            input: {
+                emailAddress,
+                firstName: 'First',
+                lastName: 'Last',
+                password: '123',
+                roleIds: ['1'],
+            },
+        });
+
+        expect(createAdministrator.emailAddress).toEqual(emailAddress);
+
+        const { createCustomer } = await adminClient.query(createCustomerDocument, {
+            input: {
+                emailAddress,
+                firstName: 'New',
+                lastName: 'Customer',
+            },
+            password: 'test',
+        });
+
+        customerErrorGuard.assertSuccess(createCustomer);
+        expect(createCustomer.emailAddress).toEqual(emailAddress);
+
+        const { customer } = await adminClient.query(getCustomerWithUserDocument, {
+            id: createCustomer.id,
         });
 
         expect(customer!.user).toEqual({
-            id: 'T_2',
-            identifier: firstCustomer.emailAddress,
+            id: createCustomer.user?.id,
+            identifier: emailAddress,
             verified: true,
         });
     });
@@ -132,37 +184,34 @@ describe('Customer resolver', () => {
             'createCustomerAddress throws on invalid countryCode',
             assertThrowsWithMessage(
                 () =>
-                    adminClient.query<CreateAddress.Mutation, CreateAddress.Variables>(CREATE_ADDRESS, {
+                    adminClient.query(createAddressDocument, {
                         id: firstCustomer.id,
                         input: {
                             streetLine1: 'streetLine1',
                             countryCode: 'INVALID',
                         },
                     }),
-                `The countryCode "INVALID" was not recognized`,
+                'The countryCode "INVALID" was not recognized',
             ),
         );
 
         it('createCustomerAddress creates a new address', async () => {
-            const result = await adminClient.query<CreateAddress.Mutation, CreateAddress.Variables>(
-                CREATE_ADDRESS,
-                {
-                    id: firstCustomer.id,
-                    input: {
-                        fullName: 'fullName',
-                        company: 'company',
-                        streetLine1: 'streetLine1',
-                        streetLine2: 'streetLine2',
-                        city: 'city',
-                        province: 'province',
-                        postalCode: 'postalCode',
-                        countryCode: 'GB',
-                        phoneNumber: 'phoneNumber',
-                        defaultShippingAddress: false,
-                        defaultBillingAddress: false,
-                    },
+            const result = await adminClient.query(createAddressDocument, {
+                id: firstCustomer.id,
+                input: {
+                    fullName: 'fullName',
+                    company: 'company',
+                    streetLine1: 'streetLine1',
+                    streetLine2: 'streetLine2',
+                    city: 'city',
+                    province: 'province',
+                    postalCode: 'postalCode',
+                    countryCode: 'GB',
+                    phoneNumber: 'phoneNumber',
+                    defaultShippingAddress: false,
+                    defaultBillingAddress: false,
                 },
-            );
+            });
             expect(omit(result.createCustomerAddress, ['id'])).toEqual({
                 fullName: 'fullName',
                 company: 'company',
@@ -182,7 +231,7 @@ describe('Customer resolver', () => {
         });
 
         it('customer query returns addresses', async () => {
-            const result = await adminClient.query<GetCustomer.Query, GetCustomer.Variables>(GET_CUSTOMER, {
+            const result = await adminClient.query(getCustomerDocument, {
                 id: firstCustomer.id,
             });
 
@@ -191,15 +240,12 @@ describe('Customer resolver', () => {
         });
 
         it('updateCustomerAddress updates the country', async () => {
-            const result = await adminClient.query<UpdateAddress.Mutation, UpdateAddress.Variables>(
-                UPDATE_ADDRESS,
-                {
-                    input: {
-                        id: firstCustomerAddressIds[0],
-                        countryCode: 'AT',
-                    },
+            const result = await adminClient.query(updateAddressDocument, {
+                input: {
+                    id: firstCustomerAddressIds[0],
+                    countryCode: 'AT',
                 },
-            );
+            });
             expect(result.updateCustomerAddress.country).toEqual({
                 code: 'AT',
                 name: 'Austria',
@@ -208,21 +254,18 @@ describe('Customer resolver', () => {
 
         it('updateCustomerAddress allows only a single default address', async () => {
             // set the first customer's second address to be default
-            const result1 = await adminClient.query<UpdateAddress.Mutation, UpdateAddress.Variables>(
-                UPDATE_ADDRESS,
-                {
-                    input: {
-                        id: firstCustomerAddressIds[1],
-                        defaultShippingAddress: true,
-                        defaultBillingAddress: true,
-                    },
+            const result1 = await adminClient.query(updateAddressDocument, {
+                input: {
+                    id: firstCustomerAddressIds[1],
+                    defaultShippingAddress: true,
+                    defaultBillingAddress: true,
                 },
-            );
+            });
             expect(result1.updateCustomerAddress.defaultShippingAddress).toBe(true);
             expect(result1.updateCustomerAddress.defaultBillingAddress).toBe(true);
 
-            // assert the first customer's other addresse is not default
-            const result2 = await adminClient.query<GetCustomer.Query, GetCustomer.Variables>(GET_CUSTOMER, {
+            // assert the first customer's other address is not default
+            const result2 = await adminClient.query(getCustomerDocument, {
                 id: firstCustomer.id,
             });
             const otherAddress = result2.customer!.addresses!.filter(
@@ -232,21 +275,18 @@ describe('Customer resolver', () => {
             expect(otherAddress.defaultBillingAddress).toBe(false);
 
             // set the first customer's first address to be default
-            const result3 = await adminClient.query<UpdateAddress.Mutation, UpdateAddress.Variables>(
-                UPDATE_ADDRESS,
-                {
-                    input: {
-                        id: firstCustomerAddressIds[0],
-                        defaultShippingAddress: true,
-                        defaultBillingAddress: true,
-                    },
+            const result3 = await adminClient.query(updateAddressDocument, {
+                input: {
+                    id: firstCustomerAddressIds[0],
+                    defaultShippingAddress: true,
+                    defaultBillingAddress: true,
                 },
-            );
+            });
             expect(result3.updateCustomerAddress.defaultShippingAddress).toBe(true);
             expect(result3.updateCustomerAddress.defaultBillingAddress).toBe(true);
 
             // assert the first customer's second address is not default
-            const result4 = await adminClient.query<GetCustomer.Query, GetCustomer.Variables>(GET_CUSTOMER, {
+            const result4 = await adminClient.query(getCustomerDocument, {
                 id: firstCustomer.id,
             });
             const otherAddress2 = result4.customer!.addresses!.filter(
@@ -256,40 +296,40 @@ describe('Customer resolver', () => {
             expect(otherAddress2.defaultBillingAddress).toBe(false);
 
             // get the second customer's address id
-            const result5 = await adminClient.query<GetCustomer.Query, GetCustomer.Variables>(GET_CUSTOMER, {
+            const result5 = await adminClient.query(getCustomerDocument, {
                 id: secondCustomer.id,
             });
             const secondCustomerAddressId = result5.customer!.addresses![0].id;
 
             // set the second customer's address to be default
-            const result6 = await adminClient.query<UpdateAddress.Mutation, UpdateAddress.Variables>(
-                UPDATE_ADDRESS,
-                {
-                    input: {
-                        id: secondCustomerAddressId,
-                        defaultShippingAddress: true,
-                        defaultBillingAddress: true,
-                    },
+            const result6 = await adminClient.query(updateAddressDocument, {
+                input: {
+                    id: secondCustomerAddressId,
+                    defaultShippingAddress: true,
+                    defaultBillingAddress: true,
                 },
-            );
+            });
             expect(result6.updateCustomerAddress.defaultShippingAddress).toBe(true);
             expect(result6.updateCustomerAddress.defaultBillingAddress).toBe(true);
 
             // assets the first customer's address defaults are unchanged
-            const result7 = await adminClient.query<GetCustomer.Query, GetCustomer.Variables>(GET_CUSTOMER, {
+            const result7 = await adminClient.query(getCustomerDocument, {
                 id: firstCustomer.id,
             });
-            expect(result7.customer!.addresses![0].defaultShippingAddress).toBe(true);
-            expect(result7.customer!.addresses![0].defaultBillingAddress).toBe(true);
-            expect(result7.customer!.addresses![1].defaultShippingAddress).toBe(false);
-            expect(result7.customer!.addresses![1].defaultBillingAddress).toBe(false);
+            const firstCustomerFirstAddress = result7.customer!.addresses!.find(
+                a => a.id === firstCustomerAddressIds[0],
+            )!;
+            const firstCustomerSecondAddress = result7.customer!.addresses!.find(
+                a => a.id === firstCustomerAddressIds[1],
+            )!;
+            expect(firstCustomerFirstAddress.defaultShippingAddress).toBe(true);
+            expect(firstCustomerFirstAddress.defaultBillingAddress).toBe(true);
+            expect(firstCustomerSecondAddress.defaultShippingAddress).toBe(false);
+            expect(firstCustomerSecondAddress.defaultBillingAddress).toBe(false);
         });
 
         it('createCustomerAddress with true defaults unsets existing defaults', async () => {
-            const { createCustomerAddress } = await adminClient.query<
-                CreateAddress.Mutation,
-                CreateAddress.Variables
-            >(CREATE_ADDRESS, {
+            const { createCustomerAddress } = await adminClient.query(createAddressDocument, {
                 id: firstCustomer.id,
                 input: {
                     streetLine1: 'new default streetline',
@@ -315,12 +355,9 @@ describe('Customer resolver', () => {
                 defaultBillingAddress: true,
             });
 
-            const { customer } = await adminClient.query<GetCustomer.Query, GetCustomer.Variables>(
-                GET_CUSTOMER,
-                {
-                    id: firstCustomer.id,
-                },
-            );
+            const { customer } = await adminClient.query(getCustomerDocument, {
+                id: firstCustomer.id,
+            });
             for (const address of customer!.addresses!) {
                 const shouldBeDefault = address.id === createCustomerAddress.id;
                 expect(address.defaultShippingAddress).toEqual(shouldBeDefault);
@@ -331,28 +368,15 @@ describe('Customer resolver', () => {
         });
 
         it('deleteCustomerAddress on default address resets defaults', async () => {
-            const { deleteCustomerAddress } = await adminClient.query<
-                DeleteCustomerAddress.Mutation,
-                DeleteCustomerAddress.Variables
-            >(
-                gql`
-                    mutation DeleteCustomerAddress($id: ID!) {
-                        deleteCustomerAddress(id: $id) {
-                            success
-                        }
-                    }
-                `,
-                { id: firstCustomerThirdAddressId },
-            );
+            const { deleteCustomerAddress } = await adminClient.query(deleteCustomerAddressDocument, {
+                id: firstCustomerThirdAddressId,
+            });
 
             expect(deleteCustomerAddress.success).toBe(true);
 
-            const { customer } = await adminClient.query<GetCustomer.Query, GetCustomer.Variables>(
-                GET_CUSTOMER,
-                {
-                    id: firstCustomer.id,
-                },
-            );
+            const { customer } = await adminClient.query(getCustomerDocument, {
+                id: firstCustomer.id,
+            });
             expect(customer!.addresses!.length).toBe(2);
             const defaultAddress = customer!.addresses!.filter(
                 a => a.defaultBillingAddress && a.defaultShippingAddress,
@@ -366,40 +390,75 @@ describe('Customer resolver', () => {
     });
 
     describe('orders', () => {
-        const orderResultGuard: ErrorResultGuard<UpdatedOrderFragment> = createErrorResultGuard(
-            input => !!input.lines,
-        );
-
-        it(`lists that user\'s orders`, async () => {
+        it("lists that user's orders", async () => {
             // log in as first customer
             await shopClient.asUserWithCredentials(firstCustomer.emailAddress, 'test');
             // add an item to the order to create an order
-            const { addItemToOrder } = await shopClient.query<
-                AddItemToOrder.Mutation,
-                AddItemToOrder.Variables
-            >(ADD_ITEM_TO_ORDER, {
+            const { addItemToOrder } = await shopClient.query(addItemToOrderDocument, {
                 productVariantId: 'T_1',
                 quantity: 1,
             });
             orderResultGuard.assertSuccess(addItemToOrder);
 
-            const { customer } = await adminClient.query<
-                GetCustomerOrders.Query,
-                GetCustomerOrders.Variables
-            >(GET_CUSTOMER_ORDERS, { id: firstCustomer.id });
+            const { customer } = await adminClient.query(getCustomerOrdersDocument, {
+                id: firstCustomer.id,
+            });
 
-            expect(customer!.orders.totalItems).toBe(1);
-            expect(customer!.orders.items[0].id).toBe(addItemToOrder!.id);
+            customerOrdersGuard.assertSuccess(customer);
+
+            expect(customer.orders.totalItems).toBe(1);
+            expect(customer.orders.items[0].id).toBe(addItemToOrder.id);
+        });
+
+        // #4560 — findByCustomerId silently stripped any relation path
+        // containing `productVariant`, breaking service-layer callers and
+        // forcing N+1 in GraphQL. Eager loading via this method does NOT
+        // filter soft-deleted variants (matching the prior `findOne`
+        // behaviour) — `deletedAt` on ProductVariant is a plain nullable
+        // column rather than `@DeleteDateColumn`.
+        it('findByCustomerId honors explicitly requested productVariant relations', async () => {
+            const orderService = server.app.get(OrderService);
+            const requestContextService = server.app.get(RequestContextService);
+            const configService = server.app.get(ConfigService);
+            const ctx = await requestContextService.create({ apiType: 'admin' });
+
+            // The GraphQL layer encodes IDs via the configured entityIdStrategy
+            // (TestingEntityIdStrategy prefixes with "T_"). Service-layer calls
+            // expect the raw DB id, so we decode here.
+            const customerId = configService.entityOptions.entityIdStrategy!.decodeId(firstCustomer.id);
+
+            const result = await orderService.findByCustomerId(ctx, customerId, undefined, [
+                'lines',
+                'lines.productVariant',
+                'lines.productVariant.product',
+            ]);
+
+            // The preceding test seeded exactly one order for firstCustomer.
+            expect(result.items.length).toBe(1);
+            const order = result.items[0];
+            expect(order.lines.length).toBeGreaterThan(0);
+            expect(order.lines[0].productVariant).toBeDefined();
+            expect(order.lines[0].productVariant.id).toBeDefined();
+            expect(order.lines[0].productVariant.product).toBeDefined();
         });
     });
 
     describe('creation', () => {
         it('triggers verification event if no password supplied', async () => {
-            sendEmailFn = jest.fn();
-            const { createCustomer } = await adminClient.query<
-                CreateCustomer.Mutation,
-                CreateCustomer.Variables
-            >(CREATE_CUSTOMER, {
+            const sendEmailFn = vi.fn();
+            let resolveFn: () => void;
+            const subscription = server.app
+                .get(EventBus)
+                .ofType(AccountRegistrationEvent)
+                .subscribe(event => {
+                    sendEmailFn(event);
+                    resolveFn?.();
+                });
+            const eventReceived = new Promise<void>(resolve => {
+                resolveFn = resolve;
+            });
+
+            const { createCustomer } = await adminClient.query(createCustomerDocument, {
                 input: {
                     emailAddress: 'test1@test.com',
                     firstName: 'New',
@@ -409,17 +468,32 @@ describe('Customer resolver', () => {
             customerErrorGuard.assertSuccess(createCustomer);
 
             expect(createCustomer.user!.verified).toBe(false);
+
+            // Wait for the event to be received before making assertions
+            await eventReceived;
+
             expect(sendEmailFn).toHaveBeenCalledTimes(1);
             expect(sendEmailFn.mock.calls[0][0] instanceof AccountRegistrationEvent).toBe(true);
             expect(sendEmailFn.mock.calls[0][0].user.identifier).toBe('test1@test.com');
+
+            subscription.unsubscribe();
         });
 
         it('creates a verified Customer', async () => {
-            sendEmailFn = jest.fn();
-            const { createCustomer } = await adminClient.query<
-                CreateCustomer.Mutation,
-                CreateCustomer.Variables
-            >(CREATE_CUSTOMER, {
+            const sendEmailFn = vi.fn();
+            let resolveFn: () => void;
+            const subscription = server.app
+                .get(EventBus)
+                .ofType(AccountRegistrationEvent)
+                .subscribe(event => {
+                    sendEmailFn(event);
+                    resolveFn?.();
+                });
+            const eventReceived = new Promise<void>(resolve => {
+                resolveFn = resolve;
+            });
+
+            const { createCustomer } = await adminClient.query(createCustomerDocument, {
                 input: {
                     emailAddress: 'test2@test.com',
                     firstName: 'New',
@@ -429,15 +503,17 @@ describe('Customer resolver', () => {
             });
             customerErrorGuard.assertSuccess(createCustomer);
 
+            // Wait for the event to be received before making assertions
+            await eventReceived;
+
             expect(createCustomer.user!.verified).toBe(true);
-            expect(sendEmailFn).toHaveBeenCalledTimes(0);
+            expect(sendEmailFn).toHaveBeenCalledTimes(1);
+
+            subscription.unsubscribe();
         });
 
         it('return error result when using an existing, non-deleted emailAddress', async () => {
-            const { createCustomer } = await adminClient.query<
-                CreateCustomer.Mutation,
-                CreateCustomer.Variables
-            >(CREATE_CUSTOMER, {
+            const { createCustomer } = await adminClient.query(createCustomerDocument, {
                 input: {
                     emailAddress: 'test2@test.com',
                     firstName: 'New',
@@ -450,14 +526,38 @@ describe('Customer resolver', () => {
             expect(createCustomer.message).toBe('The email address is not available.');
             expect(createCustomer.errorCode).toBe(ErrorCode.EMAIL_ADDRESS_CONFLICT_ERROR);
         });
+
+        it('returns error result for a password which fails validation', async () => {
+            const { createCustomer } = await adminClient.query(createCustomerDocument, {
+                input: {
+                    emailAddress: 'weak-password@test.com',
+                    firstName: 'Weak',
+                    lastName: 'Password',
+                },
+                password: 'abc',
+            });
+            customerErrorGuard.assertErrorResult(createCustomer);
+
+            expect(createCustomer.errorCode).toBe(ErrorCode.PASSWORD_VALIDATION_ERROR);
+        });
+
+        it('normalizes email address on creation', async () => {
+            const { createCustomer } = await adminClient.query(createCustomerDocument, {
+                input: {
+                    emailAddress: ' JoeSmith@test.com ',
+                    firstName: 'Joe',
+                    lastName: 'Smith',
+                },
+                password: 'test',
+            });
+            customerErrorGuard.assertSuccess(createCustomer);
+            expect(createCustomer.emailAddress).toBe('joesmith@test.com');
+        });
     });
 
     describe('update', () => {
         it('returns error result when emailAddress not available', async () => {
-            const { updateCustomer } = await adminClient.query<
-                UpdateCustomer.Mutation,
-                UpdateCustomer.Variables
-            >(UPDATE_CUSTOMER, {
+            const { updateCustomer } = await adminClient.query(updateCustomerDocument, {
                 input: {
                     id: thirdCustomer.id,
                     emailAddress: firstCustomer.emailAddress,
@@ -470,10 +570,7 @@ describe('Customer resolver', () => {
         });
 
         it('succeeds when emailAddress is available', async () => {
-            const { updateCustomer } = await adminClient.query<
-                UpdateCustomer.Mutation,
-                UpdateCustomer.Variables
-            >(UPDATE_CUSTOMER, {
+            const { updateCustomer } = await adminClient.query(updateCustomerDocument, {
                 input: {
                     id: thirdCustomer.id,
                     emailAddress: 'unique-email@test.com',
@@ -483,20 +580,43 @@ describe('Customer resolver', () => {
 
             expect(updateCustomer.emailAddress).toBe('unique-email@test.com');
         });
+
+        // https://github.com/vendurehq/vendure/issues/1071
+        it('updates the associated User email address', async () => {
+            await shopClient.asUserWithCredentials('unique-email@test.com', 'test');
+            const { me } = await shopClient.query(MeDocument);
+
+            expect(me?.identifier).toBe('unique-email@test.com');
+        });
+
+        // https://github.com/vendurehq/vendure/issues/2449
+        it('normalizes email address on update', async () => {
+            const { updateCustomer } = await adminClient.query(updateCustomerDocument, {
+                input: {
+                    id: thirdCustomer.id,
+                    emailAddress: ' Another-Address@test.com ',
+                },
+            });
+            customerErrorGuard.assertSuccess(updateCustomer);
+
+            expect(updateCustomer.emailAddress).toBe('another-address@test.com');
+
+            await shopClient.asUserWithCredentials('another-address@test.com', 'test');
+            const { me } = await shopClient.query(MeDocument);
+
+            expect(me?.identifier).toBe('another-address@test.com');
+        });
     });
 
     describe('deletion', () => {
         it('deletes a customer', async () => {
-            const result = await adminClient.query<DeleteCustomer.Mutation, DeleteCustomer.Variables>(
-                DELETE_CUSTOMER,
-                { id: thirdCustomer.id },
-            );
+            const result = await adminClient.query(deleteCustomerDocument, { id: thirdCustomer.id });
 
             expect(result.deleteCustomer).toEqual({ result: DeletionResult.DELETED });
         });
 
         it('cannot get a deleted customer', async () => {
-            const result = await adminClient.query<GetCustomer.Query, GetCustomer.Variables>(GET_CUSTOMER, {
+            const result = await adminClient.query(getCustomerDocument, {
                 id: thirdCustomer.id,
             });
 
@@ -504,9 +624,7 @@ describe('Customer resolver', () => {
         });
 
         it('deleted customer omitted from list', async () => {
-            const result = await adminClient.query<GetCustomerList.Query, GetCustomerList.Variables>(
-                GET_CUSTOMER_LIST,
-            );
+            const result = await adminClient.query(getCustomerListDocument);
 
             expect(result.customers.items.map(c => c.id).includes(thirdCustomer.id)).toBe(false);
         });
@@ -515,36 +633,18 @@ describe('Customer resolver', () => {
             'updateCustomer throws for deleted customer',
             assertThrowsWithMessage(
                 () =>
-                    adminClient.query<UpdateCustomer.Mutation, UpdateCustomer.Variables>(UPDATE_CUSTOMER, {
+                    adminClient.query(updateCustomerDocument, {
                         input: {
                             id: thirdCustomer.id,
                             firstName: 'updated',
                         },
                     }),
-                `No Customer with the id '3' could be found`,
-            ),
-        );
-
-        it(
-            'createCustomerAddress throws for deleted customer',
-            assertThrowsWithMessage(
-                () =>
-                    adminClient.query<CreateAddress.Mutation, CreateAddress.Variables>(CREATE_ADDRESS, {
-                        id: thirdCustomer.id,
-                        input: {
-                            streetLine1: 'test',
-                            countryCode: 'GB',
-                        },
-                    }),
-                `No Customer with the id '3' could be found`,
+                'No Customer with the id "3" could be found',
             ),
         );
 
         it('new Customer can be created with same emailAddress as a deleted Customer', async () => {
-            const { createCustomer } = await adminClient.query<
-                CreateCustomer.Mutation,
-                CreateCustomer.Variables
-            >(CREATE_CUSTOMER, {
+            const { createCustomer } = await adminClient.query(createCustomerDocument, {
                 input: {
                     emailAddress: thirdCustomer.emailAddress,
                     firstName: 'Reusing Email',
@@ -557,16 +657,41 @@ describe('Customer resolver', () => {
             expect(createCustomer.firstName).toBe('Reusing Email');
             expect(createCustomer.user?.identifier).toBe(thirdCustomer.emailAddress);
         });
+
+        // https://github.com/vendurehq/vendure/issues/1960
+        it('delete a guest Customer', async () => {
+            const orderErrorGuard: ErrorResultGuard<ActiveOrderCustomerFragment> = createErrorResultGuard(
+                input => !!input.lines,
+            );
+
+            await shopClient.asAnonymousUser();
+            await shopClient.query(addItemToOrderDocument, {
+                productVariantId: 'T_1',
+                quantity: 1,
+            });
+            const { setCustomerForOrder } = await shopClient.query(setCustomerDocument, {
+                input: {
+                    firstName: 'Guest',
+                    lastName: 'Customer',
+                    emailAddress: 'guest@test.com',
+                },
+            });
+
+            orderErrorGuard.assertSuccess(setCustomerForOrder);
+
+            const result = await adminClient.query(deleteCustomerDocument, {
+                id: setCustomerForOrder.customer!.id,
+            });
+
+            expect(result.deleteCustomer).toEqual({ result: DeletionResult.DELETED });
+        });
     });
 
     describe('customer notes', () => {
         let noteId: string;
 
         it('addNoteToCustomer', async () => {
-            const { addNoteToCustomer } = await adminClient.query<
-                AddNoteToCustomer.Mutation,
-                AddNoteToCustomer.Variables
-            >(ADD_NOTE_TO_CUSTOMER, {
+            const { addNoteToCustomer } = await adminClient.query(addNoteToCustomerDocument, {
                 input: {
                     id: firstCustomer.id,
                     isPublic: false,
@@ -574,10 +699,7 @@ describe('Customer resolver', () => {
                 },
             });
 
-            const { customer } = await adminClient.query<
-                GetCustomerHistory.Query,
-                GetCustomerHistory.Variables
-            >(GET_CUSTOMER_HISTORY, {
+            const { customer } = await adminClient.query(getCustomerHistoryDocument, {
                 id: firstCustomer.id,
                 options: {
                     filter: {
@@ -588,7 +710,9 @@ describe('Customer resolver', () => {
                 },
             });
 
-            expect(customer?.history.items.map(pick(['type', 'data']))).toEqual([
+            customerHistoryGuard.assertSuccess(customer);
+
+            expect(customer.history.items.map(pick(['type', 'data']))).toEqual([
                 {
                     type: HistoryEntryType.CUSTOMER_NOTE,
                     data: {
@@ -597,14 +721,11 @@ describe('Customer resolver', () => {
                 },
             ]);
 
-            noteId = customer?.history.items[0].id!;
+            noteId = customer.history.items[0].id;
         });
 
         it('update note', async () => {
-            const { updateCustomerNote } = await adminClient.query<
-                UpdateCustomerNote.Mutation,
-                UpdateCustomerNote.Variables
-            >(UPDATE_CUSTOMER_NOTE, {
+            const { updateCustomerNote } = await adminClient.query(updateCustomerNoteDocument, {
                 input: {
                     noteId,
                     note: 'An updated note',
@@ -617,61 +738,318 @@ describe('Customer resolver', () => {
         });
 
         it('delete note', async () => {
-            const { customer: before } = await adminClient.query<
-                GetCustomerHistory.Query,
-                GetCustomerHistory.Variables
-            >(GET_CUSTOMER_HISTORY, { id: firstCustomer.id });
-            const historyCount = before?.history.totalItems!;
+            const { customer: before } = await adminClient.query(getCustomerHistoryDocument, {
+                id: firstCustomer.id,
+            });
+            const historyCount = before!.history.totalItems;
 
-            const { deleteCustomerNote } = await adminClient.query<
-                DeleteCustomerNote.Mutation,
-                DeleteCustomerNote.Variables
-            >(DELETE_CUSTOMER_NOTE, {
+            const { deleteCustomerNote } = await adminClient.query(deleteCustomerNoteDocument, {
                 id: noteId,
             });
 
             expect(deleteCustomerNote.result).toBe(DeletionResult.DELETED);
 
-            const { customer: after } = await adminClient.query<
-                GetCustomerHistory.Query,
-                GetCustomerHistory.Variables
-            >(GET_CUSTOMER_HISTORY, { id: firstCustomer.id });
+            const { customer: after } = await adminClient.query(getCustomerHistoryDocument, {
+                id: firstCustomer.id,
+            });
             expect(after?.history.totalItems).toBe(historyCount - 1);
         });
     });
+
+    describe('verifyCustomerAccount', () => {
+        let unverifiedCustomerId: string;
+
+        async function getVerifiedHistoryEntryCount(customerId: string): Promise<number> {
+            const { customer } = await adminClient.query(getCustomerHistoryDocument, {
+                id: customerId,
+                options: {
+                    filter: {
+                        type: {
+                            eq: HistoryEntryType.CUSTOMER_VERIFIED,
+                        },
+                    },
+                },
+            });
+            customerHistoryGuard.assertSuccess(customer);
+            return customer.history.items.length;
+        }
+
+        function getVerificationToken(identifier: string): Promise<string | null | undefined> {
+            return server.app
+                .get(TransactionalConnection)
+                .rawConnection.getRepository(NativeAuthenticationMethod)
+                .createQueryBuilder('method')
+                .innerJoin('method.user', 'user')
+                .where('user.identifier = :identifier', { identifier })
+                .getOne()
+                .then(method => method?.verificationToken);
+        }
+
+        beforeAll(async () => {
+            const { createCustomer } = await adminClient.query(createCustomerDocument, {
+                input: {
+                    emailAddress: 'unverified@test.com',
+                    firstName: 'Unverified',
+                    lastName: 'Customer',
+                },
+            });
+            customerErrorGuard.assertSuccess(createCustomer);
+            unverifiedCustomerId = createCustomer.id;
+            expect(createCustomer.user!.verified).toBe(false);
+        });
+
+        async function expectStillUnverified(customerId: string) {
+            const { customer } = await adminClient.query(getCustomerWithUserDocument, {
+                id: customerId,
+            });
+            expect(customer!.user!.verified).toBe(false);
+            expect(await getVerifiedHistoryEntryCount(customerId)).toBe(0);
+        }
+
+        it('returns MissingPasswordError when the customer has no password and none is given', async () => {
+            const { verifyCustomerAccount } = await adminClient.query(verifyCustomerAccountDocument, {
+                id: unverifiedCustomerId,
+            });
+
+            customerErrorGuard.assertErrorResult(verifyCustomerAccount);
+            expect(verifyCustomerAccount.errorCode).toBe(ErrorCode.MISSING_PASSWORD_ERROR);
+            await expectStillUnverified(unverifiedCustomerId);
+        });
+
+        it('returns PasswordValidationError when the given password fails validation', async () => {
+            const { verifyCustomerAccount } = await adminClient.query(verifyCustomerAccountDocument, {
+                id: unverifiedCustomerId,
+                password: 'abc',
+            });
+
+            customerErrorGuard.assertErrorResult(verifyCustomerAccount);
+            expect(verifyCustomerAccount.errorCode).toBe(ErrorCode.PASSWORD_VALIDATION_ERROR);
+            // The dashboard prefers this over the generic `message`, since a custom
+            // PasswordValidationStrategy puts the policy it enforces here.
+            expect(typeof (verifyCustomerAccount as any).validationErrorMessage).toBe('string');
+            await expectStillUnverified(unverifiedCustomerId);
+        });
+
+        it('verifies an unverified customer, sets the password and clears the pending token', async () => {
+            expect(typeof (await getVerificationToken('unverified@test.com'))).toBe('string');
+
+            const { verifyCustomerAccount } = await adminClient.query(verifyCustomerAccountDocument, {
+                id: unverifiedCustomerId,
+                password: 'test-password',
+            });
+
+            customerErrorGuard.assertSuccess(verifyCustomerAccount);
+            expect(verifyCustomerAccount.user!.verified).toBe(true);
+
+            // The pending token is what `refreshCustomerVerification` re-issues, so clearing it is
+            // what ends that flow for an account verified this way.
+            expect(await getVerificationToken('unverified@test.com')).toBeNull();
+
+            const login = await shopClient.asUserWithCredentials('unverified@test.com', 'test-password');
+            expect(login.identifier).toBe('unverified@test.com');
+        });
+
+        it('records a CUSTOMER_VERIFIED history entry', async () => {
+            const { customer } = await adminClient.query(getCustomerHistoryDocument, {
+                id: unverifiedCustomerId,
+                options: {
+                    filter: {
+                        type: {
+                            eq: HistoryEntryType.CUSTOMER_VERIFIED,
+                        },
+                    },
+                },
+            });
+
+            customerHistoryGuard.assertSuccess(customer);
+
+            expect(customer.history.items.map(pick(['type', 'data']))).toContainEqual({
+                type: HistoryEntryType.CUSTOMER_VERIFIED,
+                data: { strategy: 'native' },
+            });
+        });
+
+        it('emits an AccountVerifiedEvent for the customer', async () => {
+            const { createCustomer } = await adminClient.query(createCustomerDocument, {
+                input: {
+                    emailAddress: 'unverified2@test.com',
+                    firstName: 'Unverified2',
+                    lastName: 'Customer',
+                },
+            });
+            customerErrorGuard.assertSuccess(createCustomer);
+
+            const eventFn = vi.fn();
+            let resolveFn: () => void;
+            const subscription = server.app
+                .get(EventBus)
+                .ofType(AccountVerifiedEvent)
+                .subscribe(event => {
+                    eventFn(event);
+                    resolveFn?.();
+                });
+            const eventReceived = new Promise<void>(resolve => {
+                resolveFn = resolve;
+            });
+
+            await adminClient.query(verifyCustomerAccountDocument, {
+                id: createCustomer.id,
+                password: 'test-password',
+            });
+            await eventReceived;
+
+            expect(eventFn).toHaveBeenCalledTimes(1);
+            const published: AccountVerifiedEvent = eventFn.mock.calls[0][0];
+            expect(published.customer.emailAddress).toBe('unverified2@test.com');
+            // The Customer is loaded before the User is saved, so this fails unless the saved User
+            // is written back onto it.
+            expect(published.customer.user!.verified).toBe(true);
+            expect(published.ctx.apiType).toBe('admin');
+
+            subscription.unsubscribe();
+        });
+
+        it('does not repeat the history entry or the event for an already-verified customer', async () => {
+            const entriesBefore = await getVerifiedHistoryEntryCount(unverifiedCustomerId);
+            const eventFn = vi.fn();
+            const subscription = server.app.get(EventBus).ofType(AccountVerifiedEvent).subscribe(eventFn);
+
+            const { verifyCustomerAccount } = await adminClient.query(verifyCustomerAccountDocument, {
+                id: unverifiedCustomerId,
+            });
+
+            customerErrorGuard.assertSuccess(verifyCustomerAccount);
+            expect(verifyCustomerAccount.user!.verified).toBe(true);
+            expect(await getVerifiedHistoryEntryCount(unverifiedCustomerId)).toBe(entriesBefore);
+            expect(eventFn).not.toHaveBeenCalled();
+
+            subscription.unsubscribe();
+        });
+
+        it('is refused for a Customer in another Channel', async () => {
+            // `verifyCustomerAccount` loads the Customer scoped by `ctx.channelId`, so an
+            // administrator on another Channel must not be able to reach it by id.
+            const { createChannel } = await adminClient.query(createChannelDocument, {
+                input: {
+                    code: 'verify-scope-channel',
+                    token: 'verify-scope-channel-token',
+                    defaultLanguageCode: LanguageCode.en,
+                    currencyCode: CurrencyCode.USD,
+                    pricesIncludeTax: true,
+                    defaultShippingZoneId: 'T_1',
+                    defaultTaxZoneId: 'T_1',
+                },
+            });
+            expect('token' in createChannel && createChannel.token).toBe('verify-scope-channel-token');
+
+            adminClient.setChannelToken('verify-scope-channel-token');
+            try {
+                await expect(
+                    adminClient.query(verifyCustomerAccountDocument, { id: unverifiedCustomerId }),
+                ).rejects.toThrow('No Customer with the id');
+            } finally {
+                adminClient.setChannelToken(E2E_DEFAULT_CHANNEL_TOKEN);
+            }
+        });
+
+        it('is refused without the UpdateCustomer permission', async () => {
+            const { createRole } = await adminClient.query(createRoleDocument, {
+                input: {
+                    code: 'read-only-customers',
+                    description: 'Read-only customers',
+                    permissions: [Permission.ReadCustomer],
+                },
+            });
+            await adminClient.query(createAdministratorDocument, {
+                input: {
+                    emailAddress: 'read-only-admin@test.com',
+                    firstName: 'Read',
+                    lastName: 'Only',
+                    password: 'test-password',
+                    roleIds: [createRole.id],
+                },
+            });
+
+            await adminClient.asUserWithCredentials('read-only-admin@test.com', 'test-password');
+            try {
+                await expect(
+                    adminClient.query(verifyCustomerAccountDocument, {
+                        id: unverifiedCustomerId,
+                        password: 'other-password',
+                    }),
+                ).rejects.toThrow('You are not currently authorized to perform this action');
+            } finally {
+                await adminClient.asSuperAdmin();
+            }
+        });
+
+        it(
+            'throws for a Customer with no User',
+            assertThrowsWithMessage(async () => {
+                await shopClient.asAnonymousUser();
+                await shopClient.query(addItemToOrderDocument, {
+                    productVariantId: 'T_1',
+                    quantity: 1,
+                });
+                const { setCustomerForOrder } = await shopClient.query(setCustomerDocument, {
+                    input: {
+                        firstName: 'Guest',
+                        lastName: 'ToVerify',
+                        emailAddress: 'guest-to-verify@test.com',
+                    },
+                });
+                setCustomerForOrderGuard.assertSuccess(setCustomerForOrder);
+
+                await adminClient.query(verifyCustomerAccountDocument, {
+                    id: setCustomerForOrder.customer!.id,
+                });
+            }, 'This Customer has no user account, so there is nothing to verify'),
+        );
+
+        describe('customer who registered with a password', () => {
+            const emailAddress = 'self-registered@test.com';
+            let selfRegisteredCustomerId: string;
+
+            beforeAll(async () => {
+                await shopClient.asAnonymousUser();
+                const { registerCustomerAccount } = await shopClient.query(registerAccountDocument, {
+                    input: {
+                        emailAddress,
+                        firstName: 'Self',
+                        lastName: 'Registered',
+                        password: 'test-password',
+                    },
+                });
+                successErrorGuard.assertSuccess(registerCustomerAccount);
+                expect(registerCustomerAccount.success).toBe(true);
+
+                const { customers } = await adminClient.query(getCustomerListDocument, {
+                    options: { filter: { emailAddress: { eq: emailAddress } } },
+                });
+                selfRegisteredCustomerId = customers.items[0].id;
+            });
+
+            it('returns PasswordAlreadySetError when a password is given', async () => {
+                const { verifyCustomerAccount } = await adminClient.query(verifyCustomerAccountDocument, {
+                    id: selfRegisteredCustomerId,
+                    password: 'other-password',
+                });
+
+                customerErrorGuard.assertErrorResult(verifyCustomerAccount);
+                expect(verifyCustomerAccount.errorCode).toBe(ErrorCode.PASSWORD_ALREADY_SET_ERROR);
+            });
+
+            it('verifies without a password, keeping the one chosen at registration', async () => {
+                const { verifyCustomerAccount } = await adminClient.query(verifyCustomerAccountDocument, {
+                    id: selfRegisteredCustomerId,
+                });
+
+                customerErrorGuard.assertSuccess(verifyCustomerAccount);
+                expect(verifyCustomerAccount.user!.verified).toBe(true);
+
+                const login = await shopClient.asUserWithCredentials(emailAddress, 'test-password');
+                expect(login.identifier).toBe(emailAddress);
+            });
+        });
+    });
 });
-
-const GET_CUSTOMER_WITH_USER = gql`
-    query GetCustomerWithUser($id: ID!) {
-        customer(id: $id) {
-            id
-            user {
-                id
-                identifier
-                verified
-            }
-        }
-    }
-`;
-
-const GET_CUSTOMER_ORDERS = gql`
-    query GetCustomerOrders($id: ID!) {
-        customer(id: $id) {
-            orders {
-                items {
-                    id
-                }
-                totalItems
-            }
-        }
-    }
-`;
-
-const ADD_NOTE_TO_CUSTOMER = gql`
-    mutation AddNoteToCustomer($input: AddNoteToCustomerInput!) {
-        addNoteToCustomer(input: $input) {
-            ...Customer
-        }
-    }
-    ${CUSTOMER_FRAGMENT}
-`;

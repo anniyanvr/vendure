@@ -1,55 +1,61 @@
 import { ChangeDetectionStrategy, ChangeDetectorRef, Component, OnDestroy, OnInit } from '@angular/core';
-import { FormBuilder, FormGroup, Validators } from '@angular/forms';
-import { ActivatedRoute, Router } from '@angular/router';
+import { FormBuilder, Validators } from '@angular/forms';
 import { marker as _ } from '@biesbjerg/ngx-translate-extract-marker';
-import { BaseDetailComponent } from '@vendure/admin-ui/core';
 import {
-    ConfigurableOperation,
     CreateTaxCategoryInput,
+    DataService,
+    getCustomFieldsDefaults,
+    GetTaxCategoryDetailDocument,
     LanguageCode,
-    TaxCategory,
+    NotificationService,
+    Permission,
+    TAX_CATEGORY_FRAGMENT,
+    TaxCategoryFragment,
+    TypedBaseDetailComponent,
     UpdateTaxCategoryInput,
 } from '@vendure/admin-ui/core';
-import { NotificationService } from '@vendure/admin-ui/core';
-import { DataService } from '@vendure/admin-ui/core';
-import { ServerConfigService } from '@vendure/admin-ui/core';
-import { Observable } from 'rxjs';
+import { gql } from 'apollo-angular';
 import { mergeMap, take } from 'rxjs/operators';
+
+export const GET_TAX_CATEGORY_DETAIL = gql`
+    query GetTaxCategoryDetail($id: ID!) {
+        taxCategory(id: $id) {
+            ...TaxCategory
+        }
+    }
+    ${TAX_CATEGORY_FRAGMENT}
+`;
 
 @Component({
     selector: 'vdr-tax-detail',
     templateUrl: './tax-category-detail.component.html',
     styleUrls: ['./tax-category-detail.component.scss'],
     changeDetection: ChangeDetectionStrategy.OnPush,
+    standalone: false
 })
 export class TaxCategoryDetailComponent
-    extends BaseDetailComponent<TaxCategory.Fragment>
-    implements OnInit, OnDestroy {
-    taxCategory$: Observable<TaxCategory.Fragment>;
-    detailForm: FormGroup;
-
-    private taxCondition: ConfigurableOperation;
-    private taxAction: ConfigurableOperation;
+    extends TypedBaseDetailComponent<typeof GetTaxCategoryDetailDocument, 'taxCategory'>
+    implements OnInit, OnDestroy
+{
+    customFields = this.getCustomFieldConfig('TaxCategory');
+    detailForm = this.formBuilder.group({
+        name: ['', Validators.required],
+        isDefault: false,
+        customFields: this.formBuilder.group(getCustomFieldsDefaults(this.customFields)),
+    });
+    readonly updatePermission = [Permission.UpdateSettings, Permission.UpdateTaxCategory];
 
     constructor(
-        router: Router,
-        route: ActivatedRoute,
-        serverConfigService: ServerConfigService,
         private changeDetector: ChangeDetectorRef,
         protected dataService: DataService,
         private formBuilder: FormBuilder,
         private notificationService: NotificationService,
     ) {
-        super(route, router, serverConfigService, dataService);
-        this.detailForm = this.formBuilder.group({
-            name: ['', Validators.required],
-            isDefault: false,
-        });
+        super();
     }
 
     ngOnInit() {
         this.init();
-        this.taxCategory$ = this.entity$;
     }
 
     ngOnDestroy() {
@@ -65,7 +71,11 @@ export class TaxCategoryDetailComponent
             return;
         }
         const formValue = this.detailForm.value;
-        const input = { name: formValue.name, isDefault: formValue.isDefault } as CreateTaxCategoryInput;
+        const input = {
+            name: formValue.name,
+            isDefault: formValue.isDefault,
+            customFields: formValue.customFields,
+        } as CreateTaxCategoryInput;
         this.dataService.settings.createTaxCategory(input).subscribe(
             data => {
                 this.notificationService.success(_('common.notify-create-success'), {
@@ -88,7 +98,7 @@ export class TaxCategoryDetailComponent
             return;
         }
         const formValue = this.detailForm.value;
-        this.taxCategory$
+        this.entity$
             .pipe(
                 take(1),
                 mergeMap(taxCategory => {
@@ -96,6 +106,7 @@ export class TaxCategoryDetailComponent
                         id: taxCategory.id,
                         name: formValue.name,
                         isDefault: formValue.isDefault,
+                        customFields: formValue.customFields,
                     } as UpdateTaxCategoryInput;
                     return this.dataService.settings.updateTaxCategory(input);
                 }),
@@ -119,10 +130,13 @@ export class TaxCategoryDetailComponent
     /**
      * Update the form values when the entity changes.
      */
-    protected setFormValues(entity: TaxCategory.Fragment, languageCode: LanguageCode): void {
+    protected setFormValues(entity: TaxCategoryFragment, languageCode: LanguageCode): void {
         this.detailForm.patchValue({
             name: entity.name,
             isDefault: entity.isDefault,
         });
+        if (this.customFields.length) {
+            this.setCustomFieldFormValues(this.customFields, this.detailForm.get('customFields'), entity);
+        }
     }
 }
